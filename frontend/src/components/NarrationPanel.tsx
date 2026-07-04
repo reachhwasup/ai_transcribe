@@ -1,0 +1,316 @@
+import { useState } from 'react';
+import { useProjectStore } from '../stores/projectStore';
+import { generateNarration, applyNarration, type NarrationSegment } from '../api/client';
+import {
+  Mic,
+  Loader2,
+  Play,
+  Check,
+  AlertCircle,
+  RefreshCw,
+  Trash2,
+} from 'lucide-react';
+
+const STYLES = [
+  { id: 'summary', label: '📋 Summary', desc: 'Concise recap of what happens' },
+  { id: 'commentary', label: '🎤 Commentary', desc: 'Entertaining TikTok-style narration' },
+  { id: 'educational', label: '📚 Educational', desc: 'Explain and teach like a documentary' },
+  { id: 'story', label: '📖 Story', desc: 'Turn the video into a compelling story' },
+];
+
+const LANGUAGES = [
+  { id: 'km', label: '🇰🇭 ខ្មែរ (Khmer)' },
+  { id: 'en', label: '🇺🇸 English' },
+  { id: 'zh', label: '🇨🇳 中文 (Chinese)' },
+  { id: 'ja', label: '🇯🇵 日本語 (Japanese)' },
+  { id: 'ko', label: '🇰🇷 한국어 (Korean)' },
+  { id: 'th', label: '🇹🇭 ไทย (Thai)' },
+  { id: 'vi', label: '🇻🇳 Tiếng Việt' },
+  { id: 'fr', label: '🇫🇷 Français' },
+  { id: 'es', label: '🇪🇸 Español' },
+  { id: 'de', label: '🇩🇪 Deutsch' },
+];
+
+const VOICES = [
+  { id: 'female', label: '🎀 Female' },
+  { id: 'male', label: '👔 Male' },
+  { id: 'young', label: '🧒 Young' },
+  { id: 'old', label: '👴 Old' },
+];
+
+export default function NarrationPanel() {
+  const { currentProject, loadProject } = useProjectStore();
+  const [style, setStyle] = useState('summary');
+  const [language, setLanguage] = useState(currentProject?.language || 'km');
+  const [voice, setVoice] = useState('female');
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isApplying, setIsApplying] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [narrationSegments, setNarrationSegments] = useState<NarrationSegment[]>([]);
+  const [editingIdx, setEditingIdx] = useState<number | null>(null);
+  const [editText, setEditText] = useState('');
+
+  const hasVideo = !!currentProject?.video_path;
+
+  const handleGenerate = async () => {
+    if (!currentProject) return;
+    setIsGenerating(true);
+    setError(null);
+    setNarrationSegments([]);
+    try {
+      const result = await generateNarration(currentProject.id, language, style);
+      setNarrationSegments(result.segments);
+    } catch (e: any) {
+      setError(e?.response?.data?.detail || e.message || 'Failed to generate narration');
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const handleApply = async () => {
+    if (!currentProject || narrationSegments.length === 0) return;
+    const existing = currentProject.segments?.length || 0;
+    if (existing > 0) {
+      if (!confirm(`This will replace ${existing} existing subtitle segment(s) with the narration. Continue?`)) return;
+    }
+    setIsApplying(true);
+    setError(null);
+    try {
+      await applyNarration(currentProject.id, narrationSegments, voice);
+      await loadProject(currentProject.id);
+      setNarrationSegments([]);
+    } catch (e: any) {
+      setError(e?.response?.data?.detail || e.message || 'Failed to apply narration');
+    } finally {
+      setIsApplying(false);
+    }
+  };
+
+  const handleEditStart = (idx: number) => {
+    setEditingIdx(idx);
+    setEditText(narrationSegments[idx].text);
+  };
+
+  const handleEditSave = () => {
+    if (editingIdx === null) return;
+    setNarrationSegments(prev =>
+      prev.map((s, i) => i === editingIdx ? { ...s, text: editText } : s)
+    );
+    setEditingIdx(null);
+  };
+
+  const handleDelete = (idx: number) => {
+    setNarrationSegments(prev => prev.filter((_, i) => i !== idx));
+  };
+
+  const formatTime = (s: number) => {
+    const mins = Math.floor(s / 60);
+    const secs = Math.floor(s % 60);
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  if (!hasVideo) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full p-6 text-center">
+        <Mic className="w-10 h-10 text-zinc-600 mb-3" />
+        <p className="text-sm text-zinc-400">Upload a video first to generate AI narration</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col h-full overflow-auto p-3 gap-3">
+      {/* Header */}
+      <div className="flex items-center gap-2">
+        <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
+          <Mic className="w-4 h-4 text-white" />
+        </div>
+        <div>
+          <h3 className="text-sm font-bold" style={{ color: 'var(--text-bright)' }}>AI Narration</h3>
+          <p className="text-[10px] text-zinc-500">Generate voiceover script from video</p>
+        </div>
+      </div>
+
+      {/* Style Selection */}
+      <div>
+        <label className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wide mb-1.5 block">
+          Narration Style
+        </label>
+        <div className="grid grid-cols-2 gap-1.5">
+          {STYLES.map(s => (
+            <button
+              key={s.id}
+              onClick={() => setStyle(s.id)}
+              className={`text-left px-2.5 py-2 rounded-lg border transition-all text-xs ${
+                style === s.id
+                  ? 'border-indigo-500 bg-indigo-500/10 text-indigo-300'
+                  : 'border-zinc-700 bg-zinc-800/50 text-zinc-400 hover:border-zinc-600'
+              }`}
+            >
+              <div className="font-medium">{s.label}</div>
+              <div className="text-[9px] mt-0.5 opacity-70">{s.desc}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Language */}
+      <div>
+        <label className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wide mb-1.5 block">
+          Language
+        </label>
+        <select
+          value={language}
+          onChange={e => setLanguage(e.target.value)}
+          className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-xs text-zinc-200 focus:border-indigo-500 focus:outline-none"
+        >
+          {LANGUAGES.map(l => (
+            <option key={l.id} value={l.id}>{l.label}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Voice */}
+      <div>
+        <label className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wide mb-1.5 block">
+          Voice for TTS
+        </label>
+        <div className="flex gap-2">
+          {VOICES.map(v => (
+            <button
+              key={v.id}
+              onClick={() => setVoice(v.id)}
+              className={`flex-1 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
+                voice === v.id
+                  ? v.id === 'female'
+                    ? 'border-pink-500 bg-pink-500/10 text-pink-300'
+                    : v.id === 'young'
+                    ? 'border-green-500 bg-green-500/10 text-green-300'
+                    : v.id === 'old'
+                    ? 'border-amber-500 bg-amber-500/10 text-amber-300'
+                    : 'border-blue-500 bg-blue-500/10 text-blue-300'
+                  : 'border-zinc-700 bg-zinc-800/50 text-zinc-400 hover:border-zinc-600'
+              }`}
+            >
+              {v.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Generate Button */}
+      <button
+        onClick={handleGenerate}
+        disabled={isGenerating || !hasVideo}
+        className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white text-sm font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-indigo-500/20"
+      >
+        {isGenerating ? (
+          <>
+            <Loader2 className="w-4 h-4 animate-spin" />
+            Analyzing video & writing narration...
+          </>
+        ) : (
+          <>
+            <Mic className="w-4 h-4" />
+            Generate Narration
+          </>
+        )}
+      </button>
+
+      {/* Error */}
+      {error && (
+        <div className="flex items-start gap-2 p-2.5 rounded-lg bg-red-900/30 border border-red-800 text-red-300 text-xs">
+          <AlertCircle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {/* Preview */}
+      {narrationSegments.length > 0 && (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wide">
+              Preview — {narrationSegments.length} segments
+            </span>
+            <button
+              onClick={handleGenerate}
+              disabled={isGenerating}
+              className="flex items-center gap-1 text-[10px] text-indigo-400 hover:text-indigo-300"
+              title="Regenerate"
+            >
+              <RefreshCw className="w-3 h-3" /> Redo
+            </button>
+          </div>
+
+          <div className="max-h-[300px] overflow-auto rounded-lg border border-zinc-700 divide-y divide-zinc-800">
+            {narrationSegments.map((seg, idx) => (
+              <div key={idx} className="px-2.5 py-2 hover:bg-zinc-800/50 group">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-[10px] text-zinc-600 font-mono">
+                    {formatTime(seg.start_time)} → {formatTime(seg.end_time)}
+                  </span>
+                  <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button
+                      onClick={() => handleDelete(idx)}
+                      className="p-0.5 text-red-500 hover:text-red-400"
+                      title="Remove segment"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  </div>
+                </div>
+                {editingIdx === idx ? (
+                  <div className="flex gap-1">
+                    <textarea
+                      value={editText}
+                      onChange={e => setEditText(e.target.value)}
+                      className="flex-1 bg-zinc-900 border border-zinc-600 rounded px-2 py-1 text-xs text-zinc-200 focus:border-indigo-500 focus:outline-none resize-none"
+                      rows={2}
+                      autoFocus
+                    />
+                    <button
+                      onClick={handleEditSave}
+                      className="px-2 py-1 bg-indigo-600 text-white rounded text-[10px]"
+                    >
+                      <Check className="w-3 h-3" />
+                    </button>
+                  </div>
+                ) : (
+                  <p
+                    className="text-xs text-zinc-300 leading-relaxed cursor-pointer hover:text-zinc-100"
+                    onClick={() => handleEditStart(idx)}
+                    title="Click to edit"
+                  >
+                    {seg.text}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {/* Apply Button */}
+          <button
+            onClick={handleApply}
+            disabled={isApplying || narrationSegments.length === 0}
+            className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 hover:to-emerald-500 text-white text-sm font-semibold transition-all disabled:opacity-50 shadow-lg shadow-green-500/20"
+          >
+            {isApplying ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Applying narration...
+              </>
+            ) : (
+              <>
+                <Play className="w-4 h-4" />
+                Apply as Subtitles & Generate Audio
+              </>
+            )}
+          </button>
+          <p className="text-[9px] text-zinc-600 text-center">
+            This replaces existing subtitles. You can then generate TTS audio from the Workflow tab.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
