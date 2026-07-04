@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings as app_config
 from backend.database.db import get_db
-from backend.database.models import ApiKey, AppSetting, VoiceProfile
+from backend.database.models import ApiKey, AppSetting
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -42,9 +42,6 @@ class SettingsResponse(BaseModel):
     gemini_model: str
     speaker_voice: str
     tts_engine: str
-    voxcpm_model_path: str
-    voxcpm_inference_steps: int
-    active_voice_clone_id: str
     available_models: List[dict]
     api_keys: List[ApiKeyOut]
 
@@ -53,9 +50,6 @@ class SettingsUpdate(BaseModel):
     gemini_model: Optional[str] = None
     speaker_voice: Optional[str] = None
     tts_engine: Optional[str] = None
-    voxcpm_model_path: Optional[str] = None
-    voxcpm_inference_steps: Optional[int] = None
-    active_voice_clone_id: Optional[str] = None
 
 
 # --- Helpers ---
@@ -96,8 +90,6 @@ async def _sync_config(db: AsyncSession) -> None:
     model = await _get_setting(db, "gemini_model", app_config.gemini_model)
     voice = await _get_setting(db, "speaker_voice", app_config.speaker_voice)
     tts_engine = await _get_setting(db, "tts_engine", app_config.tts_engine)
-    voxcpm_model_path = await _get_setting(db, "voxcpm_model_path", app_config.voxcpm_model_path)
-    voice_clone_id = await _get_setting(db, "active_voice_clone_id", "")
 
     # If the stored model was deprecated/removed, fall back to default
     valid_ids = [m["id"] for m in AVAILABLE_MODELS]
@@ -105,34 +97,9 @@ async def _sync_config(db: AsyncSession) -> None:
         model = app_config.gemini_model if app_config.gemini_model in valid_ids else valid_ids[0]
         await _set_setting(db, "gemini_model", model)
 
-    steps_str = await _get_setting(db, "voxcpm_inference_steps", str(app_config.voxcpm_inference_steps))
-    try:
-        steps = int(steps_str)
-        if steps < 1:
-            steps = 1
-    except ValueError:
-        steps = 3
-
     app_config.gemini_model = model
     app_config.speaker_voice = voice
     app_config.tts_engine = tts_engine
-    app_config.voxcpm_model_path = voxcpm_model_path
-    app_config.voxcpm_inference_steps = steps
-    app_config.active_voice_clone_id = voice_clone_id
-
-    # Resolve active voice clone path/text for use by tts_service
-    if voice_clone_id:
-        vp = await db.get(VoiceProfile, voice_clone_id)
-        if vp:
-            app_config.active_voice_clone_path = vp.audio_path
-            app_config.active_voice_clone_text = vp.prompt_text
-        else:
-            app_config.active_voice_clone_id = ""
-            app_config.active_voice_clone_path = ""
-            app_config.active_voice_clone_text = ""
-    else:
-        app_config.active_voice_clone_path = ""
-        app_config.active_voice_clone_text = ""
 
     # Load the first active key into the config for backward compat
     result = await db.execute(
@@ -157,9 +124,6 @@ async def get_settings(db: AsyncSession = Depends(get_db)):
         gemini_model=app_config.gemini_model,
         speaker_voice=app_config.speaker_voice,
         tts_engine=app_config.tts_engine,
-        voxcpm_model_path=app_config.voxcpm_model_path,
-        voxcpm_inference_steps=app_config.voxcpm_inference_steps,
-        active_voice_clone_id=app_config.active_voice_clone_id,
         available_models=AVAILABLE_MODELS,
         api_keys=await _all_keys(db),
     )
@@ -179,24 +143,9 @@ async def update_settings(data: SettingsUpdate, db: AsyncSession = Depends(get_d
         await _set_setting(db, "speaker_voice", data.speaker_voice)
 
     if data.tts_engine is not None:
-        if data.tts_engine not in ("edge-tts", "voxcpm"):
-            raise HTTPException(400, "Invalid TTS engine. Choose 'edge-tts' or 'voxcpm'.")
+        if data.tts_engine != "edge-tts":
+            raise HTTPException(400, "Invalid TTS engine. Only 'edge-tts' is supported.")
         await _set_setting(db, "tts_engine", data.tts_engine)
-
-    if data.voxcpm_model_path is not None:
-        await _set_setting(db, "voxcpm_model_path", data.voxcpm_model_path.strip())
-
-    if data.voxcpm_inference_steps is not None:
-        steps = max(1, data.voxcpm_inference_steps)
-        await _set_setting(db, "voxcpm_inference_steps", str(steps))
-
-    if data.active_voice_clone_id is not None:
-        # "" means "no clone / use voice design mode"
-        if data.active_voice_clone_id and data.active_voice_clone_id != "none":
-            vp = await db.get(VoiceProfile, data.active_voice_clone_id)
-            if not vp:
-                raise HTTPException(404, "Voice profile not found")
-        await _set_setting(db, "active_voice_clone_id", data.active_voice_clone_id if data.active_voice_clone_id != "none" else "")
 
     await db.commit()
     await _sync_config(db)
@@ -205,9 +154,6 @@ async def update_settings(data: SettingsUpdate, db: AsyncSession = Depends(get_d
         gemini_model=app_config.gemini_model,
         speaker_voice=app_config.speaker_voice,
         tts_engine=app_config.tts_engine,
-        voxcpm_model_path=app_config.voxcpm_model_path,
-        voxcpm_inference_steps=app_config.voxcpm_inference_steps,
-        active_voice_clone_id=app_config.active_voice_clone_id,
         available_models=AVAILABLE_MODELS,
         api_keys=await _all_keys(db),
     )

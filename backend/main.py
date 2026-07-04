@@ -21,18 +21,6 @@ async def lifespan(app: FastAPI):
     async with async_session() as db:
         await _sync_config(db)
 
-    # Reset voxcpm engine to edge-tts on startup (voxcpm loads 8GB model into RAM)
-    if settings.tts_engine == "voxcpm":
-        settings.tts_engine = "edge-tts"
-        from backend.database.models import AppSetting
-        async with async_session() as db:
-            row = await db.get(AppSetting, "tts_engine")
-            if row:
-                row.value = "edge-tts"
-            else:
-                db.add(AppSetting(key="tts_engine", value="edge-tts"))
-            await db.commit()
-
     yield
 
 

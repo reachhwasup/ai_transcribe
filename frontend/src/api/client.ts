@@ -540,54 +540,8 @@ export interface AppSettings {
   gemini_model: string;
   speaker_voice: string;
   tts_engine: string;
-  voxcpm_model_path: string;
-  voxcpm_inference_steps: number;
-  active_voice_clone_id: string;
   available_models: { id: string; name: string; description: string }[];
   api_keys: ApiKeyInfo[];
-}
-
-// Voice Cloner
-export interface VoiceProfile {
-  id: string;
-  name: string;
-  prompt_text: string;
-  audio_url: string;
-  created_at: string;
-}
-
-export async function fetchVoiceProfiles(): Promise<VoiceProfile[]> {
-  const { data } = await api.get('/voice-cloner/profiles');
-  return data;
-}
-
-export async function uploadVoiceProfile(
-  file: File,
-  name: string,
-  promptText: string = '',
-): Promise<VoiceProfile> {
-  const form = new FormData();
-  form.append('file', file);
-  form.append('name', name);
-  form.append('prompt_text', promptText);
-  const { data } = await api.post('/voice-cloner/profiles', form, {
-    headers: { 'Content-Type': 'multipart/form-data' },
-  });
-  return data;
-}
-
-export async function deleteVoiceProfile(profileId: string): Promise<void> {
-  await api.delete(`/voice-cloner/profiles/${profileId}`);
-}
-
-export async function autoTranscribeVoiceProfile(profileId: string): Promise<VoiceProfile> {
-  const { data } = await api.patch(`/voice-cloner/profiles/${profileId}/transcript`, {});
-  return data;
-}
-
-export async function updateVoiceProfileTranscript(profileId: string, text: string): Promise<VoiceProfile> {
-  const { data } = await api.patch(`/voice-cloner/profiles/${profileId}/transcript`, { prompt_text: text });
-  return data;
 }
 
 export async function fetchSettings(): Promise<AppSettings> {
@@ -595,7 +549,7 @@ export async function fetchSettings(): Promise<AppSettings> {
   return data;
 }
 
-export async function updateSettings(updates: { gemini_model?: string; speaker_voice?: string; tts_engine?: string; voxcpm_model_path?: string; voxcpm_inference_steps?: number; active_voice_clone_id?: string }): Promise<AppSettings> {
+export async function updateSettings(updates: { gemini_model?: string; speaker_voice?: string; tts_engine?: string }): Promise<AppSettings> {
   const { data } = await api.patch('/settings/', updates);
   return data;
 }

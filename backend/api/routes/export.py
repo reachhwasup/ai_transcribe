@@ -1460,9 +1460,7 @@ async def generate_voice_segments_stream(
         raise HTTPException(400, "No segments found")
 
     # edge-tts is fast and stateless — run up to 6 segments in parallel.
-    # VoxCPM uses a single shared model that is not concurrency-safe — run sequentially.
-    from backend.config import settings as _cfg
-    CONCURRENCY = 1 if _cfg.tts_engine == "voxcpm" else 6
+    CONCURRENCY = 6
 
     async def _process_one(seg_tuple):
         seg_id, text, start_time, end_time, voice_profile, voice_name, audio_speed, speaker, emotion = seg_tuple

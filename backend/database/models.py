@@ -82,11 +82,3 @@ class AppSetting(Base):
     value = Column(Text, default="")
 
 
-class VoiceProfile(Base):
-    __tablename__ = "voice_profiles"
-
-    id = Column(String, primary_key=True, default=generate_uuid)
-    name = Column(String(255), nullable=False)
-    audio_path = Column(String(1000), nullable=False)
-    prompt_text = Column(Text, default="")
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
