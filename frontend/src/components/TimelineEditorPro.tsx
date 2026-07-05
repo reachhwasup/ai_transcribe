@@ -297,8 +297,13 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
         : aiMutedProfiles.has(profile);
       const inRange = sourceTime >= seg.start_time && sourceTime < seg.end_time;
       if (inRange && isPlaying && !isMuted) {
-        if (audio.paused) {
-          audio.currentTime = sourceTime - seg.start_time;
+        const offset = sourceTime - seg.start_time;
+        const clipDur = Number.isFinite(audio.duration) ? audio.duration : Infinity;
+        // Only (re)start if the playhead is still within the clip's own length —
+        // otherwise an audio shorter than its slot restarts from the beginning
+        // every time it finishes, repeating the speech until the slot ends.
+        if (audio.paused && offset < clipDur - 0.05) {
+          audio.currentTime = offset;
           audio.play().catch(() => {});
         }
       } else {
