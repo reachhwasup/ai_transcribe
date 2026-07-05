@@ -141,6 +141,8 @@ export default function SettingsModal({ open, onClose }: Props) {
   const [showNewKey, setShowNewKey] = useState(false);
   const [selectedModel, setSelectedModel] = useState('');
   const [ttsEngine, setTtsEngine] = useState('edge-tts');
+  const [transcribeEngine, setTranscribeEngine] = useState('gemini');
+  const [whisperModel, setWhisperModel] = useState('mlx-community/whisper-large-v3-turbo');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [addingKey, setAddingKey] = useState(false);
@@ -156,6 +158,8 @@ export default function SettingsModal({ open, onClose }: Props) {
       setSettings(s);
       setSelectedModel(s.gemini_model);
       setTtsEngine(s.tts_engine || 'edge-tts');
+      setTranscribeEngine(s.transcribe_engine || 'gemini');
+      setWhisperModel(s.whisper_model || 'mlx-community/whisper-large-v3-turbo');
     } catch {
       setError('Failed to load settings');
     }
@@ -179,12 +183,18 @@ export default function SettingsModal({ open, onClose }: Props) {
     setError('');
     setSaved(false);
     try {
-      const updates: { gemini_model?: string; tts_engine?: string } = {};
+      const updates: { gemini_model?: string; tts_engine?: string; transcribe_engine?: string; whisper_model?: string } = {};
       if (selectedModel && selectedModel !== settings?.gemini_model) {
         updates.gemini_model = selectedModel;
       }
       if (ttsEngine !== settings?.tts_engine) {
         updates.tts_engine = ttsEngine;
+      }
+      if (transcribeEngine !== settings?.transcribe_engine) {
+        updates.transcribe_engine = transcribeEngine;
+      }
+      if (transcribeEngine === 'whisper' && whisperModel !== settings?.whisper_model) {
+        updates.whisper_model = whisperModel;
       }
       if (Object.keys(updates).length > 0) {
         const updated = await updateSettings(updates);
@@ -358,6 +368,61 @@ export default function SettingsModal({ open, onClose }: Props) {
                             </label>
                           ))}
                         </div>
+                      </div>
+
+                      {/* Transcription Engine */}
+                      <div>
+                        <h3 className="text-sm font-semibold text-white mb-1">Transcription Engine</h3>
+                        <p className="text-xs text-zinc-500 mb-3">Choose how videos are transcribed to text.</p>
+                        <div className="space-y-2">
+                          <label
+                            className={`flex items-start gap-3 px-3 py-2.5 rounded-lg border cursor-pointer transition-all ${
+                              transcribeEngine === 'gemini'
+                                ? 'border-khmer-500 bg-khmer-900/20'
+                                : 'border-zinc-800 hover:border-zinc-600 bg-zinc-800/50'
+                            }`}
+                          >
+                            <input type="radio" name="transcribe_engine" value="gemini" checked={transcribeEngine === 'gemini'} onChange={() => setTranscribeEngine('gemini')} className="sr-only" />
+                            <div className={`w-4 h-4 mt-0.5 rounded-full border-2 flex items-center justify-center shrink-0 ${transcribeEngine === 'gemini' ? 'border-khmer-500' : 'border-zinc-600'}`}>
+                              {transcribeEngine === 'gemini' && <div className="w-2 h-2 rounded-full bg-khmer-500" />}
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm text-white">Gemini API <span className="text-[10px] ml-1 px-1.5 py-0.5 rounded-full bg-green-900/40 text-green-400">Cloud</span></p>
+                              <p className="text-xs text-zinc-500">Transcribes and translates in one step. Needs API key and internet.</p>
+                            </div>
+                          </label>
+                          <label
+                            className={`flex items-start gap-3 px-3 py-2.5 rounded-lg border cursor-pointer transition-all ${
+                              transcribeEngine === 'whisper'
+                                ? 'border-blue-500 bg-blue-900/20'
+                                : 'border-zinc-800 hover:border-zinc-600 bg-zinc-800/50'
+                            }`}
+                          >
+                            <input type="radio" name="transcribe_engine" value="whisper" checked={transcribeEngine === 'whisper'} onChange={() => setTranscribeEngine('whisper')} className="sr-only" />
+                            <div className={`w-4 h-4 mt-0.5 rounded-full border-2 flex items-center justify-center shrink-0 ${transcribeEngine === 'whisper' ? 'border-blue-500' : 'border-zinc-600'}`}>
+                              {transcribeEngine === 'whisper' && <div className="w-2 h-2 rounded-full bg-blue-500" />}
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm text-white">Whisper <span className="text-[10px] ml-1 px-1.5 py-0.5 rounded-full bg-blue-900/40 text-blue-400">Local</span></p>
+                              <p className="text-xs text-zinc-500">Runs on this Mac — no API quota. Gemini still translates the result to your target language.</p>
+                            </div>
+                          </label>
+                        </div>
+                        {transcribeEngine === 'whisper' && (
+                          <div className="mt-3">
+                            <label className="text-xs text-zinc-400 mb-1 block">Whisper model</label>
+                            <select
+                              value={whisperModel}
+                              onChange={(e) => setWhisperModel(e.target.value)}
+                              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500"
+                            >
+                              <option value="mlx-community/whisper-large-v3-turbo">Large v3 Turbo — best quality (~1.6GB)</option>
+                              <option value="mlx-community/whisper-medium-mlx">Medium — balanced (~1.5GB)</option>
+                              <option value="mlx-community/whisper-small-mlx">Small — fastest (~500MB)</option>
+                            </select>
+                            <p className="text-[10px] text-zinc-600 mt-1">The model downloads automatically on first use.</p>
+                          </div>
+                        )}
                       </div>
 
                       {/* TTS Engine */}
