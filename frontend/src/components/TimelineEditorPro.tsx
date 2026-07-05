@@ -548,6 +548,12 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     if (!rulerDragging) return;
 
     const handleMouseMove = (e: MouseEvent) => {
+      if (e.buttons === 0) {
+        // Mouse button is no longer held — the mouseup was missed
+        // (released outside the window, app switch, …). End the drag.
+        handleMouseUp();
+        return;
+      }
       const rect = containerRef.current?.getBoundingClientRect();
       if (!rect) return;
       const x = e.clientX - rect.left + (containerRef.current?.scrollLeft || 0);
@@ -599,6 +605,10 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     const snap = dragging; // stable snapshot of drag start state
 
     const handleMouseMove = (e: MouseEvent) => {
+      if (e.buttons === 0) {
+        handleMouseUp();
+        return;
+      }
       const pps = pixelsPerSecondRef.current;
       const dx = e.clientX - snap.startX;
       const dt = dx / pps;
@@ -687,6 +697,10 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     if (!clipDragging) return;
 
     const handleMouseMove = (e: MouseEvent) => {
+      if (e.buttons === 0) {
+        handleMouseUp();
+        return;
+      }
       const dx = e.clientX - clipDragging.startX;
       const dt = dx / pixelsPerSecond;
       const clipId = clipDragging.clipId;
