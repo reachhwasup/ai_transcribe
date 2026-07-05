@@ -608,9 +608,11 @@ def _separate_with_demucs(
     cmd = [
         python, "-m", "demucs",
         "--two-stems", "vocals",
-        "-n", "htdemucs",
+        # Fine-tuned model: ~4x slower than plain htdemucs but separates
+        # vocals from music noticeably more cleanly.
+        "-n", "htdemucs_ft",
         "--shifts", "0",
-        "--overlap", "0.1",
+        "--overlap", "0.25",
         "--jobs", "2",
         "--out", demucs_out,
         audio_path,
@@ -622,10 +624,10 @@ def _separate_with_demucs(
         shutil.rmtree(demucs_out, ignore_errors=True)
         raise RuntimeError(f"Demucs failed: {r.stderr[-500:]}")
 
-    # Demucs outputs to: <out>/htdemucs/<stem_name>/vocals.wav and no_vocals.wav
+    # Demucs outputs to: <out>/<model>/<stem_name>/vocals.wav and no_vocals.wav
     stem_name = Path(audio_path).stem  # e.g. "full_audio"
-    demucs_vocals = os.path.join(demucs_out, "htdemucs", stem_name, "vocals.wav")
-    demucs_bgm = os.path.join(demucs_out, "htdemucs", stem_name, "no_vocals.wav")
+    demucs_vocals = os.path.join(demucs_out, "htdemucs_ft", stem_name, "vocals.wav")
+    demucs_bgm = os.path.join(demucs_out, "htdemucs_ft", stem_name, "no_vocals.wav")
 
     if not os.path.exists(demucs_vocals) or not os.path.exists(demucs_bgm):
         shutil.rmtree(demucs_out, ignore_errors=True)
