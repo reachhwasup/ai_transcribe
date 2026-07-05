@@ -5,7 +5,7 @@ AI-powered video transcription and translation to Khmer (ខ្មែរ) using 
 ## Features
 
 - **Video Upload** — Upload MP4, MKV, AVI, MOV, WebM files
-- **AI Transcription** — Google Gemini (cloud) or Whisper running locally on your Mac (choose in Settings; Gemini translates either way)
+- **AI Transcription** — Automatic transcription using Google Gemini (2.5 Flash by default, configurable in Settings)
 - **Khmer Translation** — Transcribe and translate audio to Khmer language
 - **AI Narration (TTS)** — Generate speech for segments with Microsoft Edge neural voices (edge-tts)
 - **Background Music** — Mood analysis and BGM generation, plus vocal/music separation (Demucs)

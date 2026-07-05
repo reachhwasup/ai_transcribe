@@ -17,9 +17,7 @@ from sqlalchemy.orm import selectinload
 from backend.database.db import get_db, async_session
 from backend.database.models import Project, Segment, VideoClip
 from backend.api.schemas import SegmentUpdate, SegmentResponse, TranscribeRequest, ProjectResponse
-from backend.config import settings as app_config
 from backend.services.gemini_service import transcribe_video, transcribe_video_streaming, generate_narration
-from backend.services import whisper_service
 
 
 router = APIRouter(prefix="/projects/{project_id}/transcripts", tags=["transcripts"])
@@ -226,17 +224,11 @@ async def generate_transcript(
             clipped_path, clip_ranges = await _extract_clips_video(project.video_path, video_clips)
             actual_path = clipped_path
 
-        # Transcribe using the configured engine
-        if app_config.transcribe_engine == "whisper":
-            segments_data = await whisper_service.transcribe_video(
-                actual_path,
-                language=request.language or project.language,
-            )
-        else:
-            segments_data = await transcribe_video(
-                actual_path,
-                language=request.language or project.language,
-            )
+        # Transcribe using Gemini
+        segments_data = await transcribe_video(
+            actual_path,
+            language=request.language or project.language,
+        )
 
         # Offset timestamps if we used a clipped video
         if clip_ranges:
@@ -553,12 +545,8 @@ async def generate_transcript_stream(
                 await db.commit()
 
             # Collect all segments first, then offset timestamps if clipped
-            if app_config.transcribe_engine == "whisper":
-                stream = whisper_service.transcribe_video_streaming(actual_video_path, language)
-            else:
-                stream = transcribe_video_streaming(actual_video_path, language)
             raw_segments = []
-            async for item in stream:
+            async for item in transcribe_video_streaming(actual_video_path, language):
                 # Progress update (not a segment)
                 if "_progress" in item:
                     yield f"data: {json.dumps({'type': 'progress', 'message': item['_progress']})}\n\n"

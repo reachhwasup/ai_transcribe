@@ -11,4 +11,3 @@ moviepy==2.1.2
 aiofiles==24.1.0
 edge-tts>=7.0.0
 demucs>=4.0.0
-mlx-whisper>=0.4.0; sys_platform == "darwin" and platform_machine == "arm64"

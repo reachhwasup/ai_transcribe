@@ -7,8 +7,6 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     speaker_voice: str = "female"
     tts_engine: str = "edge-tts"
-    transcribe_engine: str = "gemini"  # gemini | whisper
-    whisper_model: str = "mlx-community/whisper-large-v3-turbo"
     database_url: str = "sqlite+aiosqlite:///./data/app.db"
     upload_dir: str = "./uploads"
 

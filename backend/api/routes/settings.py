@@ -42,8 +42,6 @@ class SettingsResponse(BaseModel):
     gemini_model: str
     speaker_voice: str
     tts_engine: str
-    transcribe_engine: str
-    whisper_model: str
     available_models: List[dict]
     api_keys: List[ApiKeyOut]
 
@@ -52,8 +50,6 @@ class SettingsUpdate(BaseModel):
     gemini_model: Optional[str] = None
     speaker_voice: Optional[str] = None
     tts_engine: Optional[str] = None
-    transcribe_engine: Optional[str] = None
-    whisper_model: Optional[str] = None
 
 
 # --- Helpers ---
@@ -94,8 +90,6 @@ async def _sync_config(db: AsyncSession) -> None:
     model = await _get_setting(db, "gemini_model", app_config.gemini_model)
     voice = await _get_setting(db, "speaker_voice", app_config.speaker_voice)
     tts_engine = await _get_setting(db, "tts_engine", app_config.tts_engine)
-    transcribe_engine = await _get_setting(db, "transcribe_engine", app_config.transcribe_engine)
-    whisper_model = await _get_setting(db, "whisper_model", app_config.whisper_model)
 
     # If the stored model was deprecated/removed, fall back to default
     valid_ids = [m["id"] for m in AVAILABLE_MODELS]
@@ -106,8 +100,6 @@ async def _sync_config(db: AsyncSession) -> None:
     app_config.gemini_model = model
     app_config.speaker_voice = voice
     app_config.tts_engine = tts_engine
-    app_config.transcribe_engine = transcribe_engine
-    app_config.whisper_model = whisper_model
 
     # Load the first active key into the config for backward compat
     result = await db.execute(
@@ -132,8 +124,6 @@ async def get_settings(db: AsyncSession = Depends(get_db)):
         gemini_model=app_config.gemini_model,
         speaker_voice=app_config.speaker_voice,
         tts_engine=app_config.tts_engine,
-        transcribe_engine=app_config.transcribe_engine,
-        whisper_model=app_config.whisper_model,
         available_models=AVAILABLE_MODELS,
         api_keys=await _all_keys(db),
     )
@@ -157,14 +147,6 @@ async def update_settings(data: SettingsUpdate, db: AsyncSession = Depends(get_d
             raise HTTPException(400, "Invalid TTS engine. Only 'edge-tts' is supported.")
         await _set_setting(db, "tts_engine", data.tts_engine)
 
-    if data.transcribe_engine is not None:
-        if data.transcribe_engine not in ("gemini", "whisper"):
-            raise HTTPException(400, "Invalid transcription engine. Choose 'gemini' or 'whisper'.")
-        await _set_setting(db, "transcribe_engine", data.transcribe_engine)
-
-    if data.whisper_model is not None:
-        await _set_setting(db, "whisper_model", data.whisper_model.strip())
-
     await db.commit()
     await _sync_config(db)
 
@@ -172,8 +154,6 @@ async def update_settings(data: SettingsUpdate, db: AsyncSession = Depends(get_d
         gemini_model=app_config.gemini_model,
         speaker_voice=app_config.speaker_voice,
         tts_engine=app_config.tts_engine,
-        transcribe_engine=app_config.transcribe_engine,
-        whisper_model=app_config.whisper_model,
         available_models=AVAILABLE_MODELS,
         api_keys=await _all_keys(db),
     )

@@ -540,8 +540,6 @@ export interface AppSettings {
   gemini_model: string;
   speaker_voice: string;
   tts_engine: string;
-  transcribe_engine: string;
-  whisper_model: string;
   available_models: { id: string; name: string; description: string }[];
   api_keys: ApiKeyInfo[];
 }
@@ -551,7 +549,7 @@ export async function fetchSettings(): Promise<AppSettings> {
   return data;
 }
 
-export async function updateSettings(updates: { gemini_model?: string; speaker_voice?: string; tts_engine?: string; transcribe_engine?: string; whisper_model?: string }): Promise<AppSettings> {
+export async function updateSettings(updates: { gemini_model?: string; speaker_voice?: string; tts_engine?: string }): Promise<AppSettings> {
   const { data } = await api.patch('/settings/', updates);
   return data;
 }
