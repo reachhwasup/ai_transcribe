@@ -289,6 +289,7 @@ Rules:
 - NO GAPS: Do not leave large sections of the video without narration. If the video is 60 seconds long, your narration segments should span from 0s to 60s. Check the video duration and make sure your last segment's end_time is near the end of the video.
 - Timestamps should be precise and not overlap.
 - Do NOT just transcribe what people say — write NEW narration ABOUT the video.
+- IGNORE watermarks, usernames, platform logos, video IDs, and URLs shown on screen (e.g. douyin.com or tiktok.com links). NEVER include a URL, username, or app name in the narration text.
 - The narration should make sense even without seeing the video (describe what's happening).
 - Use engaging, conversational tone appropriate for social media.
 - IMPORTANT: Before finishing, verify that your segments cover the full video duration. If the video is long, generate MORE segments. Do not cut short.
@@ -331,6 +332,8 @@ async def generate_narration(video_path: str, language: str = "km", style: str =
     cleaned = []
     for i, seg in enumerate(segments):
         seg_text = str(seg.get("text", "")).strip()
+        # Strip watermark URLs Gemini may have read off the video
+        seg_text = re.sub(r"(?:https?://|www\.)\S+", "", seg_text).strip()
         if not seg_text:
             continue
         cleaned.append({

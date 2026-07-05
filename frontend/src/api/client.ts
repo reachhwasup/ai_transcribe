@@ -214,7 +214,8 @@ export async function generateNarration(
   const { data } = await api.post(
     `/projects/${projectId}/transcripts/generate-narration`,
     { language, style },
-    { timeout: 300000 },
+    // Long videos take Gemini a while to analyze — allow up to 15 minutes
+    { timeout: 900000 },
   );
   return data;
 }
