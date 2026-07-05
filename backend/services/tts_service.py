@@ -230,6 +230,17 @@ def _get_voxcpm_reference(model, voice_profile: str) -> tuple[str, str]:
     return ref_path, _VOXCPM_REF_TEXT
 
 
+def _expected_speech_ceiling(text: str) -> float:
+    """Generous upper bound (seconds) for how long the spoken text should be,
+    weighted by script (a CJK char is a syllable; Khmer/Latin chars are not)."""
+    khmer = len(re.findall(r"[ក-៿]", text))
+    cjk = len(re.findall(r"[一-鿿]", text))
+    latin = len(re.findall(r"[A-Za-z]", text))
+    other = max(len(text) - khmer - cjk - latin, 0)
+    est = khmer * 0.09 + cjk * 0.30 + latin * 0.08 + other * 0.04
+    return max(2.0, est * 1.7 + 0.8)
+
+
 async def _generate_voxcpm_audio(
     text: str,
     voice_profile: str = "female",
@@ -252,7 +263,20 @@ async def _generate_voxcpm_audio(
             normalize=False,
         )
 
-    wav = await asyncio.to_thread(_generate)
+    # Autoregressive TTS occasionally loops and speaks the text twice.
+    # Generation is stochastic, so when the output is far longer than the
+    # text warrants, retry and keep the shortest attempt.
+    sample_rate = model.tts_model.sample_rate
+    ceiling = _expected_speech_ceiling(text)
+    best_dur, wav = None, None
+    for attempt in range(3):
+        candidate = await asyncio.to_thread(_generate)
+        dur = len(candidate) / sample_rate
+        if best_dur is None or dur < best_dur:
+            best_dur, wav = dur, candidate
+        if dur <= ceiling:
+            break
+        print(f"[VoxCPM] {dur:.1f}s audio for ~{ceiling:.1f}s of text — likely repeated speech, retrying ({attempt + 1}/2)")
 
     export_dir = os.path.join(settings.upload_dir, "tts")
     os.makedirs(export_dir, exist_ok=True)
