@@ -7,7 +7,7 @@ AI-powered video transcription and translation to Khmer (ខ្មែរ) using 
 - **Video Upload** — Upload MP4, MKV, AVI, MOV, WebM files
 - **AI Transcription** — Automatic transcription using Google Gemini (2.5 Flash by default, configurable in Settings)
 - **Khmer Translation** — Transcribe and translate audio to Khmer language
-- **AI Narration (TTS)** — Generate speech for segments with Microsoft Edge neural voices (edge-tts)
+- **AI Narration (TTS)** — Emotion-aware speech per segment: edge-tts (fast) or VoxCPM2 (expressive AI voices, local)
 - **Audio Separation** — Isolate vocals from background music (Demucs), for dubbing over the original music
 - **Timeline Editor** — Visual drag-and-resize timeline for adjusting segment timing
 - **Transcript Editor** — Edit text, timestamps, and speaker labels

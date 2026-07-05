@@ -113,6 +113,115 @@ def _probe_duration(ffmpeg: str, path: str) -> float:
         return 0.0
 
 
+# --- VoxCPM lazy-loaded model cache ---
+_voxcpm_model = None
+import threading as _threading
+_voxcpm_lock = _threading.Lock()
+
+
+def _get_voxcpm_model():
+    global _voxcpm_model
+    if _voxcpm_model is None:
+        with _voxcpm_lock:
+            if _voxcpm_model is None:  # double-check inside lock
+                try:
+                    from voxcpm import VoxCPM as _VoxCPM
+                except ImportError:
+                    raise RuntimeError(
+                        "VoxCPM is not installed. Run: pip install voxcpm\n"
+                        "Or switch TTS engine back to 'edge-tts' in Settings."
+                    )
+                import torch
+                if torch.backends.mps.is_available():
+                    device = "mps"
+                elif torch.cuda.is_available():
+                    device = "cuda"
+                else:
+                    device = "cpu"
+                print(f"[VoxCPM] Loading model on {device} …")
+                _voxcpm_model = _VoxCPM.from_pretrained(
+                    settings.voxcpm_model_path,
+                    load_denoiser=False,
+                )
+                # float16 on MPS/CUDA for ~2× faster inference
+                try:
+                    if device in ("mps", "cuda"):
+                        _voxcpm_model = _voxcpm_model.to(device).half()
+                    else:
+                        _voxcpm_model = _voxcpm_model.to(device)
+                except Exception:
+                    try:
+                        _voxcpm_model = _voxcpm_model.to(device)
+                    except Exception:
+                        pass
+                print("[VoxCPM] Model ready.")
+    return _voxcpm_model
+
+
+# Map voice_profile + emotion → VoxCPM natural-language voice description
+def _build_voxcpm_prompt(text: str, voice_profile: str, emotion: str) -> str:
+    """Prepend a VoxCPM voice design description to the text."""
+    age_map = {
+        "young": "young",
+        "old": "elderly",
+        "female": "middle-aged",
+        "male": "middle-aged",
+    }
+    gender_map = {
+        "female": "female",
+        "young": "female",
+        "male": "male",
+        "old": "male",
+    }
+    emotion_map = {
+        "cheerful": "cheerful and bright",
+        "happy": "warm and happy",
+        "sad": "soft and melancholic",
+        "angry": "firm and intense",
+        "excited": "energetic and excited",
+        "calm": "calm and soothing",
+        "serious": "clear and professional",
+        "fearful": "tense and anxious",
+        "neutral": "natural and clear",
+        "": "natural and clear",
+    }
+    age = age_map.get(voice_profile, "middle-aged")
+    gender = gender_map.get(voice_profile, "female")
+    tone = emotion_map.get(emotion or "", "natural and clear")
+    description = f"A {age} {gender}, {tone} voice"
+    return f"({description}){text}"
+
+
+async def _generate_voxcpm_audio(
+    text: str,
+    voice_profile: str = "female",
+    emotion: str = "",
+) -> str:
+    """Generate TTS audio using VoxCPM2 voice design (emotion-aware)."""
+    import soundfile as sf
+    import numpy as np
+
+    model = await asyncio.to_thread(_get_voxcpm_model)
+
+    prompt_text = _build_voxcpm_prompt(text, voice_profile, emotion)
+    wav = await asyncio.to_thread(
+        model.generate,
+        prompt_text,
+        cfg_value=2.0,
+        inference_timesteps=settings.voxcpm_inference_steps,
+        normalize=False,
+    )
+
+    export_dir = os.path.join(settings.upload_dir, "tts")
+    os.makedirs(export_dir, exist_ok=True)
+    output_path = os.path.join(export_dir, f"{uuid.uuid4()}.wav")
+
+    sample_rate = model.tts_model.sample_rate
+    await asyncio.to_thread(sf.write, output_path, np.array(wav), sample_rate)
+
+    return output_path
+
+
 async def generate_segment_audio(
     text: str,
     voice_profile: str = "female",
@@ -122,6 +231,9 @@ async def generate_segment_audio(
     emotion: str = "",
 ) -> str:
     """Generate TTS audio for a single text segment. Returns path to mp3 file."""
+    if settings.tts_engine == "voxcpm":
+        return await _generate_voxcpm_audio(text, voice_profile, emotion)
+
     import edge_tts
 
     detected_lang = _detect_text_language(text)

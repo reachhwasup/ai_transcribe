@@ -141,6 +141,8 @@ export default function SettingsModal({ open, onClose }: Props) {
   const [showNewKey, setShowNewKey] = useState(false);
   const [selectedModel, setSelectedModel] = useState('');
   const [ttsEngine, setTtsEngine] = useState('edge-tts');
+  const [voxcpmPath, setVoxcpmPath] = useState('openbmb/VoxCPM2');
+  const [voxcpmSteps, setVoxcpmSteps] = useState(3);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [addingKey, setAddingKey] = useState(false);
@@ -156,6 +158,8 @@ export default function SettingsModal({ open, onClose }: Props) {
       setSettings(s);
       setSelectedModel(s.gemini_model);
       setTtsEngine(s.tts_engine || 'edge-tts');
+      setVoxcpmPath(s.voxcpm_model_path || 'openbmb/VoxCPM2');
+      setVoxcpmSteps(s.voxcpm_inference_steps ?? 3);
     } catch {
       setError('Failed to load settings');
     }
@@ -179,12 +183,18 @@ export default function SettingsModal({ open, onClose }: Props) {
     setError('');
     setSaved(false);
     try {
-      const updates: { gemini_model?: string; tts_engine?: string } = {};
+      const updates: { gemini_model?: string; tts_engine?: string; voxcpm_model_path?: string; voxcpm_inference_steps?: number } = {};
       if (selectedModel && selectedModel !== settings?.gemini_model) {
         updates.gemini_model = selectedModel;
       }
       if (ttsEngine !== settings?.tts_engine) {
         updates.tts_engine = ttsEngine;
+      }
+      if (ttsEngine === 'voxcpm' && voxcpmPath !== settings?.voxcpm_model_path) {
+        updates.voxcpm_model_path = voxcpmPath;
+      }
+      if (ttsEngine === 'voxcpm' && voxcpmSteps !== (settings?.voxcpm_inference_steps ?? 3)) {
+        updates.voxcpm_inference_steps = voxcpmSteps;
       }
       if (Object.keys(updates).length > 0) {
         const updated = await updateSettings(updates);
@@ -377,11 +387,63 @@ export default function SettingsModal({ open, onClose }: Props) {
                               {ttsEngine === 'edge-tts' && <div className="w-2 h-2 rounded-full bg-blue-500" />}
                             </div>
                             <div className="flex-1 min-w-0">
-                              <p className="text-sm text-white">Edge TTS <span className="text-[10px] ml-1 px-1.5 py-0.5 rounded-full bg-green-900/40 text-green-400">Recommended</span></p>
-                              <p className="text-xs text-zinc-500">Microsoft Edge neural voices. No GPU needed, fast, works offline.</p>
+                              <p className="text-sm text-white">Edge TTS <span className="text-[10px] ml-1 px-1.5 py-0.5 rounded-full bg-green-900/40 text-green-400">Fast</span></p>
+                              <p className="text-xs text-zinc-500">Microsoft Edge neural voices. No GPU needed, fast. Emotion via speed/pitch/volume.</p>
+                            </div>
+                          </label>
+                          <label
+                            className={`flex items-start gap-3 px-3 py-2.5 rounded-lg border cursor-pointer transition-all ${
+                              ttsEngine === 'voxcpm'
+                                ? 'border-purple-500 bg-purple-900/20'
+                                : 'border-zinc-800 hover:border-zinc-600 bg-zinc-800/50'
+                            }`}
+                          >
+                            <input type="radio" name="tts_engine" value="voxcpm" checked={ttsEngine === 'voxcpm'} onChange={() => setTtsEngine('voxcpm')} className="sr-only" />
+                            <div className={`w-4 h-4 mt-0.5 rounded-full border-2 flex items-center justify-center shrink-0 ${ttsEngine === 'voxcpm' ? 'border-purple-500' : 'border-zinc-600'}`}>
+                              {ttsEngine === 'voxcpm' && <div className="w-2 h-2 rounded-full bg-purple-500" />}
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm text-white">VoxCPM2 <span className="text-[10px] ml-1 px-1.5 py-0.5 rounded-full bg-purple-900/40 text-purple-400">AI · Expressive</span></p>
+                              <p className="text-xs text-zinc-500">2B model with natural emotional acting, 30 languages incl. Khmer. Slower — needs ~8GB RAM.</p>
                             </div>
                           </label>
                         </div>
+                        {ttsEngine === 'voxcpm' && (
+                          <div className="mt-3 space-y-3">
+                            <div>
+                              <label className="text-xs text-zinc-400 mb-1 block">Model path / HuggingFace ID</label>
+                              <input
+                                type="text"
+                                value={voxcpmPath}
+                                onChange={(e) => setVoxcpmPath(e.target.value)}
+                                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white focus:outline-none focus:border-purple-500 font-mono"
+                                placeholder="openbmb/VoxCPM2"
+                              />
+                              <p className="text-[10px] text-zinc-600 mt-1">Downloads automatically on first use (~7.6GB).</p>
+                            </div>
+                            <div>
+                              <div className="flex items-center justify-between mb-1">
+                                <label className="text-xs text-zinc-400">Speed / Quality</label>
+                                <span className="text-[10px] font-mono text-purple-400">
+                                  {voxcpmSteps === 2 ? 'Fast (2 steps)' : voxcpmSteps === 3 ? 'Balanced (3 steps)' : voxcpmSteps <= 5 ? 'Quality (5 steps)' : `Custom (${voxcpmSteps} steps)`}
+                                </span>
+                              </div>
+                              <input
+                                type="range"
+                                min={2}
+                                max={10}
+                                step={1}
+                                value={voxcpmSteps}
+                                onChange={(e) => setVoxcpmSteps(Number(e.target.value))}
+                                className="w-full accent-purple-500"
+                              />
+                              <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
+                                <span>Faster</span>
+                                <span>Higher quality</span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}

@@ -11,3 +11,4 @@ moviepy==2.1.2
 aiofiles==24.1.0
 edge-tts>=7.0.0
 demucs>=4.0.0
+voxcpm>=1.0.3

@@ -540,6 +540,8 @@ export interface AppSettings {
   gemini_model: string;
   speaker_voice: string;
   tts_engine: string;
+  voxcpm_model_path: string;
+  voxcpm_inference_steps: number;
   available_models: { id: string; name: string; description: string }[];
   api_keys: ApiKeyInfo[];
 }
@@ -549,7 +551,7 @@ export async function fetchSettings(): Promise<AppSettings> {
   return data;
 }
 
-export async function updateSettings(updates: { gemini_model?: string; speaker_voice?: string; tts_engine?: string }): Promise<AppSettings> {
+export async function updateSettings(updates: { gemini_model?: string; speaker_voice?: string; tts_engine?: string; voxcpm_model_path?: string; voxcpm_inference_steps?: number }): Promise<AppSettings> {
   const { data } = await api.patch('/settings/', updates);
   return data;
 }
