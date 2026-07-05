@@ -192,9 +192,42 @@ def _build_voxcpm_prompt(text: str, voice_profile: str, emotion: str) -> str:
     return f"({description}){text}"
 
 
-# Fixed seed per voice profile — voice design is stochastic, so without a
-# pinned seed every segment would get a different random voice.
+# Fixed seed per voice profile, used once to create the reference sample.
 _VOXCPM_VOICE_SEEDS = {"female": 42, "male": 1337, "young": 7, "old": 99}
+
+# Spoken by the generated reference sample; must match its audio exactly.
+_VOXCPM_REF_TEXT = "ខ្ញុំរីករាយណាស់ដែលបានជួបអ្នកនៅថ្ងៃនេះ ហើយសូមស្វាគមន៍មកកាន់កម្មវិធីរបស់យើង"
+
+
+def _get_voxcpm_reference(model, voice_profile: str) -> tuple[str, str]:
+    """Return (ref_wav_path, ref_text) for a voice profile.
+
+    Voice design draws a new random speaker on every generation — even with a
+    fixed seed the voice varies with the text. To keep ONE voice across all
+    segments, we synthesize a reference sample once per profile (seeded voice
+    design), cache it on disk, and clone from it for every segment.
+    """
+    ref_dir = os.path.join(settings.upload_dir, "tts", "voxcpm_refs")
+    os.makedirs(ref_dir, exist_ok=True)
+    ref_path = os.path.join(ref_dir, f"{voice_profile}.wav")
+    if not os.path.exists(ref_path):
+        import random
+        import numpy as np
+        import soundfile as sf
+        import torch
+        seed = _VOXCPM_VOICE_SEEDS.get(voice_profile, 42)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        prompt = _build_voxcpm_prompt(_VOXCPM_REF_TEXT, voice_profile, "neutral")
+        wav = model.generate(
+            prompt,
+            cfg_value=2.0,
+            inference_timesteps=max(10, settings.voxcpm_inference_steps),
+            normalize=False,
+        )
+        sf.write(ref_path, np.array(wav), model.tts_model.sample_rate)
+    return ref_path, _VOXCPM_REF_TEXT
 
 
 async def _generate_voxcpm_audio(
@@ -202,32 +235,24 @@ async def _generate_voxcpm_audio(
     voice_profile: str = "female",
     emotion: str = "",
 ) -> str:
-    """Generate TTS audio using VoxCPM2 voice design (emotion-aware)."""
+    """Generate TTS audio with VoxCPM2, cloning the profile's reference voice."""
     import soundfile as sf
     import numpy as np
 
     model = await asyncio.to_thread(_get_voxcpm_model)
 
-    prompt_text = _build_voxcpm_prompt(text, voice_profile, emotion)
-
-    def _seeded_generate():
-        # voxcpm 1.x has no seed parameter — pin global RNGs instead
-        # (safe: the app runs VoxCPM generations sequentially)
-        import random
-        import numpy as _np
-        import torch
-        seed = _VOXCPM_VOICE_SEEDS.get(voice_profile, 42)
-        random.seed(seed)
-        _np.random.seed(seed)
-        torch.manual_seed(seed)
+    def _generate():
+        ref_wav, ref_text = _get_voxcpm_reference(model, voice_profile)
         return model.generate(
-            prompt_text,
+            text,
+            prompt_wav_path=ref_wav,
+            prompt_text=ref_text,
             cfg_value=2.0,
             inference_timesteps=settings.voxcpm_inference_steps,
             normalize=False,
         )
 
-    wav = await asyncio.to_thread(_seeded_generate)
+    wav = await asyncio.to_thread(_generate)
 
     export_dir = os.path.join(settings.upload_dir, "tts")
     os.makedirs(export_dir, exist_ok=True)
