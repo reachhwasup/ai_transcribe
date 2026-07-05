@@ -571,6 +571,7 @@ async def export_video(
                         "end_time": s.end_time,
                         "voice_profile": s.voice_profile or "female",
                         "voice_name": s.voice_name or "",
+                        "emotion": s.emotion or "",
                     })
             if voice_segments:
                 try:
@@ -1308,6 +1309,8 @@ async def generate_voice_endpoint(
             "start_time": s.start_time,
             "end_time": s.end_time,
             "voice_profile": s.voice_profile or "female",
+            "voice_name": s.voice_name or "",
+            "emotion": s.emotion or "",
         }
         for s in segments
         if s.text and s.text.strip()

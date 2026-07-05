@@ -46,60 +46,30 @@ VOICE_MAP = {
 # Default fallback (Khmer)
 DEFAULT_VOICE_MAP = VOICE_MAP["km"]
 
-# Voices that support SSML emotion styles via edge-tts
-EMOTION_STYLE_VOICES = {
-    "en": "en-US-JennyNeural",
-    "zh": "zh-CN-XiaoxiaoNeural",
-}
-
-# Emotion name → SSML style per language
-EMOTION_STYLE_MAP: dict[str, dict[str, str]] = {
-    "en": {
-        "cheerful": "cheerful",
-        "happy": "cheerful",
-        "sad": "sad",
-        "angry": "angry",
-        "excited": "excited",
-        "calm": "friendly",
-        "serious": "newscast",
-        "fearful": "terrified",
-    },
-    "zh": {
-        "cheerful": "cheerful",
-        "happy": "cheerful",
-        "sad": "sad",
-        "angry": "angry",
-        "excited": "cheerful",
-        "calm": "calm",
-        "serious": "serious",
-        "fearful": "fearful",
-    },
-}
-
-_LANG_XML_TAG = {
-    "en": "en-US",
-    "zh": "zh-CN",
-    "km": "km-KH",
-    "ja": "ja-JP",
-    "ko": "ko-KR",
+# Emotion → prosody offsets (rate %, pitch Hz, volume %).
+# edge-tts applies these natively for every voice, including Khmer —
+# unlike SSML express-as styles, which the Edge endpoint rejects
+# (it reads the XML tags aloud).
+EMOTION_PROSODY: dict[str, tuple[int, int, int]] = {
+    "cheerful": (6, 15, 5),
+    "happy": (6, 15, 5),
+    "excited": (12, 25, 10),
+    "sad": (-10, -15, -5),
+    "angry": (8, -5, 15),
+    "calm": (-6, -5, 0),
+    "serious": (-4, -10, 0),
+    "fearful": (10, 20, 0),
 }
 
 
-def _build_ssml(text: str, voice: str, style: str, lang: str) -> str:
-    """Wrap text in SSML with an emotion express-as style tag."""
-    xml_lang = _LANG_XML_TAG.get(lang, "en-US")
-    return (
-        f"<speak version='1.0' "
-        f"xmlns='http://www.w3.org/2001/10/synthesis' "
-        f"xmlns:mstts='http://www.w3.org/2001/mstts' "
-        f"xml:lang='{xml_lang}'>"
-        f"<voice name='{voice}'>"
-        f"<mstts:express-as style='{style}'>"
-        f"{text}"
-        f"</mstts:express-as>"
-        f"</voice>"
-        f"</speak>"
-    )
+def _emotion_prosody(emotion: str, base_rate: str = "+0%") -> tuple[str, str, str]:
+    """Combine the caller's rate with emotion offsets → (rate, pitch, volume)."""
+    try:
+        base = int(base_rate.strip().rstrip("%"))
+    except ValueError:
+        base = 0
+    r, p, v = EMOTION_PROSODY.get((emotion or "").lower(), (0, 0, 0))
+    return (f"{base + r:+d}%", f"{p:+d}Hz", f"{v:+d}%")
 
 
 def _detect_text_language(text: str) -> str:
@@ -159,28 +129,18 @@ async def generate_segment_audio(
 
     if voice_name:
         voice = voice_name
-        tts_text = text
-    elif emotion and emotion not in ("neutral", "") and lang in EMOTION_STYLE_VOICES:
-        # Use SSML with emotional style for supported languages
-        style = EMOTION_STYLE_MAP.get(lang, {}).get(emotion)
-        if style:
-            voice = EMOTION_STYLE_VOICES[lang]
-            tts_text = _build_ssml(text, voice, style, lang)
-        else:
-            lang_map = VOICE_MAP.get(lang, DEFAULT_VOICE_MAP)
-            voice = lang_map.get(voice_profile, lang_map.get("female", DEFAULT_VOICE_MAP["female"]))
-            tts_text = text
     else:
         lang_map = VOICE_MAP.get(lang, DEFAULT_VOICE_MAP)
         voice = lang_map.get(voice_profile, lang_map.get("female", DEFAULT_VOICE_MAP["female"]))
-        tts_text = text
+
+    tts_rate, tts_pitch, tts_volume = _emotion_prosody(emotion, rate)
 
     export_dir = os.path.join(settings.upload_dir, "tts")
     os.makedirs(export_dir, exist_ok=True)
 
     output_path = os.path.join(export_dir, f"{uuid.uuid4()}.mp3")
 
-    communicate = edge_tts.Communicate(tts_text, voice, rate=rate)
+    communicate = edge_tts.Communicate(text, voice, rate=tts_rate, pitch=tts_pitch, volume=tts_volume)
     await communicate.save(output_path)
 
     return output_path
@@ -262,7 +222,11 @@ async def generate_segments_audio(
             continue
         voice = seg.get("voice_profile", "female")
         try:
-            path = await generate_segment_audio(text, voice)
+            path = await generate_segment_audio(
+                text, voice,
+                voice_name=seg.get("voice_name", ""),
+                emotion=seg.get("emotion", ""),
+            )
             tts_files.append({
                 "path": path,
                 "start_time": seg["start_time"],
