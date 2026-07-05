@@ -293,17 +293,8 @@ export default function NarrationPanel() {
         disabled={isGenerating || !hasVideo}
         className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white text-sm font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-indigo-500/20"
       >
-        {isGenerating ? (
-          <>
-            <Loader2 className="w-4 h-4 animate-spin" />
-            Analyzing video & writing narration...
-          </>
-        ) : (
-          <>
-            <Mic className="w-4 h-4" />
-            Generate Narration
-          </>
-        )}
+        <Mic className="w-4 h-4" />
+        Generate Narration
       </button>
 
       {/* Error */}
