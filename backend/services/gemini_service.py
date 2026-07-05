@@ -176,8 +176,22 @@ Rules:
 
 
 async def _upload_and_wait(video_path: str, on_progress=None):
-    """Upload video to Gemini and wait for processing."""
-    video_file = await asyncio.to_thread(genai.upload_file, video_path)
+    """Upload video to Gemini and wait for processing.
+
+    Large uploads occasionally die mid-transfer (BrokenPipeError /
+    connection reset) — retry a few times with backoff before giving up.
+    """
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            video_file = await asyncio.to_thread(genai.upload_file, video_path)
+            break
+        except (BrokenPipeError, ConnectionError, OSError) as e:
+            last_err = e
+            print(f"[gemini] upload attempt {attempt + 1}/3 failed: {e}")
+            await asyncio.sleep(2 * (attempt + 1))
+    else:
+        raise Exception(f"Video upload to Gemini failed after 3 attempts: {last_err}")
 
     poll_count = 0
     while video_file.state.name == "PROCESSING":

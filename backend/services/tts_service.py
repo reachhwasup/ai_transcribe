@@ -309,10 +309,13 @@ async def generate_fitted_segment_audio(
     language: str = "",
     max_speedup: float = 1.0,
     emotion: str = "",
+    max_duration: Optional[float] = None,
 ) -> tuple:
     """Generate TTS audio for a single segment, tempo-adjusted to fit target_duration.
     With max_speedup=1.0 (default), speech plays at natural speed and the segment
-    auto-extends if the text is longer than the time window.
+    auto-extends if the text is longer than the time window — but never past
+    max_duration (the room until the next segment), where speech is compressed
+    up to 2× instead so segments cannot overlap.
     Returns (path_to_fitted_mp3, actual_duration) where actual_duration may be
     longer than target_duration if the natural speech couldn't fit within max_speedup."""
     raw_path = await generate_segment_audio(text, voice_profile, rate, voice_name=voice_name, language=language, emotion=emotion)
@@ -329,15 +332,22 @@ async def generate_fitted_segment_audio(
         if needed_tempo < 1.0:
             # Audio is shorter than target — keep natural speed, don't slow down
             actual_duration = raw_duration
-        elif needed_tempo > max_speedup:
-            # Audio is too long for segment — cap at max_speedup
-            actual_duration = raw_duration / max_speedup
-        else:
+        elif needed_tempo <= max_speedup:
             actual_duration = target_duration
+        else:
+            # Too long for the window even at max_speedup — extend the segment,
+            # but never into the next one: compress (up to 2×) to fit the room.
+            actual_duration = raw_duration / max_speedup
+            if max_duration and max_duration > 0 and actual_duration > max_duration:
+                tempo = min(raw_duration / max_duration, 2.0)
+                actual_duration = raw_duration / tempo
     else:
         actual_duration = target_duration
 
-    cmd = _build_tempo_cmd(ffmpeg, raw_path, fitted_path, actual_duration)
+    # Pass the exact tempo we decided on — _build_tempo_cmd's own cap
+    # defaults to 1.0 and would otherwise silently skip the speed-up.
+    tempo_cap = raw_duration / actual_duration if actual_duration > 0 else 1.0
+    cmd = _build_tempo_cmd(ffmpeg, raw_path, fitted_path, actual_duration, max_speedup=max(1.0, tempo_cap))
     result = await asyncio.to_thread(
         subprocess.run, cmd, capture_output=True, text=True, timeout=120
     )
@@ -400,8 +410,8 @@ async def generate_segments_audio(
         single = tts_files[0]
         output_path = os.path.join(export_dir, f"{uuid.uuid4()}_voice.{output_format}")
 
-        # Speed-adjust to fit the segment duration
-        cmd = _build_tempo_cmd(ffmpeg, single["path"], output_path, single["duration"])
+        # Speed-adjust to fit the segment duration (compress up to 2×)
+        cmd = _build_tempo_cmd(ffmpeg, single["path"], output_path, single["duration"], max_speedup=2.0)
         result = await asyncio.to_thread(
             subprocess.run, cmd, capture_output=True, text=True, timeout=120
         )
@@ -414,10 +424,11 @@ async def generate_segments_audio(
     output_path = os.path.join(export_dir, f"{uuid.uuid4()}_voice.{output_format}")
     temp_fitted = []
 
-    # Fit each TTS audio to its segment duration
+    # Fit each TTS audio to its segment duration (compress up to 2× so
+    # segments in the combined track never overlap)
     for f in tts_files:
         fitted_path = os.path.join(export_dir, f"{uuid.uuid4()}_fitted.wav")
-        cmd = _build_tempo_cmd(ffmpeg, f["path"], fitted_path, f["duration"])
+        cmd = _build_tempo_cmd(ffmpeg, f["path"], fitted_path, f["duration"], max_speedup=2.0)
         result = await asyncio.to_thread(
             subprocess.run, cmd, capture_output=True, text=True, timeout=120
         )

@@ -1,4 +1,5 @@
 import asyncio
+import bisect
 import json
 import os
 import shutil
@@ -1381,6 +1382,21 @@ async def generate_voice_segments_endpoint(
     if not segments:
         raise HTTPException(400, "No segments found")
 
+    # All segment start times in the project (not just the selection), so each
+    # audio can be bounded by the room until the next segment.
+    starts_res = await db.execute(
+        select(Segment.start_time).where(Segment.project_id == project_id).order_by(Segment.start_time)
+    )
+    all_starts = [row[0] for row in starts_res.all()]
+
+    def _room_until_next(start_time: float) -> Optional[float]:
+        idx = bisect.bisect_right(all_starts, start_time)
+        if idx < len(all_starts):
+            return all_starts[idx] - start_time
+        if project.duration and project.duration > start_time:
+            return project.duration - start_time
+        return None
+
     updated = []
     for seg in segments:
         if not seg.text or not seg.text.strip():
@@ -1409,6 +1425,7 @@ async def generate_voice_segments_endpoint(
                 language=project.language or "",
                 max_speedup=1.15 if is_narrator else 1.0,
                 emotion=seg.emotion or "",
+                max_duration=_room_until_next(seg.start_time),
             )
             # Store as URL relative to /uploads/
             rel_path = os.path.relpath(audio_path, ".")
@@ -1462,6 +1479,22 @@ async def generate_voice_segments_stream(
     if not segments_snap:
         raise HTTPException(400, "No segments found")
 
+    # All segment start times in the project, to bound each audio by the room
+    # until the next segment so generated speech can never overlap it.
+    starts_res = await db.execute(
+        select(Segment.start_time).where(Segment.project_id == project_id).order_by(Segment.start_time)
+    )
+    all_starts = [row[0] for row in starts_res.all()]
+    project_duration = project.duration or 0.0
+
+    def _room_until_next(start_time: float):
+        idx = bisect.bisect_right(all_starts, start_time)
+        if idx < len(all_starts):
+            return all_starts[idx] - start_time
+        if project_duration > start_time:
+            return project_duration - start_time
+        return None
+
     # edge-tts is fast and stateless — run up to 6 segments in parallel.
     # VoxCPM uses a single shared model that is not concurrency-safe — run sequentially.
     from backend.config import settings as _cfg
@@ -1486,6 +1519,7 @@ async def generate_voice_segments_stream(
                 language=project_language,
                 max_speedup=1.15 if is_narrator else 1.0,
                 emotion=emotion,
+                max_duration=_room_until_next(start_time),
             )
             rel_path = os.path.relpath(audio_path, ".")
             audio_url = "/" + rel_path.replace("\\", "/")
