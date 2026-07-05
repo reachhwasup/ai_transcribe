@@ -1414,8 +1414,6 @@ async def generate_voice_segments_endpoint(
         rate = f"{speed_pct:+d}%"
 
         try:
-            # Allow modest speedup for narration segments so speech fits time windows
-            is_narrator = (seg.speaker or "").lower() == "narrator"
             audio_path, actual_duration = await generate_fitted_segment_audio(
                 text=seg.text,
                 voice_profile=seg.voice_profile or "female",
@@ -1423,7 +1421,6 @@ async def generate_voice_segments_endpoint(
                 rate=rate,
                 voice_name=seg.voice_name or "",
                 language=project.language or "",
-                max_speedup=1.15 if is_narrator else 1.0,
                 emotion=seg.emotion or "",
                 max_duration=_room_until_next(seg.start_time),
             )
@@ -1508,7 +1505,6 @@ async def generate_voice_segments_stream(
         seg_speed = audio_speed if audio_speed and audio_speed != 1.0 else request_speed
         speed_pct = int((seg_speed - 1.0) * 100)
         rate = f"{speed_pct:+d}%"
-        is_narrator = (speaker or "").lower() == "narrator"
         try:
             audio_path, actual_duration = await generate_fitted_segment_audio(
                 text=text,
@@ -1517,7 +1513,6 @@ async def generate_voice_segments_stream(
                 rate=rate,
                 voice_name=voice_name or "",
                 language=project_language,
-                max_speedup=1.15 if is_narrator else 1.0,
                 emotion=emotion,
                 max_duration=_room_until_next(start_time),
             )

@@ -307,17 +307,16 @@ async def generate_fitted_segment_audio(
     rate: str = "+0%",
     voice_name: str = "",
     language: str = "",
-    max_speedup: float = 1.0,
     emotion: str = "",
     max_duration: Optional[float] = None,
 ) -> tuple:
-    """Generate TTS audio for a single segment, tempo-adjusted to fit target_duration.
-    With max_speedup=1.0 (default), speech plays at natural speed and the segment
-    auto-extends if the text is longer than the time window — but never past
-    max_duration (the room until the next segment), where speech is compressed
-    up to 2× instead so segments cannot overlap.
-    Returns (path_to_fitted_mp3, actual_duration) where actual_duration may be
-    longer than target_duration if the natural speech couldn't fit within max_speedup."""
+    """Generate TTS audio for a single segment.
+
+    Speech always plays at natural pace when possible: if it's longer than
+    target_duration, the segment extends into the free room before the next
+    segment (max_duration). Only when even that room is too small is the
+    speech compressed (up to 2×) so it can never overlap the next segment.
+    Returns (path_to_fitted_mp3, actual_duration)."""
     raw_path = await generate_segment_audio(text, voice_profile, rate, voice_name=voice_name, language=language, emotion=emotion)
 
     ffmpeg = _get_ffmpeg()
@@ -328,19 +327,17 @@ async def generate_fitted_segment_audio(
     raw_duration = _probe_duration(ffmpeg, raw_path)
 
     if raw_duration > 0 and target_duration > 0:
-        needed_tempo = raw_duration / target_duration
-        if needed_tempo < 1.0:
-            # Audio is shorter than target — keep natural speed, don't slow down
-            actual_duration = raw_duration
-        elif needed_tempo <= max_speedup:
-            actual_duration = target_duration
+        if max_duration is None:
+            room = max(raw_duration, target_duration)  # no neighbor — extend freely
         else:
-            # Too long for the window even at max_speedup — extend the segment,
-            # but never into the next one: compress (up to 2×) to fit the room.
-            actual_duration = raw_duration / max_speedup
-            if max_duration and max_duration > 0 and actual_duration > max_duration:
-                tempo = min(raw_duration / max_duration, 2.0)
-                actual_duration = raw_duration / tempo
+            room = max(target_duration, max_duration)
+        if raw_duration <= room:
+            # Natural pace; extends into free room when longer than the slot
+            actual_duration = raw_duration
+        else:
+            # Room exhausted — compress (up to 2×) to avoid overlapping the next segment
+            tempo = min(raw_duration / room, 2.0)
+            actual_duration = raw_duration / tempo
     else:
         actual_duration = target_duration
 
