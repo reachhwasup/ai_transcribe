@@ -33,8 +33,6 @@ export interface Project {
   duration: number;
   status: string;
   language: string;
-  bgm_url: string;
-  bgm_volume: number;
   created_at: string;
   updated_at: string;
   segments: Segment[];

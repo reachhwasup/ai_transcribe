@@ -12,7 +12,6 @@ import SettingsModal from '../components/SettingsModal';
 import ExportModal from '../components/ExportModal';
 import MediaPool from '../components/MediaPool';
 import NarrationPanel from '../components/NarrationPanel';
-import BGMPanel from '../components/BGMPanel';
 import { ArrowLeft, Loader2, Settings, Moon, Sun, Video, GripVertical, GripHorizontal, Film, LayoutGrid, Mic, Music } from 'lucide-react';
 import { useThemeStore } from '../stores/themeStore';
 
@@ -24,10 +23,9 @@ export default function ProjectEditor() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const vocalsRef = useRef<HTMLAudioElement>(null);
   const bgmRef = useRef<HTMLAudioElement>(null);
-  const projectBgmRef = useRef<HTMLAudioElement>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showExport, setShowExport] = useState(false);
-  const [leftTab, setLeftTab] = useState<'media' | 'tools' | 'narrate' | 'bgm'>('tools');
+  const [leftTab, setLeftTab] = useState<'media' | 'tools' | 'narrate'>('tools');
 
   // Resizable panel sizes
   const [sidebarWidth, setSidebarWidth] = useState(300);
@@ -137,85 +135,6 @@ export default function ProjectEditor() {
       video.removeEventListener('seeked', handleSeeked);
     };
   }, [audioSeparated, vocalsUrl, bgmUrl]);
-
-  // Sync project-level generated BGM with video playback
-  const projectBgmUrl = currentProject?.bgm_url || null;
-  const projectBgmVolume = currentProject?.bgm_volume ?? 0.3;
-
-  useEffect(() => {
-    const audio = projectBgmRef.current;
-    if (audio) audio.volume = projectBgmVolume;
-  }, [projectBgmVolume]);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    const audio = projectBgmRef.current;
-    if (!video || !audio || !projectBgmUrl) return;
-
-    audio.volume = projectBgmVolume;
-    let audioReady = false;
-
-    const tryPlay = () => {
-      if (!audioReady || video.paused) return;
-      if (Math.abs(audio.currentTime - video.currentTime) > 0.3) {
-        audio.currentTime = video.currentTime;
-      }
-      audio.play().catch(() => {});
-    };
-
-    const handleCanPlay = () => {
-      audioReady = true;
-      if (!video.paused) tryPlay();
-    };
-
-    const syncPlayState = () => {
-      if (video.paused) {
-        audio.pause();
-      } else {
-        tryPlay();
-      }
-    };
-
-    const handleTimeUpdate = () => {
-      if (video.paused) return;
-      // If audio somehow stopped, keep retrying
-      if (audio.paused && audioReady) {
-        audio.currentTime = video.currentTime;
-        audio.play().catch(() => {});
-      }
-      // Drift correction
-      if (Math.abs(audio.currentTime - video.currentTime) > 0.3) {
-        audio.currentTime = video.currentTime;
-      }
-    };
-
-    const handleSeeked = () => {
-      audio.currentTime = video.currentTime;
-    };
-
-    // Check if already loaded
-    if (audio.readyState >= 3) {
-      audioReady = true;
-    }
-
-    audio.addEventListener('canplaythrough', handleCanPlay);
-    video.addEventListener('play', syncPlayState);
-    video.addEventListener('pause', syncPlayState);
-    video.addEventListener('seeked', handleSeeked);
-    video.addEventListener('timeupdate', handleTimeUpdate);
-
-    // Match current state
-    syncPlayState();
-
-    return () => {
-      audio.removeEventListener('canplaythrough', handleCanPlay);
-      video.removeEventListener('play', syncPlayState);
-      video.removeEventListener('pause', syncPlayState);
-      video.removeEventListener('seeked', handleSeeked);
-      video.removeEventListener('timeupdate', handleTimeUpdate);
-      audio.pause();
-    };
-  }, [projectBgmUrl, projectBgmVolume]);
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -506,17 +425,6 @@ export default function ProjectEditor() {
               <Mic className="w-3 h-3" />
               Narrate
             </button>
-            <button
-              onClick={() => setLeftTab('bgm')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium transition-colors border-b-2 ${
-                leftTab === 'bgm'
-                  ? 'text-emerald-400 border-emerald-500 bg-emerald-900/20'
-                  : 'text-zinc-500 border-transparent hover:text-zinc-300 hover:bg-zinc-800/20'
-              }`}
-            >
-              <Music className="w-3 h-3" />
-              BGM
-            </button>
           </div>
 
           {/* Tab Content */}
@@ -530,8 +438,6 @@ export default function ProjectEditor() {
               />
             ) : leftTab === 'narrate' ? (
               <NarrationPanel />
-            ) : leftTab === 'bgm' ? (
-              <BGMPanel />
             ) : (
               <Sidebar
                 onOpenExport={() => setShowExport(true)}
@@ -580,7 +486,6 @@ export default function ProjectEditor() {
               videoRef={videoRef}
               vocalsRef={vocalsRef}
               bgmRef={bgmRef}
-              projectBgmRef={projectBgmRef}
               audioSeparated={audioSeparated}
               onAudioSeparated={handleAudioSeparated}
               onRemoveAudioSeparation={handleRemoveAudioSeparation}
@@ -594,7 +499,6 @@ export default function ProjectEditor() {
       <audio ref={bgmRef} src={bgmUrl || undefined} preload="auto" style={{ display: 'none' }} />
 
       {/* Hidden audio for project-level generated BGM — always rendered so ref is stable */}
-      <audio ref={projectBgmRef} src={projectBgmUrl || undefined} preload="auto" loop style={{ display: 'none' }} />
 
       {/* Status Bar */}
       <StatusBar />

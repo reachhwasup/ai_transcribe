@@ -41,7 +41,6 @@ interface Props {
   videoRef: RefObject<HTMLVideoElement | null>;
   vocalsRef?: RefObject<HTMLAudioElement | null>;
   bgmRef?: RefObject<HTMLAudioElement | null>;
-  projectBgmRef?: RefObject<HTMLAudioElement | null>;
   audioSeparated?: boolean;
   onAudioSeparated?: (vocalsUrl: string, bgmUrl: string) => void;
   onRemoveAudioSeparation?: () => void;
@@ -54,7 +53,7 @@ const COLORS = [
 
 const _UNUSED_SPEED = 0; // speed is now per-segment in SubtitleDataPanel
 
-export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, projectBgmRef, audioSeparated, onAudioSeparated, onRemoveAudioSeparation }: Props) {
+export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSeparated, onAudioSeparated, onRemoveAudioSeparation }: Props) {
   const {
     currentProject,
     currentTime,
@@ -91,7 +90,6 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, projectBgm
   const [aiMutedProfiles, setAiMutedProfiles] = useState<Set<string>>(new Set());
   const [b1Muted, setB1Muted] = useState(false);
   const [v1Muted, setV1Muted] = useState(false);
-  const [projectBgmMuted, setProjectBgmMuted] = useState(false);
 
   // Generate Voice Audio state
   const [showAudioPanel, setShowAudioPanel] = useState(false);
@@ -174,13 +172,6 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, projectBgm
   useEffect(() => {
     if (bgmRef?.current) bgmRef.current.muted = b1Muted;
   }, [b1Muted, bgmRef]);
-
-  // Wire project-level BGM mute
-  useEffect(() => {
-    if (projectBgmRef?.current) projectBgmRef.current.muted = projectBgmMuted;
-  }, [projectBgmMuted, projectBgmRef]);
-
-  const hasProjectBgm = !!currentProject?.bgm_url;
 
   // When audio is separated, auto-mute A2 and unmute V1+B1
   useEffect(() => {
@@ -1415,26 +1406,6 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, projectBgm
             </div>
           )}
 
-          {/* BGM Track — Generated background music */}
-          {hasProjectBgm && (
-            <div
-              className="flex items-center justify-between px-1.5 border-b border-zinc-700/30 group"
-              style={{ height: TRACK_HEIGHT }}
-            >
-              <div className="flex items-center gap-1">
-                <Music className="w-2.5 h-2.5 text-emerald-400" />
-                <span className="text-[10px] font-bold text-emerald-400">BGM</span>
-              </div>
-              <div className="flex items-center gap-0.5">
-                <button
-                  onClick={() => setProjectBgmMuted(!projectBgmMuted)}
-                  className="p-0.5 rounded hover:bg-zinc-700/50 opacity-60 group-hover:opacity-100"
-                >
-                  {projectBgmMuted ? <VolumeX className="w-2.5 h-2.5 text-red-400" /> : <Volume2 className="w-2.5 h-2.5 text-zinc-500" />}
-                </button>
-              </div>
-            </div>
-          )}
         </div>
 
         {/* Scrollable timeline */}
@@ -1863,46 +1834,12 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, projectBgm
               </div>
             )}
 
-            {/* ──── Project BGM Track (generated background music) ──── */}
-            {hasProjectBgm && (
-              <div
-                className="relative border-b border-zinc-700/30"
-                style={{ height: TRACK_HEIGHT }}
-              >
-                {markers.map((t) => (
-                  <div
-                    key={`pbgm-grid-${t}`}
-                    className="absolute top-0 bottom-0 w-px bg-zinc-700/15"
-                    style={{ left: timeToX(t) }}
-                  />
-                ))}
-
-                <div
-                  className={`absolute top-1.5 rounded-md transition-opacity ${projectBgmMuted ? 'opacity-30' : ''}`}
-                  style={{
-                    left: 0,
-                    width: timeToX(duration),
-                    height: TRACK_HEIGHT - 12,
-                    background: 'linear-gradient(90deg, #06543855, #10b98144, #06543855)',
-                    borderLeft: '3px solid #10b981',
-                  }}
-                >
-                  <div className="px-2 py-1 flex items-center gap-2 h-full">
-                    <Music className="w-3 h-3 text-emerald-300/60" />
-                    <span className="text-[10px] text-emerald-300/60 whitespace-nowrap">
-                      {projectBgmMuted ? 'Muted' : 'BGM ♪'}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            )}
-
             {/* ──── Playhead — vertical line ──── */}
             <div
               className="absolute top-0 w-px z-20 pointer-events-none timeline-playhead"
               style={{
                 left: timeToX(currentTime),
-                height: 7 + VIDEO_TRACK_HEIGHT + TRACK_HEIGHT * (laneCount + 1 + (audioSeparated ? 2 : 0) + (hasProjectBgm ? 1 : 0)),
+                height: 7 + VIDEO_TRACK_HEIGHT + TRACK_HEIGHT * (laneCount + 1 + (audioSeparated ? 2 : 0)),
               }}
             />
           </div>

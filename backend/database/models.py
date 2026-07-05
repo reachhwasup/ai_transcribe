@@ -21,8 +21,6 @@ class Project(Base):
     duration = Column(Float, default=0.0)
     status = Column(String(50), default="created")  # created, uploading, transcribing, completed, error
     language = Column(String(10), default="km")  # km = Khmer
-    bgm_url = Column(String(1000), default="")
-    bgm_volume = Column(Float, default=0.3)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 

@@ -79,8 +79,6 @@ class ProjectResponse(BaseModel):
     duration: float
     status: str
     language: str
-    bgm_url: str = ""
-    bgm_volume: float = 0.3
     created_at: datetime
     updated_at: datetime
     segments: List[SegmentResponse] = []

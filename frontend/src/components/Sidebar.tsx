@@ -10,7 +10,6 @@ import {
 } from '../api/client';
 import {
   Upload,
-  Music2,
   Wand2,
   MicOff,
   FileDown,
@@ -30,7 +29,6 @@ interface SidebarProps {
 export default function Sidebar({ onOpenExport, audioSeparated, onAudioSeparated }: SidebarProps) {
   const { currentProject, loadProject, uploadProgress, isTranscribing } = useProjectStore();
   const videoInputRef = useRef<HTMLInputElement>(null);
-  const bgmInputRef = useRef<HTMLInputElement>(null);
   const srtInputRef = useRef<HTMLInputElement>(null);
 
   // Loading states
@@ -38,7 +36,6 @@ export default function Sidebar({ onOpenExport, audioSeparated, onAudioSeparated
   const [muting, setMuting] = useState(false);
   const [importing, setImporting] = useState(false);
   const [clearing, setClearing] = useState(false);
-  const [localBgmUrl, setLocalBgmUrl] = useState('');
   const [error, setError] = useState('');
 
   const hasVideo = !!currentProject?.video_path;
@@ -64,15 +61,6 @@ export default function Sidebar({ onOpenExport, audioSeparated, onAudioSeparated
     } catch (err: any) {
       setError(err?.message || 'Upload failed');
     }
-  };
-
-  // Load BGM
-  const handleBgmSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (bgmInputRef.current) bgmInputRef.current.value = '';
-    const url = URL.createObjectURL(file);
-    setLocalBgmUrl(url);
   };
 
   // Isolate BGM
@@ -147,7 +135,6 @@ export default function Sidebar({ onOpenExport, audioSeparated, onAudioSeparated
     <>
       {/* Hidden file inputs */}
       <input ref={videoInputRef} type="file" accept="video/*" onChange={handleVideoSelect} className="hidden" />
-      <input ref={bgmInputRef} type="file" accept="audio/*" onChange={handleBgmSelect} className="hidden" />
       <input ref={srtInputRef} type="file" accept=".srt,.vtt" onChange={handleSrtSelect} className="hidden" />
 
       <div className="flex flex-col h-full">
@@ -243,15 +230,6 @@ export default function Sidebar({ onOpenExport, audioSeparated, onAudioSeparated
               <span>Export SRT</span>
             </button>
 
-            {/* Load BGM */}
-            <button
-              onClick={() => bgmInputRef.current?.click()}
-              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs text-zinc-300 hover:bg-zinc-800/80 hover:text-white transition-colors text-left"
-            >
-              <Music2 className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-              <span>{localBgmUrl ? 'BGM Loaded ✓' : 'Load Background Music'}</span>
-              {localBgmUrl && <Check className="w-3 h-3 text-emerald-400 ml-auto shrink-0" />}
-            </button>
           </div>
 
           <div className="h-px bg-zinc-800/60 mx-3" />

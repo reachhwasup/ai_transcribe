@@ -617,35 +617,3 @@ export async function updateVideoClip(
   );
   return data;
 }
-
-
-// ─── BGM (Background Music) ─────────────────────────────────────────────
-
-export async function generateBGM(
-  projectId: string,
-  prompt?: string,
-  mood?: string,
-): Promise<{ bgm_url: string; duration: number }> {
-  const { data } = await api.post(
-    `/projects/${projectId}/export/generate-bgm`,
-    { prompt: prompt || null, mood: mood || null },
-    { timeout: 300_000 },
-  );
-  return data;
-}
-
-export async function updateBGMSettings(
-  projectId: string,
-  bgmUrl?: string,
-  bgmVolume?: number,
-): Promise<{ bgm_url: string; bgm_volume: number }> {
-  const { data } = await api.put(
-    `/projects/${projectId}/export/bgm`,
-    { bgm_url: bgmUrl, bgm_volume: bgmVolume },
-  );
-  return data;
-}
-
-export async function removeBGM(projectId: string): Promise<void> {
-  await api.delete(`/projects/${projectId}/export/bgm`);
-}
