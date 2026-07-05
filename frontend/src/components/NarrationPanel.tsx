@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useProjectStore } from '../stores/projectStore';
 import { generateNarration, applyNarration, type NarrationSegment } from '../api/client';
 import {
@@ -9,7 +10,78 @@ import {
   AlertCircle,
   RefreshCw,
   Trash2,
+  CheckCircle2,
+  XCircle,
+  X,
 } from 'lucide-react';
+
+type NarrationToastState = { kind: 'busy' | 'done' | 'error'; msg: string } | null;
+
+// Floating progress toast — same look and placement as TranscribeToast
+function NarrationToast({ toast, onClose }: { toast: NarrationToastState; onClose: () => void }) {
+  const [show, setShow] = useState(false);
+
+  useEffect(() => {
+    if (toast) {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => setShow(true));
+      });
+    } else {
+      setShow(false);
+    }
+  }, [toast]);
+
+  if (!toast) return null;
+
+  return createPortal(
+    <div className="fixed top-4 right-4 z-[9999] pointer-events-none">
+      <div
+        className={`pointer-events-auto w-80 rounded-xl shadow-2xl border transition-all duration-300 ease-out ${
+          show ? 'translate-x-0 opacity-100' : 'translate-x-[120%] opacity-0'
+        } ${
+          toast.kind === 'error'
+            ? 'bg-red-950/95 border-red-800/60'
+            : toast.kind === 'done'
+            ? 'bg-emerald-950/95 border-emerald-800/60'
+            : 'bg-zinc-900/95 border-zinc-700/60'
+        } backdrop-blur-xl`}
+      >
+        <div className="flex items-center justify-between px-4 pt-3 pb-1">
+          <div className="flex items-center gap-2">
+            {toast.kind === 'error' ? (
+              <XCircle className="w-4 h-4 text-red-400" />
+            ) : toast.kind === 'done' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+            ) : (
+              <Mic className="w-4 h-4 text-indigo-400" />
+            )}
+            <span className={`text-xs font-semibold ${
+              toast.kind === 'error' ? 'text-red-300' : toast.kind === 'done' ? 'text-emerald-300' : 'text-zinc-200'
+            }`}>
+              {toast.kind === 'error' ? 'Narration Error' : toast.kind === 'done' ? 'Done!' : 'AI Narration'}
+            </span>
+          </div>
+          <button onClick={onClose} className="p-0.5 rounded hover:bg-white/10 transition-colors">
+            <X className="w-3.5 h-3.5 text-zinc-500" />
+          </button>
+        </div>
+        <div className="px-4 pb-3 pt-1">
+          {toast.kind === 'busy' ? (
+            <div className="flex items-center gap-2">
+              <Loader2 className="w-3.5 h-3.5 text-indigo-400 animate-spin shrink-0" />
+              <p className="text-[11px] text-zinc-400 leading-relaxed">{toast.msg}</p>
+            </div>
+          ) : (
+            <p className={`text-[11px] leading-relaxed line-clamp-3 ${
+              toast.kind === 'error' ? 'text-red-400/90' : 'text-emerald-400/90'
+            }`}>{toast.msg}</p>
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
 
 const STYLES = [
   { id: 'summary', label: '📋 Summary', desc: 'Concise recap of what happens' },
@@ -49,19 +121,31 @@ export default function NarrationPanel() {
   const [narrationSegments, setNarrationSegments] = useState<NarrationSegment[]>([]);
   const [editingIdx, setEditingIdx] = useState<number | null>(null);
   const [editText, setEditText] = useState('');
+  const [toast, setToast] = useState<NarrationToastState>(null);
 
   const hasVideo = !!currentProject?.video_path;
+
+  // Auto-hide done/error toasts (like TranscribeToast)
+  useEffect(() => {
+    if (!toast || toast.kind === 'busy') return;
+    const timer = setTimeout(() => setToast(null), toast.kind === 'error' ? 6000 : 4000);
+    return () => clearTimeout(timer);
+  }, [toast]);
 
   const handleGenerate = async () => {
     if (!currentProject) return;
     setIsGenerating(true);
     setError(null);
     setNarrationSegments([]);
+    setToast({ kind: 'busy', msg: 'Analyzing video & writing narration script...' });
     try {
       const result = await generateNarration(currentProject.id, language, style);
       setNarrationSegments(result.segments);
+      setToast({ kind: 'done', msg: `Narration ready — ${result.segments.length} segments. Review the preview, then apply.` });
     } catch (e: any) {
-      setError(e?.response?.data?.detail || e.message || 'Failed to generate narration');
+      const msg = e?.response?.data?.detail || e.message || 'Failed to generate narration';
+      setError(msg);
+      setToast({ kind: 'error', msg });
     } finally {
       setIsGenerating(false);
     }
@@ -75,12 +159,16 @@ export default function NarrationPanel() {
     }
     setIsApplying(true);
     setError(null);
+    setToast({ kind: 'busy', msg: 'Applying narration as subtitles...' });
     try {
       await applyNarration(currentProject.id, narrationSegments, voice);
       await loadProject(currentProject.id);
       setNarrationSegments([]);
+      setToast({ kind: 'done', msg: 'Narration applied — subtitles replaced.' });
     } catch (e: any) {
-      setError(e?.response?.data?.detail || e.message || 'Failed to apply narration');
+      const msg = e?.response?.data?.detail || e.message || 'Failed to apply narration';
+      setError(msg);
+      setToast({ kind: 'error', msg });
     } finally {
       setIsApplying(false);
     }
@@ -120,6 +208,7 @@ export default function NarrationPanel() {
 
   return (
     <div className="flex flex-col h-full overflow-auto p-3 gap-3">
+      <NarrationToast toast={toast} onClose={() => setToast(null)} />
       {/* Header */}
       <div className="flex items-center gap-2">
         <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
