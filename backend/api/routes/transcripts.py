@@ -314,6 +314,8 @@ async def update_segment(
         invalidate = True
     if "text" in updates and updates["text"] != segment.text:
         invalidate = True
+    if "emotion" in updates and updates["emotion"] != segment.emotion:
+        invalidate = True
 
     old_duration = segment.end_time - segment.start_time
     new_start = updates.get("start_time", segment.start_time)

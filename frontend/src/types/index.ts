@@ -9,6 +9,7 @@ export interface Segment {
   speaker: string;
   voice_profile: string;
   voice_name: string;
+  emotion: string;
   audio_url: string;
   audio_speed: number;
   created_at: string;
