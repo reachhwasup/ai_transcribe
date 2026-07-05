@@ -33,18 +33,6 @@ const VOICE_OPTIONS = [
   { id: 'de-DE-FlorianMultilingualNeural', label: '👔 Florian (ប្រុស)', gender: 'M' },
 ];
 
-const EMOTION_OPTIONS = [
-  { id: 'neutral', label: '😐 ធម្មតា' },
-  { id: 'happy', label: '😊 រីករាយ' },
-  { id: 'cheerful', label: '😄 សប្បាយ' },
-  { id: 'excited', label: '🤩 រំភើប' },
-  { id: 'sad', label: '😢 សោកសៅ' },
-  { id: 'angry', label: '😠 ខឹង' },
-  { id: 'calm', label: '😌 ស្ងប់ស្ងាត់' },
-  { id: 'serious', label: '🧐 ម៉ឺងម៉ាត់' },
-  { id: 'fearful', label: '😨 ភ័យខ្លាច' },
-];
-
 interface Props {
   videoRef: RefObject<HTMLVideoElement | null>;
 }
@@ -196,9 +184,6 @@ export default function SubtitleDataPanel({ videoRef }: Props) {
     await updateSegment(segId, { voice_name: voiceName, audio_url: '' });
   };
 
-  const handleEmotionChange = async (segId: string, emotion: string) => {
-    await updateSegment(segId, { emotion, audio_url: '' });
-  };
 
   const seekTo = (time: number) => {
     if (videoRef.current) videoRef.current.currentTime = time;
@@ -439,9 +424,6 @@ export default function SubtitleDataPanel({ videoRef }: Props) {
                 <th className="px-3 py-2.5 text-center text-[11px] font-semibold text-zinc-400 uppercase tracking-wider w-[150px]">
                   AI Voice
                 </th>
-                <th className="px-3 py-2.5 text-center text-[11px] font-semibold text-zinc-400 uppercase tracking-wider w-[110px]">
-                  Emotion
-                </th>
                 <th className="px-3 py-2.5 text-center text-[11px] font-semibold text-zinc-400 uppercase tracking-wider w-[90px]">
                   Speed
                 </th>
@@ -589,26 +571,6 @@ export default function SubtitleDataPanel({ videoRef }: Props) {
                           .map((v) => (
                           <option key={v.id} value={v.id}>
                             {v.label}
-                          </option>
-                        ))}
-                      </select>
-                    </td>
-
-                    {/* Emotion */}
-                    <td className="px-3 py-2 text-center" onClick={(e) => e.stopPropagation()}>
-                      <select
-                        value={seg.emotion || 'neutral'}
-                        onChange={(e) => handleEmotionChange(seg.id, e.target.value)}
-                        className={`px-1.5 py-1 rounded-md text-xs font-medium border cursor-pointer appearance-none text-center ${
-                          (seg.emotion || 'neutral') === 'neutral'
-                            ? 'bg-zinc-800/60 text-zinc-300 border-zinc-700/60'
-                            : 'bg-amber-900/25 text-amber-300 border-amber-800/50'
-                        }`}
-                        style={{ minWidth: '95px' }}
-                      >
-                        {EMOTION_OPTIONS.map((o) => (
-                          <option key={o.id} value={o.id}>
-                            {o.label}
                           </option>
                         ))}
                       </select>
