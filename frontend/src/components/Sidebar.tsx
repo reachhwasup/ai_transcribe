@@ -6,7 +6,6 @@ import {
   clearAllSegments,
   importSrtFile,
   getExportUrl,
-  uploadVideo,
 } from '../api/client';
 import {
   Upload,
@@ -27,7 +26,7 @@ interface SidebarProps {
 }
 
 export default function Sidebar({ onOpenExport, audioSeparated, onAudioSeparated }: SidebarProps) {
-  const { currentProject, loadProject, uploadProgress, isTranscribing } = useProjectStore();
+  const { currentProject, loadProject, uploadProgress, isTranscribing, uploadVideo } = useProjectStore();
   const videoInputRef = useRef<HTMLInputElement>(null);
   const srtInputRef = useRef<HTMLInputElement>(null);
 
@@ -50,17 +49,12 @@ export default function Sidebar({ onOpenExport, audioSeparated, onAudioSeparated
     if (currentProject) await loadProject(currentProject.id);
   };
 
-  // Load Video
+  // Load Video — the store action drives the progress bar and error state
   const handleVideoSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !currentProject) return;
     if (videoInputRef.current) videoInputRef.current.value = '';
-    try {
-      await uploadVideo(currentProject.id, file);
-      await reloadProject();
-    } catch (err: any) {
-      setError(err?.message || 'Upload failed');
-    }
+    await uploadVideo(file);
   };
 
   // Isolate BGM
