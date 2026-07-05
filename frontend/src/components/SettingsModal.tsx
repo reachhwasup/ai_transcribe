@@ -142,7 +142,7 @@ export default function SettingsModal({ open, onClose }: Props) {
   const [selectedModel, setSelectedModel] = useState('');
   const [ttsEngine, setTtsEngine] = useState('edge-tts');
   const [voxcpmPath, setVoxcpmPath] = useState('openbmb/VoxCPM2');
-  const [voxcpmSteps, setVoxcpmSteps] = useState(3);
+  const [voxcpmSteps, setVoxcpmSteps] = useState(10);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [addingKey, setAddingKey] = useState(false);
@@ -159,7 +159,7 @@ export default function SettingsModal({ open, onClose }: Props) {
       setSelectedModel(s.gemini_model);
       setTtsEngine(s.tts_engine || 'edge-tts');
       setVoxcpmPath(s.voxcpm_model_path || 'openbmb/VoxCPM2');
-      setVoxcpmSteps(s.voxcpm_inference_steps ?? 3);
+      setVoxcpmSteps(s.voxcpm_inference_steps ?? 10);
     } catch {
       setError('Failed to load settings');
     }
@@ -193,7 +193,7 @@ export default function SettingsModal({ open, onClose }: Props) {
       if (ttsEngine === 'voxcpm' && voxcpmPath !== settings?.voxcpm_model_path) {
         updates.voxcpm_model_path = voxcpmPath;
       }
-      if (ttsEngine === 'voxcpm' && voxcpmSteps !== (settings?.voxcpm_inference_steps ?? 3)) {
+      if (ttsEngine === 'voxcpm' && voxcpmSteps !== (settings?.voxcpm_inference_steps ?? 10)) {
         updates.voxcpm_inference_steps = voxcpmSteps;
       }
       if (Object.keys(updates).length > 0) {
@@ -425,7 +425,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                               <div className="flex items-center justify-between mb-1">
                                 <label className="text-xs text-zinc-400">Speed / Quality</label>
                                 <span className="text-[10px] font-mono text-purple-400">
-                                  {voxcpmSteps === 2 ? 'Fast (2 steps)' : voxcpmSteps === 3 ? 'Balanced (3 steps)' : voxcpmSteps <= 5 ? 'Quality (5 steps)' : `Custom (${voxcpmSteps} steps)`}
+                                  {voxcpmSteps >= 10 ? `Recommended (${voxcpmSteps} steps)` : voxcpmSteps >= 6 ? `Balanced (${voxcpmSteps} steps)` : `Fast, lower quality (${voxcpmSteps} steps)`}
                                 </span>
                               </div>
                               <input

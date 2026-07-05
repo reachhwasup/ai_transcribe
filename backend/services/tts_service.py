@@ -192,6 +192,11 @@ def _build_voxcpm_prompt(text: str, voice_profile: str, emotion: str) -> str:
     return f"({description}){text}"
 
 
+# Fixed seed per voice profile — voice design is stochastic, so without a
+# pinned seed every segment would get a different random voice.
+_VOXCPM_VOICE_SEEDS = {"female": 42, "male": 1337, "young": 7, "old": 99}
+
+
 async def _generate_voxcpm_audio(
     text: str,
     voice_profile: str = "female",
@@ -204,13 +209,25 @@ async def _generate_voxcpm_audio(
     model = await asyncio.to_thread(_get_voxcpm_model)
 
     prompt_text = _build_voxcpm_prompt(text, voice_profile, emotion)
-    wav = await asyncio.to_thread(
-        model.generate,
-        prompt_text,
-        cfg_value=2.0,
-        inference_timesteps=settings.voxcpm_inference_steps,
-        normalize=False,
-    )
+
+    def _seeded_generate():
+        # voxcpm 1.x has no seed parameter — pin global RNGs instead
+        # (safe: the app runs VoxCPM generations sequentially)
+        import random
+        import numpy as _np
+        import torch
+        seed = _VOXCPM_VOICE_SEEDS.get(voice_profile, 42)
+        random.seed(seed)
+        _np.random.seed(seed)
+        torch.manual_seed(seed)
+        return model.generate(
+            prompt_text,
+            cfg_value=2.0,
+            inference_timesteps=settings.voxcpm_inference_steps,
+            normalize=False,
+        )
+
+    wav = await asyncio.to_thread(_seeded_generate)
 
     export_dir = os.path.join(settings.upload_dir, "tts")
     os.makedirs(export_dir, exist_ok=True)
