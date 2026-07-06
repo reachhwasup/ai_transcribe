@@ -396,7 +396,7 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         </div>
 
         {/* Body */}
-        <div className={`flex-1 overflow-auto px-6 py-5 ${inline ? 'w-full max-w-3xl mx-auto' : ''}`}>
+        <div className={`flex-1 overflow-auto px-6 py-5 ${inline ? 'w-full max-w-6xl mx-auto' : ''}`}>
           {tab === 'subtitle' ? (
             /* Subtitle export */
             <div className="space-y-3">
@@ -432,14 +432,16 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                   <p>No video uploaded. Upload a video first to export.</p>
                 </div>
               ) : (
-                <>
+                <div className={inline ? 'flex gap-6 items-start' : 'space-y-5'}>
+                  {/* LEFT column (inline): the preview stays in view while settings scroll */}
+                  <div className={inline ? 'flex-1 min-w-0 sticky top-0' : ''}>
                   {/* Video Preview with custom controls */}
                   <div className="rounded-lg overflow-hidden bg-black border border-zinc-700/50">
                     <div
                       className="relative cursor-pointer mx-auto bg-black flex items-center justify-center transition-all duration-300"
                       style={{
                         aspectRatio: preset ? `${preset.width} / ${preset.height}` : '16 / 9',
-                        maxHeight: inline ? '48vh' : '240px',
+                        maxHeight: inline ? '62vh' : '240px',
                       }}
                       onClick={togglePreview}
                     >
@@ -536,7 +538,10 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                       </span>
                     </div>
                   </div>
+                  </div>
 
+                  {/* RIGHT column (inline): all export settings */}
+                  <div className={inline ? 'w-[380px] shrink-0 space-y-5' : 'space-y-5'}>
                   {/* Trim controls */}
                   <div>
                     <div className="flex items-center justify-between mb-3">
@@ -748,7 +753,8 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                       <p className="text-xs text-red-300">{error}</p>
                     </div>
                   )}
-                </>
+                  </div>
+                </div>
               )}
             </div>
           )}
