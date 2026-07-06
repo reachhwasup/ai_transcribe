@@ -13,7 +13,7 @@ import ExportModal from '../components/ExportModal';
 import SubtitleStyleBar from '../components/SubtitleStyleBar';
 import MediaPool from '../components/MediaPool';
 import NarrationPanel from '../components/NarrationPanel';
-import { ArrowLeft, Loader2, Settings, Moon, Sun, Video, GripVertical, Film, LayoutGrid, Mic, Clapperboard, Type, Download } from 'lucide-react';
+import { ArrowLeft, Loader2, Settings, Moon, Sun, Video, GripVertical, GripHorizontal, Film, LayoutGrid, Mic, Clapperboard, Type, Download } from 'lucide-react';
 import { useThemeStore } from '../stores/themeStore';
 
 export default function ProjectEditor() {
@@ -472,16 +472,35 @@ export default function ProjectEditor() {
         {/* Right Panel — content switches with the workspace tab */}
         <div className="flex-1 flex flex-col overflow-hidden min-w-0">
           {workTab === 'edit' && (
-            <div className="flex-1 overflow-hidden">
-              <TimelineEditorPro
-                videoRef={videoRef}
-                vocalsRef={vocalsRef}
-                bgmRef={bgmRef}
-                audioSeparated={audioSeparated}
-                onAudioSeparated={handleAudioSeparated}
-                onRemoveAudioSeparation={handleRemoveAudioSeparation}
-              />
-            </div>
+            <>
+              {/* Subtitle Data Table */}
+              <div className="flex-1 overflow-hidden">
+                <SubtitleDataPanel videoRef={videoRef} />
+              </div>
+
+              {/* Timeline resize handle */}
+              <div
+                className="h-1 shrink-0 bg-zinc-800 hover:bg-khmer-500/60 cursor-row-resize transition-colors relative group"
+                onMouseDown={(e) => handleResizeStart(e, 'timeline')}
+              >
+                <div className="absolute inset-x-0 -top-1 -bottom-1" />
+                <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <GripHorizontal className="w-3 h-3 text-khmer-400" />
+                </div>
+              </div>
+
+              {/* Timeline Editor */}
+              <div className="border-t border-zinc-800 shrink-0" style={{ height: timelineHeight }}>
+                <TimelineEditorPro
+                  videoRef={videoRef}
+                  vocalsRef={vocalsRef}
+                  bgmRef={bgmRef}
+                  audioSeparated={audioSeparated}
+                  onAudioSeparated={handleAudioSeparated}
+                  onRemoveAudioSeparation={handleRemoveAudioSeparation}
+                />
+              </div>
+            </>
           )}
           {workTab === 'subtitle' && (
             <>
