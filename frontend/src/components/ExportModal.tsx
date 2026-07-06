@@ -39,6 +39,7 @@ const PLATFORM_ICONS: Record<string, string> = {
 export default function ExportModal({ open, onClose }: Props) {
   const { currentProject, videoClips, videoMuted } = useProjectStore();
   const previewRef = useRef<HTMLVideoElement>(null);
+  const previewBgRef = useRef<HTMLVideoElement>(null);
   const rafRef = useRef<number>(0);
   const aiAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
   const clipLayout = useMemo(() => buildClipLayout(videoClips), [videoClips]);
@@ -57,6 +58,18 @@ export default function ExportModal({ open, onClose }: Props) {
   const [error, setError] = useState('');
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const [previewTime, setPreviewTime] = useState(0); // timeline time
+
+  // Keep the blurred background preview in sync with the main preview
+  useEffect(() => {
+    const bg = previewBgRef.current;
+    const main = previewRef.current;
+    if (!bg || !main || scaleMode !== 'blur') return;
+    if (previewPlaying) bg.play().catch(() => {});
+    else bg.pause();
+    if (Math.abs(bg.currentTime - main.currentTime) > 0.35) {
+      bg.currentTime = main.currentTime;
+    }
+  }, [previewPlaying, previewTime, scaleMode]);
   const [showSubtitles, setShowSubtitles] = useState(true);
   const [currentSourceTime, setCurrentSourceTime] = useState(0);
   const [subtitleLanguage, setSubtitleLanguage] = useState('');
@@ -410,10 +423,19 @@ export default function ExportModal({ open, onClose }: Props) {
                       }}
                       onClick={togglePreview}
                     >
+                      {scaleMode === 'blur' && (
+                        <video
+                          ref={previewBgRef}
+                          src={`/uploads/${currentProject.id}/${currentProject.video_path?.split('/').pop()}`}
+                          className="absolute inset-0 w-full h-full object-cover blur-xl scale-110 opacity-80"
+                          preload="metadata"
+                          muted
+                        />
+                      )}
                       <video
                         ref={previewRef}
                         src={`/uploads/${currentProject.id}/${currentProject.video_path?.split('/').pop()}`}
-                        className="max-w-full max-h-full object-contain"
+                        className={`relative ${scaleMode === 'fill' ? 'w-full h-full object-cover' : 'max-w-full max-h-full object-contain'}`}
                         preload="metadata"
                         muted={videoMuted}
                       />
