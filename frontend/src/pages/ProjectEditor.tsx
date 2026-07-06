@@ -13,7 +13,7 @@ import ExportModal from '../components/ExportModal';
 import SubtitleStyleBar from '../components/SubtitleStyleBar';
 import MediaPool from '../components/MediaPool';
 import NarrationPanel from '../components/NarrationPanel';
-import { ArrowLeft, Loader2, Settings, Moon, Sun, Video, GripVertical, GripHorizontal, Film, LayoutGrid, Mic, Clapperboard, Type, Download } from 'lucide-react';
+import { ArrowLeft, Loader2, Settings, Moon, Sun, Video, GripVertical, GripHorizontal, Film, LayoutGrid, Mic, Clapperboard, Download } from 'lucide-react';
 import { useThemeStore } from '../stores/themeStore';
 
 export default function ProjectEditor() {
@@ -25,7 +25,7 @@ export default function ProjectEditor() {
   const vocalsRef = useRef<HTMLAudioElement>(null);
   const bgmRef = useRef<HTMLAudioElement>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [workTab, setWorkTab] = useState<'edit' | 'subtitle' | 'deliver'>('edit');
+  const [workTab, setWorkTab] = useState<'edit' | 'deliver'>('edit');
   const [leftTab, setLeftTab] = useState<'media' | 'tools' | 'narrate'>('tools');
 
   // Resizable panel sizes
@@ -474,6 +474,9 @@ export default function ProjectEditor() {
         <div className="flex-1 flex flex-col overflow-hidden min-w-0">
           {workTab === 'edit' && (
             <>
+              {/* Subtitle style (size / position) */}
+              <SubtitleStyleBar />
+
               {/* Subtitle Data Table */}
               <div className="flex-1 overflow-hidden">
                 <SubtitleDataPanel videoRef={videoRef} />
@@ -503,14 +506,6 @@ export default function ProjectEditor() {
               </div>
             </>
           )}
-          {workTab === 'subtitle' && (
-            <>
-              <SubtitleStyleBar />
-              <div className="flex-1 overflow-hidden">
-                <SubtitleDataPanel videoRef={videoRef} />
-              </div>
-            </>
-          )}
           {workTab === 'deliver' && (
             <div className="flex-1 overflow-hidden">
               <ExportModal open inline onClose={() => setWorkTab('edit')} />
@@ -523,7 +518,6 @@ export default function ProjectEditor() {
       <div className="h-12 shrink-0 border-t border-zinc-800 bg-zinc-900/90 flex items-center justify-center gap-1">
         {([
           { id: 'edit', label: 'Edit', icon: Clapperboard },
-          { id: 'subtitle', label: 'Subtitle', icon: Type },
           { id: 'deliver', label: 'Deliver', icon: Download },
         ] as const).map((t) => (
           <button
