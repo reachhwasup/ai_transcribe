@@ -204,6 +204,10 @@ export interface NarrationSegment {
   start_time: number;
   end_time: number;
   text: string;
+  type?: 'narration' | 'dialogue';
+  speaker?: string;
+  gender?: string;
+  emotion?: string;
 }
 
 export async function generateNarration(

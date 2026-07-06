@@ -276,7 +276,11 @@ def _build_narration_prompt(language: str = "km", style: str = "summary") -> str
 
     style_instructions = {
         "summary": f"Write a concise, engaging SUMMARY narration of what happens in this video. Describe the key events, actions, and information clearly. Like a TikTok recap or news summary. The narration should be in {lang_name}.",
-        "commentary": f"Write an entertaining COMMENTARY narration for this video, like a TikTok storyteller. Add reactions, opinions, and engaging hooks (e.g. 'Wait for it...', 'You won't believe what happens next...'). The narration should be in {lang_name}.",
+        "commentary": f"""Write an entertaining TikTok-style COMMENTARY recap of this video, like a viral drama-recap channel. The narration must be in {lang_name}.
+- HOOK FIRST: the very first segment must create instant curiosity — a shocking fact, a bold claim, or a question about what happens (never start with boring setup).
+- Use present tense and casual spoken {lang_name} with short, punchy sentences.
+- Add reactions and suspense between events ('Wait for it...', 'And THIS is where it gets crazy...').
+- End with a cliffhanger or a question that makes viewers comment.""",
         "educational": f"Write an EDUCATIONAL narration explaining what is happening in this video. Break down concepts, provide context, and teach the viewer. Like a documentary narrator. The narration should be in {lang_name}.",
         "story": f"Write a STORYTELLING narration that turns this video into a compelling story. Use narrative structure with a beginning, middle, and end. Add dramatic flair. The narration should be in {lang_name}.",
     }
@@ -289,11 +293,19 @@ Watch this video carefully from beginning to end. Analyze everything: visuals, a
 
 TASK: {style_desc}
 
-Return a JSON array of narration segments that can be spoken as voiceover:
+Return a JSON array of segments. Two segment types are allowed:
 [
-  {{"start_time": 0.0, "end_time": 5.0, "text": "narration text in {lang_name}"}},
-  {{"start_time": 5.5, "end_time": 10.0, "text": "next narration segment"}}
+  {{"start_time": 0.0, "end_time": 5.0, "type": "narration", "text": "narration text in {lang_name}", "emotion": "excited"}},
+  {{"start_time": 5.5, "end_time": 8.0, "type": "dialogue", "speaker": "the character speaking", "gender": "female", "text": "the actor's line translated to {lang_name}", "emotion": "angry"}}
 ]
+
+DIALOGUE RULES:
+- Mix narration with the actors' ACTUAL LINES: when a spoken line is dramatic, funny, or important to the story, include it as its own segment with type "dialogue", timed to when the actor actually speaks it.
+- Transcribe the line and translate it to {lang_name}. Keep it short and impactful.
+- Set "speaker" to the character's name or description (e.g. "CEO", "the wife") and "gender" to "male" or "female" for the voice.
+- Narration and dialogue segments must NOT overlap — the narrator pauses while characters speak.
+- Aim for mostly narration with the strongest dialogue moments woven in (roughly 1 dialogue for every 3-5 narration segments).
+- "emotion" (both types, optional): one of cheerful, happy, excited, sad, angry, calm, serious, fearful, neutral — matching how the line should be spoken.
 
 Rules:
 - TEXT must be in {lang_name}. Write natural, fluent {lang_name} that sounds good when spoken aloud.
@@ -350,11 +362,16 @@ async def generate_narration(video_path: str, language: str = "km", style: str =
         seg_text = re.sub(r"(?:https?://|www\.)\S+", "", seg_text).strip()
         if not seg_text:
             continue
+        seg_type = str(seg.get("type") or "narration").lower()
         cleaned.append({
             "index": i,
             "start_time": float(seg.get("start_time", 0)),
             "end_time": float(seg.get("end_time", 0)),
             "text": seg_text,
+            "type": seg_type if seg_type in ("narration", "dialogue") else "narration",
+            "speaker": str(seg.get("speaker") or "").strip(),
+            "gender": str(seg.get("gender") or "").strip().lower(),
+            "emotion": str(seg.get("emotion") or "").strip().lower(),
         })
     return cleaned
 

@@ -904,10 +904,20 @@ async def apply_narration_segments(
         await db.delete(seg)
     await db.flush()
 
-    # Create new segments from narration
+    # Create new segments from narration. Dialogue segments (actor lines)
+    # keep the character as speaker and use a gender-matched voice; narration
+    # segments use the chosen narrator voice.
     voice = body.get("voice_profile", "female")
     new_segments = []
     for i, seg_data in enumerate(narration_segments):
+        is_dialogue = str(seg_data.get("type") or "narration") == "dialogue"
+        gender = str(seg_data.get("gender") or "").lower()
+        if is_dialogue:
+            speaker = str(seg_data.get("speaker") or "").strip() or "Actor"
+            voice_profile = "male" if gender == "male" else "female"
+        else:
+            speaker = "Narrator"
+            voice_profile = voice
         seg = Segment(
             id=str(uuid.uuid4()),
             project_id=project_id,
@@ -916,8 +926,9 @@ async def apply_narration_segments(
             end_time=float(seg_data["end_time"]),
             text=str(seg_data["text"]),
             original_text=str(seg_data["text"]),
-            speaker="Narrator",
-            voice_profile=voice,
+            speaker=speaker,
+            voice_profile=voice_profile,
+            emotion=str(seg_data.get("emotion") or "neutral") or "neutral",
         )
         db.add(seg)
         new_segments.append(seg)

@@ -344,8 +344,13 @@ export default function NarrationPanel() {
                 {narrationSegments.map((seg, idx) => (
                   <div key={idx} className="px-3 py-2.5 hover:bg-zinc-800/50 group">
                     <div className="flex items-center justify-between mb-1">
-                      <span className="text-[10px] text-zinc-600 font-mono">
+                      <span className="flex items-center gap-2 text-[10px] text-zinc-600 font-mono">
                         {formatTime(seg.start_time)} → {formatTime(seg.end_time)}
+                        {seg.type === 'dialogue' && (
+                          <span className="px-1.5 py-0.5 rounded bg-blue-900/40 text-blue-300 font-sans">
+                            💬 {seg.speaker || 'Actor'}{seg.gender === 'male' ? ' 👔' : seg.gender === 'female' ? ' 🎀' : ''}
+                          </span>
+                        )}
                       </span>
                       <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                         <button
