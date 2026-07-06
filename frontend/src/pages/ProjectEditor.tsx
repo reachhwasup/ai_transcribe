@@ -28,8 +28,17 @@ export default function ProjectEditor() {
   const [leftTab, setLeftTab] = useState<'media' | 'tools' | 'narrate'>('tools');
 
   // Resizable panel sizes
-  const [sidebarWidth, setSidebarWidth] = useState(300);
-  const [timelineHeight, setTimelineHeight] = useState(220);
+  // Layout defaults: wider left column (bigger video preview) and a taller
+  // timeline; user drag adjustments persist across refreshes.
+  const [sidebarWidth, setSidebarWidth] = useState(() => Number(localStorage.getItem('editor-sidebar-width')) || 380);
+  const [timelineHeight, setTimelineHeight] = useState(() => Number(localStorage.getItem('editor-timeline-height')) || 280);
+
+  useEffect(() => {
+    localStorage.setItem('editor-sidebar-width', String(sidebarWidth));
+  }, [sidebarWidth]);
+  useEffect(() => {
+    localStorage.setItem('editor-timeline-height', String(timelineHeight));
+  }, [timelineHeight]);
   const draggingRef = useRef<'sidebar' | 'timeline' | null>(null);
   const startPosRef = useRef(0);
   const startSizeRef = useRef(0);
