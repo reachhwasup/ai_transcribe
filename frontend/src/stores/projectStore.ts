@@ -20,8 +20,10 @@ interface ProjectStore {
   videoMuted: boolean;
   uploadProgress: number;
   error: string | null;
+  subtitleStyle: { sizePct: number; position: 'bottom' | 'middle' | 'top' };
 
   // Actions
+  setSubtitleStyle: (style: Partial<{ sizePct: number; position: 'bottom' | 'middle' | 'top' }>) => void;
   loadProjects: () => Promise<void>;
   loadProject: (id: string) => Promise<void>;
   createProject: (name: string, description?: string) => Promise<Project>;
@@ -63,6 +65,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
   selectedSegmentIds: new Set<string>(),
   videoMuted: false,
   uploadProgress: 0,
+  subtitleStyle: { sizePct: 4, position: 'bottom' as const },
   error: null,
 
   loadProjects: async () => {
@@ -79,10 +82,23 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     set({ isLoading: true, error: null });
     try {
       const project = await api.fetchProject(id);
-      set({ currentProject: project, isLoading: false, activeSegmentId: null, videoClips: project.video_clips || [] });
+      // Restore this project's saved subtitle style
+      let subtitleStyle: { sizePct: number; position: 'bottom' | 'middle' | 'top' } = { sizePct: 4, position: 'bottom' };
+      try {
+        const raw = localStorage.getItem(`subtitle-style-${id}`);
+        if (raw) subtitleStyle = { ...subtitleStyle, ...JSON.parse(raw) };
+      } catch { /* ignore corrupted entry */ }
+      set({ currentProject: project, isLoading: false, activeSegmentId: null, videoClips: project.video_clips || [], subtitleStyle });
     } catch (e: any) {
       set({ error: e.message, isLoading: false });
     }
+  },
+
+  setSubtitleStyle: (style) => {
+    const merged = { ...get().subtitleStyle, ...style };
+    set({ subtitleStyle: merged });
+    const id = get().currentProject?.id;
+    if (id) localStorage.setItem(`subtitle-style-${id}`, JSON.stringify(merged));
   },
 
   createProject: async (name: string, description = '') => {

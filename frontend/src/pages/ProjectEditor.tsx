@@ -10,9 +10,10 @@ import TimelineEditorPro from '../components/TimelineEditorPro';
 import StatusBar from '../components/StatusBar';
 import SettingsModal from '../components/SettingsModal';
 import ExportModal from '../components/ExportModal';
+import SubtitleStyleBar from '../components/SubtitleStyleBar';
 import MediaPool from '../components/MediaPool';
 import NarrationPanel from '../components/NarrationPanel';
-import { ArrowLeft, Loader2, Settings, Moon, Sun, Video, GripVertical, GripHorizontal, Film, LayoutGrid, Mic, Music } from 'lucide-react';
+import { ArrowLeft, Loader2, Settings, Moon, Sun, Video, GripVertical, Film, LayoutGrid, Mic, Clapperboard, Type, Download } from 'lucide-react';
 import { useThemeStore } from '../stores/themeStore';
 
 export default function ProjectEditor() {
@@ -24,7 +25,7 @@ export default function ProjectEditor() {
   const vocalsRef = useRef<HTMLAudioElement>(null);
   const bgmRef = useRef<HTMLAudioElement>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [showExport, setShowExport] = useState(false);
+  const [workTab, setWorkTab] = useState<'edit' | 'subtitle' | 'deliver'>('edit');
   const [leftTab, setLeftTab] = useState<'media' | 'tools' | 'narrate'>('tools');
 
   // Resizable panel sizes
@@ -153,8 +154,8 @@ export default function ProjectEditor() {
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if ((e.target as HTMLElement)?.isContentEditable) return;
 
-      // Don't trigger when settings/export modals are open
-      if (showSettings || showExport) return;
+      // Don't trigger when settings modal or the Deliver page is open
+      if (showSettings || workTab === 'deliver') return;
 
       const video = videoRef.current;
 
@@ -255,7 +256,7 @@ export default function ProjectEditor() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [showSettings, showExport]);
+  }, [showSettings, workTab]);
 
   const handleAudioSeparated = (newVocalsUrl: string, newBgmUrl: string) => {
     setVocalsUrl(newVocalsUrl);
@@ -449,7 +450,7 @@ export default function ProjectEditor() {
               <NarrationPanel />
             ) : (
               <Sidebar
-                onOpenExport={() => setShowExport(true)}
+                onOpenExport={() => setWorkTab('deliver')}
                 audioSeparated={audioSeparated}
                 onAudioSeparated={handleAudioSeparated}
               />
@@ -468,39 +469,56 @@ export default function ProjectEditor() {
           </div>
         </div>
 
-        {/* Right Panel — Subtitle Data + Timeline */}
+        {/* Right Panel — content switches with the workspace tab */}
         <div className="flex-1 flex flex-col overflow-hidden min-w-0">
-          {/* Subtitle Data Table */}
-          <div className="flex-1 overflow-hidden">
-            <SubtitleDataPanel videoRef={videoRef} />
-          </div>
-
-          {/* Timeline resize handle */}
-          <div
-            className="h-1 shrink-0 bg-zinc-800 hover:bg-khmer-500/60 cursor-row-resize transition-colors relative group"
-            onMouseDown={(e) => handleResizeStart(e, 'timeline')}
-          >
-            <div className="absolute inset-x-0 -top-1 -bottom-1" />
-            <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity">
-              <GripHorizontal className="w-3 h-3 text-khmer-400" />
+          {workTab === 'edit' && (
+            <div className="flex-1 overflow-hidden">
+              <TimelineEditorPro
+                videoRef={videoRef}
+                vocalsRef={vocalsRef}
+                bgmRef={bgmRef}
+                audioSeparated={audioSeparated}
+                onAudioSeparated={handleAudioSeparated}
+                onRemoveAudioSeparation={handleRemoveAudioSeparation}
+              />
             </div>
-          </div>
-
-          {/* Timeline Editor */}
-          <div
-            className="border-t border-zinc-800 shrink-0"
-            style={{ height: timelineHeight }}
-          >
-            <TimelineEditorPro
-              videoRef={videoRef}
-              vocalsRef={vocalsRef}
-              bgmRef={bgmRef}
-              audioSeparated={audioSeparated}
-              onAudioSeparated={handleAudioSeparated}
-              onRemoveAudioSeparation={handleRemoveAudioSeparation}
-            />
-          </div>
+          )}
+          {workTab === 'subtitle' && (
+            <>
+              <SubtitleStyleBar />
+              <div className="flex-1 overflow-hidden">
+                <SubtitleDataPanel videoRef={videoRef} />
+              </div>
+            </>
+          )}
+          {workTab === 'deliver' && (
+            <div className="flex-1 overflow-hidden">
+              <ExportModal open inline onClose={() => setWorkTab('edit')} />
+            </div>
+          )}
         </div>
+      </div>
+
+      {/* Resolve-style workspace tabs */}
+      <div className="h-12 shrink-0 border-t border-zinc-800 bg-zinc-900/90 flex items-center justify-center gap-1">
+        {([
+          { id: 'edit', label: 'Edit', icon: Clapperboard },
+          { id: 'subtitle', label: 'Subtitle', icon: Type },
+          { id: 'deliver', label: 'Deliver', icon: Download },
+        ] as const).map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setWorkTab(t.id)}
+            className={`flex flex-col items-center justify-center px-7 py-1 rounded-md transition-colors ${
+              workTab === t.id
+                ? 'text-khmer-400 bg-khmer-900/20'
+                : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/40'
+            }`}
+          >
+            <t.icon className="w-4 h-4" />
+            <span className="text-[9px] font-medium mt-0.5">{t.label}</span>
+          </button>
+        ))}
       </div>
 
       {/* Hidden audio elements for separated tracks — always rendered so refs are stable */}
@@ -514,9 +532,6 @@ export default function ProjectEditor() {
 
       {/* Settings Modal */}
       <SettingsModal open={showSettings} onClose={() => setShowSettings(false)} />
-
-      {/* Export Modal */}
-      <ExportModal open={showExport} onClose={() => setShowExport(false)} />
     </div>
   );
 }

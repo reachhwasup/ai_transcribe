@@ -24,6 +24,8 @@ import { buildClipLayout, totalTimelineDuration, sourceToTimeline, timelineToSou
 interface Props {
   open: boolean;
   onClose: () => void;
+  /** Render as an in-page panel (Deliver tab) instead of a floating modal */
+  inline?: boolean;
 }
 
 const PLATFORM_ICONS: Record<string, string> = {
@@ -36,8 +38,8 @@ const PLATFORM_ICONS: Record<string, string> = {
   custom: '⚙️',
 };
 
-export default function ExportModal({ open, onClose }: Props) {
-  const { currentProject, videoClips, videoMuted } = useProjectStore();
+export default function ExportModal({ open, onClose, inline = false }: Props) {
+  const { currentProject, videoClips, videoMuted, subtitleStyle } = useProjectStore();
   const previewRef = useRef<HTMLVideoElement>(null);
   const previewBgRef = useRef<HTMLVideoElement>(null);
   const rafRef = useRef<number>(0);
@@ -288,6 +290,8 @@ export default function ExportModal({ open, onClose }: Props) {
         subtitleLanguage || undefined,
         videoMuted,
         scaleMode,
+        subtitleStyle.sizePct,
+        subtitleStyle.position,
       );
 
       // Download the blob
@@ -329,9 +333,18 @@ export default function ExportModal({ open, onClose }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onClose}>
+    <div
+      className={
+        inline
+          ? 'h-full overflow-y-auto flex justify-center py-4 px-4'
+          : 'fixed inset-0 bg-black/60 flex items-center justify-center z-50'
+      }
+      onClick={inline ? undefined : onClose}
+    >
       <div
-        className="bg-zinc-900 border border-zinc-700 rounded-xl w-full max-w-2xl mx-4 shadow-2xl max-h-[90vh] flex flex-col"
+        className={`bg-zinc-900 border border-zinc-700 rounded-xl w-full max-w-2xl shadow-2xl flex flex-col ${
+          inline ? 'h-fit' : 'mx-4 max-h-[90vh]'
+        }`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}

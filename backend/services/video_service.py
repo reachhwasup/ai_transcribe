@@ -129,9 +129,10 @@ def _parse_srt(srt_path: str):
     return segments
 
 
-def _generate_subtitle_images(srt_path: str, width: int, height: int):
+def _generate_subtitle_images(srt_path: str, width: int, height: int, size_pct: float = 4.0, position: str = "bottom"):
     """
     Generate transparent PNG images for each subtitle using Pillow.
+    size_pct: subtitle size as % of frame height; position: bottom | middle | top.
     Returns list of {path, start, end} dicts.
     """
     from PIL import Image, ImageDraw, ImageFont, features
@@ -145,7 +146,7 @@ def _generate_subtitle_images(srt_path: str, width: int, height: int):
     if features.check("raqm"):
         layout_engine = ImageFont.Layout.RAQM
 
-    font_size = max(16, min(32, width // 40)) if width < height else max(20, min(40, width // 48))
+    font_size = max(14, round(height * size_pct / 100 * 0.75))
 
     def _load_font(paths):
         for fp in paths:
@@ -229,7 +230,12 @@ def _generate_subtitle_images(srt_path: str, width: int, height: int):
         bbox = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         x = (width - tw) // 2
-        y = height - th - max(40, height // 15)
+        if position == "top":
+            y = max(24, height // 20)
+        elif position == "middle":
+            y = (height - th) // 2
+        else:
+            y = height - th - max(40, height // 15)
         pad = 8
         draw.rectangle(
             [x - pad, y - pad, x + tw + pad, y + th + pad],
@@ -254,6 +260,8 @@ def export_video_for_platform(
     tts_audio_path: str | None = None,
     mute_original_audio: bool = False,
     scale_mode: str = "fit",  # fit (black bars) | fill (crop/zoom) | blur (blurred background)
+    subtitle_size_pct: float = 4.0,  # subtitle height as % of frame height
+    subtitle_position: str = "bottom",  # bottom | middle | top
 ) -> str:
     """
     Export video formatted for a specific platform.
@@ -282,7 +290,7 @@ def export_video_for_platform(
     sub_images = []  # PNG overlay fallback
 
     if want_subs and not has_libass:
-        sub_images = _generate_subtitle_images(srt_path, w, h)
+        sub_images = _generate_subtitle_images(srt_path, w, h, subtitle_size_pct, subtitle_position)
 
     has_tts = bool(tts_audio_path and os.path.exists(tts_audio_path))
 
@@ -341,10 +349,14 @@ def export_video_for_platform(
     if has_libass:
         escaped_srt = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
         # ASS FontSize lives in the subtitles filter's default 384x288 script
-        # space and scales with output height: 16 ≈ 5.5% of frame height,
-        # which looks huge on 9:16 exports. Target ~4% vertical, ~4.7% horizontal.
-        font_size = 11 if w < h else 13
-        vf_base += f",subtitles='{escaped_srt}':force_style='FontSize={font_size},PrimaryColour=&HFFFFFF&,Outline=1'"
+        # space and scales with output height (FontSize 288 = full frame height).
+        font_size = max(6, min(24, round(288 * subtitle_size_pct / 100)))
+        # ASS numpad alignment: 2 = bottom center, 5 = middle center, 8 = top center
+        alignment = {"bottom": 2, "middle": 5, "top": 8}.get(subtitle_position, 2)
+        vf_base += (
+            f",subtitles='{escaped_srt}':force_style="
+            f"'FontSize={font_size},Alignment={alignment},MarginV=16,PrimaryColour=&HFFFFFF&,Outline=1'"
+        )
 
     # Decide if we need filter_complex or simple -vf
     need_filter_complex = bool(sub_images) or (has_tts and has_video_audio and not mute_original_audio)

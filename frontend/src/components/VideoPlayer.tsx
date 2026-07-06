@@ -9,7 +9,7 @@ interface Props {
 }
 
 export default function VideoPlayer({ videoRef }: Props) {
-  const { currentProject, currentTime, isPlaying, setCurrentTime, setIsPlaying, setActiveSegment, videoClips } =
+  const { currentProject, currentTime, isPlaying, setCurrentTime, setIsPlaying, setActiveSegment, videoClips, activeSegmentId, subtitleStyle } =
     useProjectStore();
   const [muted, setMuted] = useState(false);
   const [loop, setLoop] = useState(false);
@@ -244,14 +244,35 @@ export default function VideoPlayer({ videoRef }: Props) {
   return (
     <div className="flex flex-col border-b border-zinc-800">
       {/* Video with play overlay */}
-      <div className="relative bg-black flex items-center justify-center group" style={{ maxHeight: '240px' }}>
+      <div className="relative bg-black flex items-center justify-center group" style={{ maxHeight: '300px' }}>
         <video
           ref={videoRef}
           src={videoSrc}
-          className="w-full max-h-[240px] object-contain"
+          className="w-full max-h-[300px] object-contain"
           onClick={togglePlay}
           preload="auto"
         />
+        {/* Styled subtitle overlay — live preview of the export style */}
+        {(() => {
+          const seg = currentProject?.segments?.find((s) => s.id === activeSegmentId);
+          if (!seg?.text) return null;
+          const posCls =
+            subtitleStyle.position === 'top'
+              ? 'top-2'
+              : subtitleStyle.position === 'middle'
+              ? 'top-1/2 -translate-y-1/2'
+              : 'bottom-2';
+          return (
+            <div className={`absolute left-2 right-2 ${posCls} text-center pointer-events-none`}>
+              <span
+                className="inline-block px-2 py-0.5 bg-black/60 rounded text-white leading-snug max-w-full"
+                style={{ fontSize: `${Math.round(subtitleStyle.sizePct * 3)}px` }}
+              >
+                {seg.text}
+              </span>
+            </div>
+          );
+        })()}
         {/* Big play overlay when paused */}
         {!isPlaying && (
           <div
