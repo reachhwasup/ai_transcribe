@@ -111,6 +111,12 @@ const VOICES = [
   { id: 'old', label: '👴 Old' },
 ];
 
+// Microsoft's Khmer neural voices — shown by name when narrating in Khmer
+const KHMER_VOICES = [
+  { id: 'female', label: '🎀 ស្រីមុំ (Sreymom)' },
+  { id: 'male', label: '👔 ពិសិដ្ឋ (Piseth)' },
+];
+
 export default function NarrationPanel() {
   const { currentProject, loadProject } = useProjectStore();
   const [style, setStyle] = useState('summary');
@@ -126,6 +132,13 @@ export default function NarrationPanel() {
   const [showPreview, setShowPreview] = useState(false);
 
   const hasVideo = !!currentProject?.video_path;
+
+  // Khmer has two named voices — snap young/old to the matching one
+  useEffect(() => {
+    if (language === 'km' && (voice === 'young' || voice === 'old')) {
+      setVoice(voice === 'young' ? 'female' : 'male');
+    }
+  }, [language, voice]);
 
   // Auto-hide done/error toasts (like TranscribeToast)
   useEffect(() => {
@@ -269,7 +282,7 @@ export default function NarrationPanel() {
           Voice for TTS
         </label>
         <div className="flex gap-2">
-          {VOICES.map(v => (
+          {(language === 'km' ? KHMER_VOICES : VOICES).map(v => (
             <button
               key={v.id}
               onClick={() => setVoice(v.id)}
@@ -289,6 +302,11 @@ export default function NarrationPanel() {
             </button>
           ))}
         </div>
+        {language === 'km' && (
+          <p className="text-[9px] text-zinc-600 mt-1.5">
+            Microsoft Khmer neural voices (km-KH) — dialogue lines automatically use the matching male/female voice.
+          </p>
+        )}
       </div>
 
       {/* Generate Button */}
