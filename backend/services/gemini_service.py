@@ -276,7 +276,8 @@ def _build_narration_prompt(language: str = "km", style: str = "summary") -> str
 
     style_instructions = {
         "summary": f"Write a concise, engaging SUMMARY narration of what happens in this video. Describe the key events, actions, and information clearly. Like a TikTok recap or news summary. The narration should be in {lang_name}.",
-        "commentary": f"""Write an entertaining TikTok-style COMMENTARY recap of this video, like a viral drama-recap channel. The narration must be in {lang_name}.
+        "commentary": f"Write an entertaining COMMENTARY narration for this video, like a TikTok storyteller. Add reactions, opinions, and engaging hooks (e.g. 'Wait for it...', 'You won't believe what happens next...'). The narration should be in {lang_name}.",
+        "commentary2": f"""Write an entertaining TikTok-style COMMENTARY recap of this video, like a viral drama-recap channel. The narration must be in {lang_name}.
 - HOOK FIRST: the very first segment must create instant curiosity — a shocking fact, a bold claim, or a question about what happens (never start with boring setup).
 - Use present tense and casual spoken {lang_name} with short, punchy sentences.
 - Add reactions and suspense between events ('Wait for it...', 'And THIS is where it gets crazy...').

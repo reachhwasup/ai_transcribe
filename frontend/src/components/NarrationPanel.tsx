@@ -86,6 +86,7 @@ function NarrationToast({ toast, onClose }: { toast: NarrationToastState; onClos
 const STYLES = [
   { id: 'summary', label: '📋 Summary', desc: 'Concise recap of what happens' },
   { id: 'commentary', label: '🎤 Commentary', desc: 'Entertaining TikTok-style narration' },
+  { id: 'commentary2', label: '🔥 Commentary V2', desc: 'Hook-first viral recap with cliffhanger' },
   { id: 'educational', label: '📚 Educational', desc: 'Explain and teach like a documentary' },
   { id: 'story', label: '📖 Story', desc: 'Turn the video into a compelling story' },
 ];

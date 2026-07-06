@@ -904,6 +904,26 @@ async def apply_narration_segments(
         await db.delete(seg)
     await db.flush()
 
+    # Normalize timings so segments always fit the timeline: sort, clamp to
+    # the video duration, drop empty windows, and trim overlaps.
+    duration = project.duration or 0.0
+    narration_segments = sorted(narration_segments, key=lambda s: float(s.get("start_time", 0)))
+    normalized = []
+    for seg_data in narration_segments:
+        start = max(0.0, float(seg_data.get("start_time", 0)))
+        end = float(seg_data.get("end_time", 0))
+        if duration > 0:
+            start = min(start, duration)
+            end = min(end, duration)
+        if normalized and start < normalized[-1]["end_time"]:
+            start = normalized[-1]["end_time"]
+        if end - start < 0.3:
+            continue
+        normalized.append({**seg_data, "start_time": start, "end_time": end})
+    narration_segments = normalized
+    if not narration_segments:
+        raise HTTPException(400, "No narration segments fit within the video duration")
+
     # Create new segments from narration. Dialogue segments (actor lines)
     # keep the character as speaker and use a gender-matched voice; narration
     # segments use the chosen narrator voice.
