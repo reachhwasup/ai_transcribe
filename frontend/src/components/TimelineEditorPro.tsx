@@ -127,10 +127,8 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
   }, [currentProject?.id, mutedTracks, aiMutedProfiles, b1Muted, v1Muted, a2Muted]);
 
   // Generate Voice Audio state
-  const [showAudioPanel, setShowAudioPanel] = useState(false);
   const [audioGenerating, setAudioGenerating] = useState(false);
   const [audioGenerated, setAudioGenerated] = useState(false);
-  const audioPanelRef = useRef<HTMLDivElement>(null);
 
   // Editing tools state
   const [showFlipPanel, setShowFlipPanel] = useState(false);
@@ -807,23 +805,6 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     }
   }, [currentTime, timeToX]);
 
-  // Close audio panel on outside click
-  useEffect(() => {
-    if (!showAudioPanel) return;
-    const handleClick = (e: MouseEvent) => {
-      if (audioPanelRef.current && !audioPanelRef.current.contains(e.target as Node)) {
-        setShowAudioPanel(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [showAudioPanel]);
-
-  const handleOpenAudioPanel = () => {
-    setAudioGenerated(false);
-    setShowAudioPanel(prev => !prev);
-  };
-
   const handleGenerateVoice = async () => {
     if (!currentProject || segments.length === 0) return;
     setAudioGenerating(true);
@@ -1231,74 +1212,25 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
           )}
 
           {/* Generate Audio */}
-          <div className="relative" ref={audioPanelRef}>
-            <button
-              disabled={segments.length === 0}
-              onClick={handleOpenAudioPanel}
-              className={`flex items-center gap-1 px-2.5 py-1 rounded text-[10px] font-medium transition-colors ${
-                showAudioPanel
-                  ? 'bg-khmer-700 text-white'
-                  : 'bg-zinc-700/80 hover:bg-zinc-600 text-zinc-300'
-              } disabled:opacity-30`}
-            >
+          <button
+            disabled={segments.length === 0 || audioGenerating}
+            onClick={handleGenerateVoice}
+            title={selectedSegmentIds.size > 0 ? `Generate voice for ${selectedSegmentIds.size} selected segment(s)` : 'Generate voice for all segments'}
+            className="flex items-center gap-1 px-2.5 py-1 rounded text-[10px] font-medium transition-colors bg-zinc-700/80 hover:bg-zinc-600 text-zinc-300 disabled:opacity-30"
+          >
+            {audioGenerating ? (
+              <Loader2 className="w-3 h-3 animate-spin" />
+            ) : audioGenerated ? (
+              <Check className="w-3 h-3 text-emerald-400" />
+            ) : (
               <AudioLines className="w-3 h-3" />
-              {selectedSegmentIds.size > 0 ? `Generate (${selectedSegmentIds.size})` : 'Generate Audio'}
-              <ChevronDown className={`w-2.5 h-2.5 transition-transform ${showAudioPanel ? 'rotate-180' : ''}`} />
-            </button>
-
-            {/* Dropdown panel */}
-            {showAudioPanel && (
-              <div className="absolute right-0 top-full mt-1 w-80 bg-zinc-900 border border-zinc-700 rounded-lg shadow-2xl z-50 p-3 space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-zinc-200">
-                    {selectedSegmentIds.size > 0 ? `Generate Voice (${selectedSegmentIds.size} selected)` : 'Generate Voice from Subtitles'}
-                  </span>
-                  <button onClick={() => setShowAudioPanel(false)} className="p-0.5 rounded hover:bg-zinc-700">
-                    <X className="w-3.5 h-3.5 text-zinc-400" />
-                  </button>
-                </div>
-                <p className="text-[10px] text-zinc-400 leading-relaxed">
-                  {selectedSegmentIds.size > 0
-                    ? `AI will generate voice audio for ${selectedSegmentIds.size} selected segment(s). Audio appears in the AI track(s) below.`
-                    : 'AI will generate voice audio for all subtitle segments. Audio appears in the AI track(s) below.'}
-                </p>
-                <div className="max-h-32 overflow-y-auto space-y-1 bg-zinc-800/50 rounded-md p-2">
-                  {segments.slice(0, 10).map((seg, i) => (
-                    <div key={seg.id} className="flex items-start gap-2 text-[10px]">
-                      <span className="text-zinc-500 shrink-0 w-4">{i + 1}.</span>
-                      <span className={`shrink-0 px-1 rounded ${seg.voice_profile === 'male' ? 'bg-blue-900/40 text-blue-300' : 'bg-pink-900/40 text-pink-300'}`}>
-                        {seg.voice_profile === 'male' ? '♂' : '♀'}
-                      </span>
-                      <span className="text-zinc-300 font-khmer truncate">{seg.text}</span>
-                      {seg.audio_url && <span className="text-emerald-400 shrink-0">✓</span>}
-                    </div>
-                  ))}
-                  {segments.length > 10 && (
-                    <p className="text-[10px] text-zinc-500 text-center">... and {segments.length - 10} more segments</p>
-                  )}
-                </div>
-                <div className="text-[10px] text-zinc-500">
-                  {segments.length} segments · {segments.filter(s => s.voice_profile === 'female').length} female · {segments.filter(s => s.voice_profile === 'male').length} male
-                  {segments.filter(s => s.audio_url).length > 0 && (
-                    <span className="text-emerald-400"> · {segments.filter(s => s.audio_url).length} generated</span>
-                  )}
-                </div>
-                <button
-                  onClick={handleGenerateVoice}
-                  disabled={audioGenerating || segments.length === 0}
-                  className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-medium bg-khmer-700 hover:bg-khmer-600 text-white transition-colors disabled:opacity-40"
-                >
-                  {audioGenerating ? (
-                    <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Generating voice...</>
-                  ) : audioGenerated ? (
-                    <><Check className="w-3.5 h-3.5" /> Generated!</>
-                  ) : (
-                    <><AudioLines className="w-3.5 h-3.5" /> {selectedSegmentIds.size > 0 ? `Generate Voice (${selectedSegmentIds.size})` : 'Generate AI Voice'}</>
-                  )}
-                </button>
-              </div>
             )}
-          </div>
+            {audioGenerating
+              ? 'Generating…'
+              : selectedSegmentIds.size > 0
+              ? `Generate (${selectedSegmentIds.size})`
+              : 'Generate Audio'}
+          </button>
 
           {/* Zoom */}
           <div className="flex items-center gap-1 ml-1">
