@@ -341,14 +341,16 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
     <div
       className={
         inline
-          ? 'h-full overflow-y-auto flex justify-center py-4 px-4'
+          ? 'h-full w-full'
           : 'fixed inset-0 bg-black/60 flex items-center justify-center z-50'
       }
       onClick={inline ? undefined : onClose}
     >
       <div
-        className={`bg-zinc-900 border border-zinc-700 rounded-xl w-full max-w-2xl shadow-2xl flex flex-col ${
-          inline ? 'h-fit' : 'mx-4 max-h-[90vh]'
+        className={`bg-zinc-900 flex flex-col ${
+          inline
+            ? 'w-full h-full'
+            : 'border border-zinc-700 rounded-xl w-full max-w-2xl shadow-2xl mx-4 max-h-[90vh]'
         }`}
         onClick={(e) => e.stopPropagation()}
       >
@@ -394,7 +396,7 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-auto px-6 py-5">
+        <div className={`flex-1 overflow-auto px-6 py-5 ${inline ? 'w-full max-w-3xl mx-auto' : ''}`}>
           {tab === 'subtitle' ? (
             /* Subtitle export */
             <div className="space-y-3">
@@ -437,7 +439,7 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                       className="relative cursor-pointer mx-auto bg-black flex items-center justify-center transition-all duration-300"
                       style={{
                         aspectRatio: preset ? `${preset.width} / ${preset.height}` : '16 / 9',
-                        maxHeight: '240px',
+                        maxHeight: inline ? '48vh' : '240px',
                       }}
                       onClick={togglePreview}
                     >

@@ -375,10 +375,10 @@ export default function ProjectEditor() {
 
       {/* Main Workspace */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left Panel — Video + Project Info + Tools */}
+        {/* Left Panel — Video + Project Info + Tools (hidden on Deliver: it has its own preview) */}
         <div
-          className="shrink-0 border-r border-zinc-800 bg-zinc-900/30 flex flex-col overflow-hidden"
-          style={{ width: sidebarWidth }}
+          className="shrink-0 border-r border-zinc-800 bg-zinc-900/30 flex-col overflow-hidden"
+          style={{ width: sidebarWidth, display: workTab === 'deliver' ? 'none' : 'flex' }}
         >
           {/* Project title */}
           <div className="px-3 py-2 border-b border-zinc-800">
@@ -461,6 +461,7 @@ export default function ProjectEditor() {
         {/* Sidebar resize handle */}
         <div
           className="w-1 shrink-0 bg-zinc-800 hover:bg-khmer-500/60 cursor-col-resize transition-colors relative group"
+          style={{ display: workTab === 'deliver' ? 'none' : undefined }}
           onMouseDown={(e) => handleResizeStart(e, 'sidebar')}
         >
           <div className="absolute inset-y-0 -left-1 -right-1" />
