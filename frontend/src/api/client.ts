@@ -271,6 +271,7 @@ export async function exportVideoForPlatform(
   splitDuration?: number,
   subtitleLanguage?: string,
   muteOriginalAudio?: boolean,
+  scaleMode?: string,
 ): Promise<Blob> {
   const { data } = await api.post(
     `/projects/${projectId}/export/video`,
@@ -283,6 +284,7 @@ export async function exportVideoForPlatform(
       mute_original_audio: muteOriginalAudio ?? false,
       split_duration: splitDuration ?? null,
       subtitle_language: subtitleLanguage || null,
+      scale_mode: scaleMode || 'fit',
     },
     {
       responseType: 'blob',

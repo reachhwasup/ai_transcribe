@@ -253,6 +253,7 @@ def export_video_for_platform(
     srt_path: str | None = None,
     tts_audio_path: str | None = None,
     mute_original_audio: bool = False,
+    scale_mode: str = "fit",  # fit (black bars) | fill (crop/zoom) | blur (blurred background)
 ) -> str:
     """
     Export video formatted for a specific platform.
@@ -323,7 +324,19 @@ def export_video_for_platform(
         next_idx += 1
 
     # ---- Build video filter ----
-    vf_base = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
+    if scale_mode == "fill":
+        # Zoom to fill the frame, cropping the overflow (center crop)
+        vf_base = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+    elif scale_mode == "blur":
+        # Video fitted at natural size over a blurred, zoomed copy of itself
+        vf_base = (
+            f"split[bgin][fgin];"
+            f"[bgin]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=20:3[bg];"
+            f"[fgin]scale={w}:{h}:force_original_aspect_ratio=decrease[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2"
+        )
+    else:  # fit
+        vf_base = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
 
     if has_libass:
         escaped_srt = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")

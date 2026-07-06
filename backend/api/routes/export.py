@@ -396,6 +396,7 @@ class VideoExportRequest(BaseModel):
     mute_original_audio: bool = False
     split_duration: Optional[float] = None  # seconds per part; None = single file
     subtitle_language: Optional[str] = None  # target language for subtitles
+    scale_mode: str = "fit"  # fit | fill | blur
 
 
 async def _build_tts_from_existing(segments, total_duration) -> str:
@@ -597,6 +598,7 @@ async def export_video(
             srt_path=srt_path,
             tts_audio_path=tts_audio_path,
             mute_original_audio=body.mute_original_audio,
+            scale_mode=body.scale_mode,
         )
     except RuntimeError as e:
         raise HTTPException(500, str(e))
