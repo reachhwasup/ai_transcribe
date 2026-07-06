@@ -307,7 +307,10 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
           audio.play().catch(() => {});
         }
       } else {
-        if (!audio.paused) {
+        // Grace window: the clip may have started a fraction late (timeupdate
+        // granularity), so don't chop its last word exactly at end_time.
+        const pastGrace = sourceTime < seg.start_time || sourceTime > seg.end_time + 0.35;
+        if (!audio.paused && pastGrace) {
           audio.pause();
           audio.currentTime = 0;
         }
