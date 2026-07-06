@@ -466,10 +466,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     };
     const onZoom = (e: Event) => {
       const dir = (e as CustomEvent).detail;
-      setZoom(prev => dir === 'in'
-        ? Math.min(20, +(prev + 0.5).toFixed(1))
-        : Math.max(0.5, +(prev - 0.5).toFixed(1))
-      );
+      zoomBy(dir === 'in' ? 1.3 : 1 / 1.3);
     };
 
     const onUndo = () => handleUndo();
@@ -502,6 +499,17 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
   }, [videoClips, sourceDuration]);
   // For rendering: use timeline duration (sequential) when clips exist, else source duration
   const duration = timelineDuration;
+
+  const ZOOM_MIN = 0.05;
+  const ZOOM_MAX = 20;
+  const zoomBy = useCallback((factor: number) => {
+    setZoom(prev => Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, +(prev * factor).toFixed(3))));
+  }, []);
+  const getFitZoom = useCallback(() => {
+    const el = containerRef.current;
+    if (!el || duration <= 0) return 1;
+    return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, (el.clientWidth - 24) / (duration * 20)));
+  }, [duration]);
   const totalWidth = Math.max(duration * pixelsPerSecond, 800);
 
   // Assign each segment to a lane (track) so overlapping segments go to T2, T3, etc.
@@ -907,12 +915,21 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
 
   const handleFitToView = useCallback(() => {
     if (!containerRef.current || duration <= 0) return;
-    const viewWidth = containerRef.current.clientWidth - 20;
-    const idealPPS = viewWidth / duration;
-    const idealZoom = idealPPS / 20;
-    setZoom(Math.max(0.5, Math.min(20, +idealZoom.toFixed(1))));
+    setZoom(getFitZoom());
     containerRef.current.scrollLeft = 0;
-  }, [duration]);
+  }, [duration, getFitZoom]);
+
+  // Long videos start fully visible instead of 20,000px wide
+  const autoFitDoneRef = useRef(false);
+  useEffect(() => {
+    if (autoFitDoneRef.current || duration <= 0 || !containerRef.current) return;
+    autoFitDoneRef.current = true;
+    const fit = getFitZoom();
+    if (fit < zoom) {
+      setZoom(fit);
+      containerRef.current.scrollLeft = 0;
+    }
+  }, [duration, getFitZoom, zoom]);
 
   // Ctrl+wheel zoom on the timeline
   useEffect(() => {
@@ -925,8 +942,8 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
       const pointerX = e.clientX - rect.left;
       const scrollLeft = el.scrollLeft;
       const pointerTime = (pointerX + scrollLeft) / (20 * zoom);
-      const step = e.deltaY < 0 ? 0.5 : -0.5;
-      const newZoom = Math.max(0.5, Math.min(20, +(zoom + step).toFixed(1)));
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const newZoom = Math.max(0.05, Math.min(20, +(zoom * factor).toFixed(3)));
       setZoom(newZoom);
       // Keep the time under the pointer in the same screen position
       requestAnimationFrame(() => {
@@ -1235,7 +1252,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
           {/* Zoom */}
           <div className="flex items-center gap-1 ml-1">
             <button
-              onClick={() => setZoom(prev => Math.max(0.5, +(prev - 0.5).toFixed(1)))}
+              onClick={() => zoomBy(1 / 1.3)}
               className="p-0.5 rounded hover:bg-zinc-700/60 text-zinc-400 hover:text-zinc-200 transition-colors"
               title="Zoom Out"
             >
@@ -1243,19 +1260,26 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
             </button>
             <input
               type="range"
-              min={0.5}
-              max={20}
-              step={0.5}
-              value={zoom}
-              onChange={(e) => setZoom(parseFloat(e.target.value))}
+              min={0}
+              max={1}
+              step={0.01}
+              value={Math.log(zoom / 0.05) / Math.log(20 / 0.05)}
+              onChange={(e) => setZoom(+((0.05 * Math.pow(20 / 0.05, parseFloat(e.target.value))).toFixed(3)))}
               className="w-16 h-1 accent-khmer-500 cursor-pointer"
             />
             <button
-              onClick={() => setZoom(prev => Math.min(20, +(prev + 0.5).toFixed(1)))}
+              onClick={() => zoomBy(1.3)}
               className="p-0.5 rounded hover:bg-zinc-700/60 text-zinc-400 hover:text-zinc-200 transition-colors"
               title="Zoom In"
             >
               <ZoomIn className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={handleFitToView}
+              className="px-1.5 py-0.5 rounded hover:bg-zinc-700/60 text-[9px] text-zinc-400 hover:text-zinc-200 transition-colors border border-zinc-700"
+              title="Fit whole video in view"
+            >
+              Fit
             </button>
             <span className="text-[9px] text-zinc-500 min-w-[28px]">{Math.round(zoom * 100)}%</span>
           </div>
