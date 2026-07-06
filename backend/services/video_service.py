@@ -327,8 +327,11 @@ def export_video_for_platform(
 
     if has_libass:
         escaped_srt = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-        font_size = 16 if w < h else 24
-        vf_base += f",subtitles='{escaped_srt}':force_style='FontSize={font_size},PrimaryColour=&HFFFFFF&'"
+        # ASS FontSize lives in the subtitles filter's default 384x288 script
+        # space and scales with output height: 16 ≈ 5.5% of frame height,
+        # which looks huge on 9:16 exports. Target ~4% vertical, ~4.7% horizontal.
+        font_size = 11 if w < h else 13
+        vf_base += f",subtitles='{escaped_srt}':force_style='FontSize={font_size},PrimaryColour=&HFFFFFF&,Outline=1'"
 
     # Decide if we need filter_complex or simple -vf
     need_filter_complex = bool(sub_images) or (has_tts and has_video_audio and not mute_original_audio)
