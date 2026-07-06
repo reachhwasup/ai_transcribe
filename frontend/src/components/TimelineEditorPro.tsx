@@ -91,6 +91,41 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
   const [b1Muted, setB1Muted] = useState(false);
   const [v1Muted, setV1Muted] = useState(false);
 
+  // Restore this project's saved mute choices (so they survive refresh)
+  const mutesLoadedRef = useRef(false);
+  useEffect(() => {
+    if (!currentProject?.id) return;
+    try {
+      const raw = localStorage.getItem(`timeline-mutes-${currentProject.id}`);
+      if (raw) {
+        const m = JSON.parse(raw);
+        setMutedTracks(new Set<number>(m.tracks || []));
+        setAiMutedProfiles(new Set<string>(m.ai || []));
+        setB1Muted(!!m.b1);
+        setV1Muted(!!m.v1);
+        setA2Muted(!!m.a2);
+      }
+    } catch {
+      // corrupted entry — ignore
+    }
+    mutesLoadedRef.current = true;
+  }, [currentProject?.id]);
+
+  // Persist mute choices per project
+  useEffect(() => {
+    if (!currentProject?.id || !mutesLoadedRef.current) return;
+    localStorage.setItem(
+      `timeline-mutes-${currentProject.id}`,
+      JSON.stringify({
+        tracks: Array.from(mutedTracks),
+        ai: Array.from(aiMutedProfiles),
+        b1: b1Muted,
+        v1: v1Muted,
+        a2: a2Muted,
+      })
+    );
+  }, [currentProject?.id, mutedTracks, aiMutedProfiles, b1Muted, v1Muted, a2Muted]);
+
   // Generate Voice Audio state
   const [showAudioPanel, setShowAudioPanel] = useState(false);
   const [audioGenerating, setAudioGenerating] = useState(false);
@@ -173,9 +208,13 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     if (bgmRef?.current) bgmRef.current.muted = b1Muted;
   }, [b1Muted, bgmRef]);
 
-  // When audio is separated, auto-mute A2 and unmute V1+B1
+  // When audio isolation is NEWLY activated, auto-mute A2 and unmute V1+B1.
+  // Only on the transition — not on mount — so saved mute choices survive refresh.
+  const prevSeparatedRef = useRef<boolean | null>(null);
   useEffect(() => {
-    if (audioSeparated) {
+    const was = prevSeparatedRef.current;
+    prevSeparatedRef.current = !!audioSeparated;
+    if (audioSeparated && was === false) {
       setA2Muted(true);
       setV1Muted(false);
       setB1Muted(false);
