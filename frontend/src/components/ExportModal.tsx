@@ -49,6 +49,7 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
   const [platforms, setPlatforms] = useState<Record<string, PlatformPreset>>({});
   const [selectedPlatform, setSelectedPlatform] = useState('youtube');
   const [scaleMode, setScaleMode] = useState<'fit' | 'fill' | 'blur'>('fit');
+  const [exportName, setExportName] = useState('export');
   const [trimEnabled, setTrimEnabled] = useState(false);
   const [startTime, setStartTime] = useState('0');
   const [endTime, setEndTime] = useState('');
@@ -106,6 +107,9 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
       setPreviewPlaying(false);
       setPreviewTime(0);
       setEndTime(String(Math.floor(currentProject.duration || 60)));
+      // Default export name = the uploaded video's filename (without extension)
+      const base = (currentProject.video_filename || currentProject.name || 'export').replace(/\.[^.]+$/, '');
+      setExportName(base);
       fetchPlatforms(currentProject.id)
         .then(setPlatforms)
         .catch(() => {});
@@ -300,7 +304,8 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${currentProject.name.replace(/\s+/g, '_')}_${selectedPlatform}${isZip ? '_parts' : ''}.${ext}`;
+      const safeName = (exportName.trim() || currentProject.name || 'export').replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, '_');
+      a.download = `${safeName}${isZip ? '_parts' : ''}.${ext}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -700,6 +705,23 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                           <p className="text-[9px] text-zinc-500 mt-0.5">{m.desc}</p>
                         </button>
                       ))}
+                    </div>
+                  </div>
+
+                  {/* Export file name */}
+                  <div>
+                    <label className="text-sm font-medium text-zinc-300 mb-2 block">
+                      File Name
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={exportName}
+                        onChange={(e) => setExportName(e.target.value)}
+                        placeholder="export name"
+                        className="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white focus:outline-none focus:border-khmer-500"
+                      />
+                      <span className="text-xs text-zinc-500 shrink-0">.mp4</span>
                     </div>
                   </div>
 
