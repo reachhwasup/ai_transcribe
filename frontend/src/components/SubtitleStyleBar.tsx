@@ -2,29 +2,29 @@ import { useProjectStore } from '../stores/projectStore';
 import { DEFAULT_SUBTITLE_STYLE } from '../types/subtitleStyle';
 import { Type, RotateCcw } from 'lucide-react';
 
-/** CapCut-style controls for burned-in subtitle captions.
- *  Live preview shows on the video player; applied when exporting with subtitles. */
-export default function SubtitleStyleBar() {
-  const { subtitleStyle: s, setSubtitleStyle } = useProjectStore();
-
-  const Swatch = ({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) => (
+// Defined at module scope (not inside the component) so their identity is
+// stable across re-renders — otherwise the native color picker gets torn
+// down and reopened on every change and can't be used.
+function Swatch({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+  return (
     <label className="flex items-center gap-1.5 cursor-pointer" title={label}>
       <span className="text-[10px] text-zinc-400 whitespace-nowrap">{label}</span>
-      <span className="relative w-6 h-6 rounded border border-zinc-600 overflow-hidden shrink-0">
-        <input
-          type="color"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="absolute -inset-1 w-8 h-8 cursor-pointer"
-        />
-      </span>
+      <input
+        type="color"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-6 h-6 rounded border border-zinc-600 bg-transparent cursor-pointer p-0"
+        style={{ appearance: 'none', WebkitAppearance: 'none' }}
+      />
     </label>
   );
+}
 
-  const Slider = ({ label, value, min, max, step, onChange, fmt }: {
-    label: string; value: number; min: number; max: number; step: number;
-    onChange: (v: number) => void; fmt?: (v: number) => string;
-  }) => (
+function Slider({ label, value, min, max, step, onChange, fmt }: {
+  label: string; value: number; min: number; max: number; step: number;
+  onChange: (v: number) => void; fmt?: (v: number) => string;
+}) {
+  return (
     <div className="flex items-center gap-1.5">
       <span className="text-[10px] text-zinc-400 whitespace-nowrap">{label}</span>
       <input type="range" min={min} max={max} step={step} value={value}
@@ -33,6 +33,12 @@ export default function SubtitleStyleBar() {
       <span className="text-[9px] font-mono text-zinc-500 w-7">{fmt ? fmt(value) : value}</span>
     </div>
   );
+}
+
+/** CapCut-style controls for burned-in subtitle captions.
+ *  Live preview shows on the video player; applied when exporting with subtitles. */
+export default function SubtitleStyleBar() {
+  const { subtitleStyle: s, setSubtitleStyle } = useProjectStore();
 
   return (
     <div className="flex items-center gap-x-4 gap-y-2 px-4 py-2 border-b border-zinc-800 bg-zinc-900/60 shrink-0 flex-wrap">
