@@ -276,8 +276,7 @@ export async function exportVideoForPlatform(
   subtitleLanguage?: string,
   muteOriginalAudio?: boolean,
   scaleMode?: string,
-  subtitleSizePct?: number,
-  subtitlePosition?: string,
+  subtitleStyle?: import('../types/subtitleStyle').SubtitleStyle,
 ): Promise<Blob> {
   const { data } = await api.post(
     `/projects/${projectId}/export/video`,
@@ -291,8 +290,9 @@ export async function exportVideoForPlatform(
       split_duration: splitDuration ?? null,
       subtitle_language: subtitleLanguage || null,
       scale_mode: scaleMode || 'fit',
-      subtitle_size_pct: subtitleSizePct ?? 4,
-      subtitle_position: subtitlePosition || 'bottom',
+      subtitle_size_pct: subtitleStyle?.sizePct ?? 4,
+      subtitle_position: subtitleStyle?.position || 'bottom',
+      subtitle_style: subtitleStyle ?? null,
     },
     {
       responseType: 'blob',

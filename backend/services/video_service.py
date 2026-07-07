@@ -129,10 +129,21 @@ def _parse_srt(srt_path: str):
     return segments
 
 
-def _generate_subtitle_images(srt_path: str, width: int, height: int, size_pct: float = 4.0, position: str = "bottom"):
+def _hex_rgb(hex_str: str, default=(255, 255, 255)):
+    """Parse '#RRGGBB' into an (r, g, b) tuple."""
+    try:
+        h = str(hex_str).lstrip("#")
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except (ValueError, IndexError, TypeError):
+        return default
+
+
+def _generate_subtitle_images(srt_path: str, width: int, height: int, size_pct: float = 4.0, position: str = "bottom", style: dict | None = None):
     """
     Generate transparent PNG images for each subtitle using Pillow.
     size_pct: subtitle size as % of frame height; position: bottom | middle | top.
+    style: caption style dict (textColor, outlineColor, outlineWidth, boxColor,
+           boxOpacity, boxOutlineColor, boxOutlineWidth). None = white-on-black default.
     Returns list of {path, start, end} dicts.
     """
     from PIL import Image, ImageDraw, ImageFont, features
@@ -140,6 +151,18 @@ def _generate_subtitle_images(srt_path: str, width: int, height: int, size_pct: 
     segments = _parse_srt(srt_path)
     if not segments:
         return []
+
+    # Resolve caption style, scaling outline widths to the export resolution so
+    # they look the same as in the (smaller) preview.
+    style = style or {}
+    scale = height / 720.0  # preview reference height
+    text_rgb = _hex_rgb(style.get("textColor"), (255, 255, 255))
+    outline_rgb = _hex_rgb(style.get("outlineColor"), (0, 0, 0))
+    outline_w = round(float(style.get("outlineWidth", 2)) * scale)
+    box_rgb = _hex_rgb(style.get("boxColor"), (0, 0, 0))
+    box_alpha = int(max(0.0, min(1.0, float(style.get("boxOpacity", 0.55)))) * 255)
+    box_border_rgb = _hex_rgb(style.get("boxOutlineColor"), (0, 0, 0))
+    box_border_w = round(float(style.get("boxOutlineWidth", 0)) * scale)
 
     # Use raqm layout engine for complex scripts (Khmer, Thai, Arabic, etc.)
     layout_engine = None
@@ -236,13 +259,26 @@ def _generate_subtitle_images(srt_path: str, width: int, height: int, size_pct: 
             y = (height - th) // 2
         else:
             y = height - th - max(40, height // 15)
-        pad = 8
-        draw.rectangle(
-            [x - pad, y - pad, x + tw + pad, y + th + pad],
-            fill=(0, 0, 0, 180),
+        pad = max(8, round(font_size * 0.25))
+
+        # Background box (fill + optional border), only if visible
+        if box_alpha > 0 or box_border_w > 0:
+            box = [x - pad, y - pad, x + tw + pad, y + th + pad]
+            draw.rectangle(
+                box,
+                fill=(box_rgb[0], box_rgb[1], box_rgb[2], box_alpha) if box_alpha > 0 else None,
+                outline=(box_border_rgb[0], box_border_rgb[1], box_border_rgb[2], 255) if box_border_w > 0 else None,
+                width=max(1, box_border_w),
+            )
+
+        # Text: draw the outline (stroke) then the fill on top
+        tx, ty = x - bbox[0], y - bbox[1]
+        draw.text(
+            (tx, ty), text, font=font,
+            fill=(text_rgb[0], text_rgb[1], text_rgb[2], 255),
+            stroke_width=outline_w if outline_w > 0 else 0,
+            stroke_fill=(outline_rgb[0], outline_rgb[1], outline_rgb[2], 255) if outline_w > 0 else None,
         )
-        # Offset text position by bbox origin so text aligns with the background
-        draw.text((x - bbox[0], y - bbox[1]), text, fill=(255, 255, 255, 255), font=font)
         img_path = os.path.join(export_dir, f"_sub_{uuid.uuid4()}_{i}.png")
         img.save(img_path)
         sub_images.append({"path": img_path, "start": seg["start"], "end": seg["end"]})
@@ -262,6 +298,7 @@ def export_video_for_platform(
     scale_mode: str = "fit",  # fit (black bars) | fill (crop/zoom) | blur (blurred background)
     subtitle_size_pct: float = 4.0,  # subtitle height as % of frame height
     subtitle_position: str = "bottom",  # bottom | middle | top
+    subtitle_style: dict | None = None,  # full caption style (colors, outline, box)
 ) -> str:
     """
     Export video formatted for a specific platform.
@@ -290,7 +327,7 @@ def export_video_for_platform(
     sub_images = []  # PNG overlay fallback
 
     if want_subs and not has_libass:
-        sub_images = _generate_subtitle_images(srt_path, w, h, subtitle_size_pct, subtitle_position)
+        sub_images = _generate_subtitle_images(srt_path, w, h, subtitle_size_pct, subtitle_position, subtitle_style)
 
     has_tts = bool(tts_audio_path and os.path.exists(tts_audio_path))
 

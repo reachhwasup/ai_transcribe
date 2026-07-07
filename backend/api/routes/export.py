@@ -399,6 +399,7 @@ class VideoExportRequest(BaseModel):
     scale_mode: str = "fit"  # fit | fill | blur
     subtitle_size_pct: float = 4.0  # burned subtitle height as % of frame height
     subtitle_position: str = "bottom"  # bottom | middle | top
+    subtitle_style: Optional[dict] = None  # full caption style (colors, outline, box)
 
 
 async def _build_tts_from_existing(segments, total_duration) -> str:
@@ -603,6 +604,7 @@ async def export_video(
             scale_mode=body.scale_mode,
             subtitle_size_pct=body.subtitle_size_pct,
             subtitle_position=body.subtitle_position,
+            subtitle_style=body.subtitle_style,
         )
     except RuntimeError as e:
         raise HTTPException(500, str(e))

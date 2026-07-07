@@ -3,6 +3,7 @@ import { useProjectStore } from '../stores/projectStore';
 import { Play, Pause, Square, Repeat, Volume2, VolumeX, Upload } from 'lucide-react';
 import { useState } from 'react';
 import { buildClipLayout, sourceToTimeline, timelineToSource, totalTimelineDuration } from '../utils/clipTimemap';
+import SubtitleOverlay from './SubtitleOverlay';
 
 interface Props {
   videoRef: RefObject<HTMLVideoElement | null>;
@@ -256,21 +257,8 @@ export default function VideoPlayer({ videoRef }: Props) {
         {(() => {
           const seg = currentProject?.segments?.find((s) => s.id === activeSegmentId);
           if (!seg?.text) return null;
-          const posCls =
-            subtitleStyle.position === 'top'
-              ? 'top-2'
-              : subtitleStyle.position === 'middle'
-              ? 'top-1/2 -translate-y-1/2'
-              : 'bottom-2';
           return (
-            <div className={`absolute left-2 right-2 ${posCls} text-center pointer-events-none`}>
-              <span
-                className="inline-block px-2 py-0.5 bg-black/60 rounded text-white leading-snug max-w-full"
-                style={{ fontSize: `${Math.round(subtitleStyle.sizePct * 3)}px` }}
-              >
-                {seg.text}
-              </span>
-            </div>
+            <SubtitleOverlay text={seg.text} style={subtitleStyle} />
           );
         })()}
         {/* Big play overlay when paused */}

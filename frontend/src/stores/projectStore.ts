@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import type { Project, ProjectListItem, Segment, VideoClip } from '../types';
+import type { SubtitleStyle } from '../types/subtitleStyle';
+import { DEFAULT_SUBTITLE_STYLE } from '../types/subtitleStyle';
 import * as api from '../api/client';
 
 interface ProjectStore {
@@ -20,10 +22,10 @@ interface ProjectStore {
   videoMuted: boolean;
   uploadProgress: number;
   error: string | null;
-  subtitleStyle: { sizePct: number; position: 'bottom' | 'middle' | 'top' };
+  subtitleStyle: SubtitleStyle;
 
   // Actions
-  setSubtitleStyle: (style: Partial<{ sizePct: number; position: 'bottom' | 'middle' | 'top' }>) => void;
+  setSubtitleStyle: (style: Partial<SubtitleStyle>) => void;
   loadProjects: () => Promise<void>;
   loadProject: (id: string) => Promise<void>;
   createProject: (name: string, description?: string) => Promise<Project>;
@@ -65,7 +67,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
   selectedSegmentIds: new Set<string>(),
   videoMuted: false,
   uploadProgress: 0,
-  subtitleStyle: { sizePct: 4, position: 'bottom' as const },
+  subtitleStyle: DEFAULT_SUBTITLE_STYLE,
   error: null,
 
   loadProjects: async () => {
@@ -83,7 +85,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     try {
       const project = await api.fetchProject(id);
       // Restore this project's saved subtitle style
-      let subtitleStyle: { sizePct: number; position: 'bottom' | 'middle' | 'top' } = { sizePct: 4, position: 'bottom' };
+      let subtitleStyle: SubtitleStyle = { ...DEFAULT_SUBTITLE_STYLE };
       try {
         const raw = localStorage.getItem(`subtitle-style-${id}`);
         if (raw) subtitleStyle = { ...subtitleStyle, ...JSON.parse(raw) };

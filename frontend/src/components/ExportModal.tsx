@@ -20,6 +20,7 @@ import {
   Pause,
 } from 'lucide-react';
 import { buildClipLayout, totalTimelineDuration, sourceToTimeline, timelineToSource } from '../utils/clipTimemap';
+import SubtitleOverlay from './SubtitleOverlay';
 
 interface Props {
   open: boolean;
@@ -42,6 +43,8 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
   const { currentProject, videoClips, videoMuted, subtitleStyle } = useProjectStore();
   const previewRef = useRef<HTMLVideoElement>(null);
   const previewBgRef = useRef<HTMLVideoElement>(null);
+  const previewBoxRef = useRef<HTMLDivElement>(null);
+  const [previewBoxH, setPreviewBoxH] = useState(300);
   const rafRef = useRef<number>(0);
   const aiAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
   const clipLayout = useMemo(() => buildClipLayout(videoClips), [videoClips]);
@@ -73,6 +76,17 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
       bg.currentTime = main.currentTime;
     }
   }, [previewPlaying, previewTime, scaleMode]);
+
+  // Measure the preview box so caption size (% of frame height) previews accurately
+  useEffect(() => {
+    const el = previewBoxRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => setPreviewBoxH(el.clientHeight || 300));
+    ro.observe(el);
+    setPreviewBoxH(el.clientHeight || 300);
+    return () => ro.disconnect();
+  }, [open, inline, selectedPlatform]);
+
   const [showSubtitles, setShowSubtitles] = useState(true);
   const [currentSourceTime, setCurrentSourceTime] = useState(0);
   const [subtitleLanguage, setSubtitleLanguage] = useState('');
@@ -294,8 +308,7 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         subtitleLanguage || undefined,
         videoMuted,
         scaleMode,
-        subtitleStyle.sizePct,
-        subtitleStyle.position,
+        subtitleStyle,
       );
 
       // Download the blob
@@ -438,6 +451,7 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                   {/* Video Preview with custom controls */}
                   <div className="rounded-lg overflow-hidden bg-black border border-zinc-700/50">
                     <div
+                      ref={previewBoxRef}
                       className="relative cursor-pointer mx-auto bg-black flex items-center justify-center transition-all duration-300"
                       style={{
                         aspectRatio: preset ? `${preset.width} / ${preset.height}` : '16 / 9',
@@ -461,20 +475,14 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                         preload="metadata"
                         muted={videoMuted}
                       />
-                      {/* Subtitle overlay */}
+                      {/* Subtitle overlay — matches the burned-in export style */}
                       {showSubtitles && (() => {
                         const segments = translatedSegments.length > 0 ? translatedSegments : (currentProject?.segments || []);
                         const seg = segments.find(
                           s => currentSourceTime >= s.start_time && currentSourceTime < s.end_time
                         );
                         if (!seg) return null;
-                        return (
-                          <div className="absolute bottom-4 left-2 right-2 text-center pointer-events-none">
-                            <span className="inline-block px-3 py-1 bg-black/70 rounded text-white text-sm font-medium leading-snug max-w-full">
-                              {seg.text}
-                            </span>
-                          </div>
-                        );
+                        return <SubtitleOverlay text={seg.text} style={subtitleStyle} frameHeight={previewBoxH} />;
                       })()}
                       {translating && (
                         <div className="absolute top-2 right-2 pointer-events-none">
