@@ -113,37 +113,6 @@ def _probe_duration(ffmpeg: str, path: str) -> float:
         return 0.0
 
 
-def _trim_silence(path: str) -> str:
-    """Trim leading/trailing silence from an audio file in place.
-
-    TTS engines (both edge-tts and VoxCPM) often pad short utterances with up
-    to a second of silence, which throws off segment timing and fitting. This
-    removes the dead air at both ends, leaving a small natural margin.
-    """
-    ffmpeg = _get_ffmpeg()
-    trimmed = path.rsplit(".", 1)[0] + "_trim." + path.rsplit(".", 1)[-1]
-    # Trim the head, reverse, trim the (now-head) tail, reverse back.
-    af = (
-        "silenceremove=start_periods=1:start_silence=0.03:start_threshold=-45dB:detection=peak,"
-        "areverse,"
-        "silenceremove=start_periods=1:start_silence=0.06:start_threshold=-45dB:detection=peak,"
-        "areverse"
-    )
-    codec = _codec_for_ext(trimmed)
-    cmd = [ffmpeg, "-y", "-i", path, "-af", af] + codec + [trimmed]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if r.returncode == 0 and os.path.exists(trimmed) and _probe_duration(ffmpeg, trimmed) > 0.1:
-            os.replace(trimmed, path)
-    except (subprocess.TimeoutExpired, OSError):
-        if os.path.exists(trimmed):
-            try:
-                os.remove(trimmed)
-            except OSError:
-                pass
-    return path
-
-
 # --- VoxCPM lazy-loaded model cache ---
 _voxcpm_model = None
 import threading as _threading
@@ -318,7 +287,6 @@ async def _generate_voxcpm_audio(
 
     sample_rate = model.tts_model.sample_rate
     await asyncio.to_thread(sf.write, output_path, np.array(wav), sample_rate)
-    await asyncio.to_thread(_trim_silence, output_path)
 
     return output_path
 
@@ -332,11 +300,7 @@ async def generate_segment_audio(
     emotion: str = "",
 ) -> str:
     """Generate TTS audio for a single text segment. Returns path to mp3 file."""
-    # VoxCPM frequently doubles or garbles very short utterances (1-3 words),
-    # and a doubled short word is too brief to trip the repeat detector.
-    # Its expressive edge is negligible on such short text, so route short
-    # segments to the far more reliable edge-tts even when VoxCPM is selected.
-    if settings.tts_engine == "voxcpm" and _estimated_speech_seconds(text) >= 1.3:
+    if settings.tts_engine == "voxcpm":
         return await _generate_voxcpm_audio(text, voice_profile, emotion)
 
     import edge_tts
@@ -359,7 +323,6 @@ async def generate_segment_audio(
 
     communicate = edge_tts.Communicate(text, voice, rate=tts_rate, pitch=tts_pitch, volume=tts_volume)
     await communicate.save(output_path)
-    await asyncio.to_thread(_trim_silence, output_path)
 
     return output_path
 
