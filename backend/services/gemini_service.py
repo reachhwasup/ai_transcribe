@@ -276,12 +276,18 @@ def _build_narration_prompt(language: str = "km", style: str = "summary") -> str
 
     style_instructions = {
         "summary": f"Write a concise, engaging SUMMARY narration of what happens in this video. Describe the key events, actions, and information clearly. Like a TikTok recap or news summary. The narration should be in {lang_name}.",
-        "commentary": f"Write an entertaining COMMENTARY narration for this video, like a TikTok storyteller. Add reactions, opinions, and engaging hooks (e.g. 'Wait for it...', 'You won't believe what happens next...'). The narration should be in {lang_name}.",
-        "commentary2": f"""Write an entertaining TikTok-style COMMENTARY recap of this video, like a viral drama-recap channel. The narration must be in {lang_name}.
-- HOOK FIRST: the very first segment must create instant curiosity — a shocking fact, a bold claim, or a question about what happens (never start with boring setup).
-- Use present tense and casual spoken {lang_name} with short, punchy sentences.
-- Add reactions and suspense between events ('Wait for it...', 'And THIS is where it gets crazy...').
-- End with a cliffhanger or a question that makes viewers comment.""",
+        "commentary": f"""Write a warm STORYTELLER commentary for this video — the calm, immersive drama-recap style. The narration must be in {lang_name}.
+- Flowing, descriptive narration that draws the viewer INTO the story like a friend retelling a movie.
+- Longer, complete sentences with emotional depth; explain characters' feelings and motivations, not just events.
+- A gentle, engaging tone — occasional light reactions, but mostly smooth storytelling.
+- Fewer, richer segments that let each moment breathe.""",
+        "commentary2": f"""Write a high-energy VIRAL HYPE commentary for this video — the fast, addictive drama-recap style. The narration must be in {lang_name}.
+- HOOK FIRST: the opening segment must SHOCK — a jaw-dropping reveal, a bold claim, or a burning question (never setup).
+- VERY short, punchy sentences in present tense. Rapid pace. One idea per line.
+- Talk DIRECTLY to the viewer ('You won't believe this', 'Watch what she does next', 'Wait for it...').
+- Maximum suspense and emotional exaggeration between beats.
+- Weave in the most dramatic actor lines as dialogue.
+- End on a hard cliffhanger that forces a comment or a follow.""",
         "educational": f"Write an EDUCATIONAL narration explaining what is happening in this video. Break down concepts, provide context, and teach the viewer. Like a documentary narrator. The narration should be in {lang_name}.",
         "story": f"Write a STORYTELLING narration that turns this video into a compelling story. Use narrative structure with a beginning, middle, and end. Add dramatic flair. The narration should be in {lang_name}.",
     }
