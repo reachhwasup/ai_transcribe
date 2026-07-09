@@ -277,6 +277,7 @@ export async function exportVideoForPlatform(
   muteOriginalAudio?: boolean,
   scaleMode?: string,
   subtitleStyle?: import('../types/subtitleStyle').SubtitleStyle,
+  backgroundAudio?: string,
 ): Promise<Blob> {
   const { data } = await api.post(
     `/projects/${projectId}/export/video`,
@@ -287,6 +288,7 @@ export async function exportVideoForPlatform(
       include_subtitles: includeSubtitles ?? false,
       include_voice: includeVoice ?? false,
       mute_original_audio: muteOriginalAudio ?? false,
+      background_audio: backgroundAudio || 'original',
       split_duration: splitDuration ?? null,
       subtitle_language: subtitleLanguage || null,
       scale_mode: scaleMode || 'fit',

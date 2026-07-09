@@ -52,6 +52,7 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
   const [platforms, setPlatforms] = useState<Record<string, PlatformPreset>>({});
   const [selectedPlatform, setSelectedPlatform] = useState('youtube');
   const [scaleMode, setScaleMode] = useState<'fit' | 'fill' | 'blur'>('fit');
+  const [bgAudio, setBgAudio] = useState<'original' | 'music' | 'none'>('original');
   const [exportName, setExportName] = useState('export');
   const [trimEnabled, setTrimEnabled] = useState(false);
   const [startTime, setStartTime] = useState('0');
@@ -309,6 +310,7 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         videoMuted,
         scaleMode,
         subtitleStyle,
+        bgAudio,
       );
 
       // Download the blob
@@ -721,6 +723,38 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                         </button>
                       ))}
                     </div>
+                  </div>
+
+                  {/* Background audio */}
+                  <div>
+                    <label className="text-sm font-medium text-zinc-300 mb-2 block">
+                      Background Audio
+                    </label>
+                    <div className="grid grid-cols-3 gap-2">
+                      {([
+                        { id: 'original', label: 'Original', desc: 'Voice + music' },
+                        { id: 'music', label: 'Music only', desc: 'Removes voices' },
+                        { id: 'none', label: 'Silent', desc: 'No original audio' },
+                      ] as const).map((m) => (
+                        <button
+                          key={m.id}
+                          onClick={() => setBgAudio(m.id)}
+                          className={`px-2 py-2 rounded-lg border text-center transition-all ${
+                            bgAudio === m.id
+                              ? 'border-khmer-500 bg-khmer-900/20'
+                              : 'border-zinc-800 hover:border-zinc-600 bg-zinc-800/40'
+                          }`}
+                        >
+                          <p className="text-xs font-medium text-white">{m.label}</p>
+                          <p className="text-[9px] text-zinc-500 mt-0.5">{m.desc}</p>
+                        </button>
+                      ))}
+                    </div>
+                    {bgAudio === 'music' && (
+                      <p className="text-[10px] text-zinc-600 mt-1.5">
+                        Uses the isolated music track. Run “Isolate Vocals / BGM” first, or voices will just be muted.
+                      </p>
+                    )}
                   </div>
 
                   {/* Export file name */}

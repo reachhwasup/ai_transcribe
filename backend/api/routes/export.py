@@ -394,6 +394,7 @@ class VideoExportRequest(BaseModel):
     include_subtitles: bool = False
     include_voice: bool = False
     mute_original_audio: bool = False
+    background_audio: str = "original"  # original | music | none
     split_duration: Optional[float] = None  # seconds per part; None = single file
     subtitle_language: Optional[str] = None  # target language for subtitles
     scale_mode: str = "fit"  # fit | fill | blur
@@ -590,6 +591,20 @@ async def export_video(
                     print(f"TTS generation for export failed: {e}")
                     tts_audio_path = None
 
+    # Resolve the background audio choice into a music path + mute flag.
+    music_audio_path = None
+    mute_original = body.mute_original_audio
+    if body.background_audio == "music":
+        # Use the isolated music-only stem (from Isolate Vocals/BGM), if present
+        bgm_path = os.path.join(os.path.dirname(project.video_path), "bgm.wav")
+        if os.path.exists(bgm_path):
+            music_audio_path = bgm_path
+        else:
+            # No isolation done — fall back to muting so voices aren't left in
+            mute_original = True
+    elif body.background_audio == "none":
+        mute_original = True
+
     try:
         output_path = await asyncio.to_thread(
             export_video_for_platform,
@@ -600,7 +615,8 @@ async def export_video(
             include_subtitles=body.include_subtitles,
             srt_path=srt_path,
             tts_audio_path=tts_audio_path,
-            mute_original_audio=body.mute_original_audio,
+            mute_original_audio=mute_original,
+            music_audio_path=music_audio_path,
             scale_mode=body.scale_mode,
             subtitle_size_pct=body.subtitle_size_pct,
             subtitle_position=body.subtitle_position,

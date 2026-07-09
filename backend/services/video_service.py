@@ -295,6 +295,7 @@ def export_video_for_platform(
     srt_path: str | None = None,
     tts_audio_path: str | None = None,
     mute_original_audio: bool = False,
+    music_audio_path: str | None = None,  # isolated music-only bed (replaces original audio)
     scale_mode: str = "fit",  # fit (black bars) | fill (crop/zoom) | blur (blurred background)
     subtitle_size_pct: float = 4.0,  # subtitle height as % of frame height
     subtitle_position: str = "bottom",  # bottom | middle | top
@@ -330,10 +331,13 @@ def export_video_for_platform(
         sub_images = _generate_subtitle_images(srt_path, w, h, subtitle_size_pct, subtitle_position, subtitle_style)
 
     has_tts = bool(tts_audio_path and os.path.exists(tts_audio_path))
+    # Isolated music-only bed: when present it becomes the background audio
+    # instead of the original mix, so voices are gone but music stays.
+    has_music = bool(music_audio_path and os.path.exists(music_audio_path))
 
     # Probe whether video has audio
     has_video_audio = False
-    if has_tts or mute_original_audio:
+    if has_tts or mute_original_audio or has_music:
         probe_cmd = [ffmpeg, "-i", video_path, "-hide_banner"]
         probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
         has_video_audio = any(
@@ -368,6 +372,17 @@ def export_video_for_platform(
         cmd += ["-i", tts_audio_path]
         next_idx += 1
 
+    # Add isolated music input, trimmed to the same window as the video
+    music_idx = None
+    if has_music:
+        if start_time is not None:
+            cmd += ["-ss", str(start_time)]
+        cmd += ["-i", music_audio_path]
+        if end_time is not None:
+            cmd += ["-t", str(end_time - (start_time or 0))]
+        music_idx = next_idx
+        next_idx += 1
+
     # ---- Build video filter ----
     if scale_mode == "fill":
         # Zoom to fill the frame, cropping the overflow (center crop)
@@ -395,8 +410,17 @@ def export_video_for_platform(
             f"'FontSize={font_size},Alignment={alignment},MarginV=16,PrimaryColour=&HFFFFFF&,Outline=1'"
         )
 
-    # Decide if we need filter_complex or simple -vf
-    need_filter_complex = bool(sub_images) or (has_tts and has_video_audio and not mute_original_audio)
+    # Background audio source: isolated music if available, else the original
+    # video audio (unless muted). This is what TTS narration mixes on top of.
+    if has_music:
+        bg_audio = f"{music_idx}:a"
+    elif not mute_original_audio and has_video_audio:
+        bg_audio = "0:a"
+    else:
+        bg_audio = None
+
+    # Decide if we need filter_complex (subtitle overlays, or mixing two audios)
+    need_filter_complex = bool(sub_images) or (has_tts and bg_audio is not None)
 
     if need_filter_complex:
         fc_parts = []
@@ -417,27 +441,29 @@ def export_video_for_platform(
 
         # Audio mixing
         audio_map = None
-        if has_tts and has_video_audio and not mute_original_audio:
+        if has_tts and bg_audio is not None:
             fc_parts.append(
-                f"[0:a][{tts_idx}:a]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+                f"[{bg_audio}][{tts_idx}:a]amix=inputs=2:duration=first:dropout_transition=0[aout]"
             )
             audio_map = "[aout]"
         elif has_tts:
             audio_map = f"{tts_idx}:a"
+        elif bg_audio is not None:
+            audio_map = bg_audio
 
         fc = ";".join(fc_parts)
         cmd += ["-filter_complex", fc, "-map", f"[{prev_label}]"]
         if audio_map:
             cmd += ["-map", audio_map]
-        elif mute_original_audio:
-            cmd += ["-an"]
         else:
-            cmd += ["-map", "0:a?"]
+            cmd += ["-an"]
     else:
         # Simple case: just -vf
         cmd += ["-vf", vf_base]
         if has_tts:
             cmd += ["-map", "0:v", "-map", f"{tts_idx}:a"]
+        elif bg_audio is not None:
+            cmd += ["-map", "0:v", "-map", bg_audio]
         elif mute_original_audio:
             cmd += ["-an"]
 
