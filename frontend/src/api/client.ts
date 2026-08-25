@@ -464,7 +464,9 @@ export async function exportVideoForPlatform(
   scaleMode?: string,
   subtitleStyle?: import('../types/subtitleStyle').SubtitleStyle,
   backgroundAudio?: string,
-): Promise<{ blob: Blob; filename?: string }> {
+  exportFolder?: string,
+  outputFilename?: string,
+): Promise<{ blob: Blob; filename?: string; savedPath?: string; exportFolder?: string }> {
   const payload = {
     platform,
     start_time: startTime ?? null,
@@ -479,6 +481,8 @@ export async function exportVideoForPlatform(
     subtitle_size_pct: subtitleStyle?.sizePct ?? 4,
     subtitle_position: subtitleStyle?.position || 'bottom',
     subtitle_style: subtitleStyle ?? null,
+    export_folder: exportFolder || null,
+    output_filename: outputFilename || null,
   };
 
   try {
@@ -503,6 +507,8 @@ export async function exportVideoForPlatform(
     const decoder = new TextDecoder();
     let downloadUrl = '';
     let finalFilename = '';
+    let savedLocalPath: string | undefined;
+    let savedFolder: string | undefined;
     let buffer = '';
 
     while (true) {
@@ -524,6 +530,8 @@ export async function exportVideoForPlatform(
               onProgress?.(100, data.message || 'Video successfully rendered!');
               downloadUrl = data.download_url;
               finalFilename = data.filename;
+              savedLocalPath = data.saved_path;
+              savedFolder = data.export_folder;
             } else if (data.type === 'error') {
               throw new Error(data.message || 'Rendering failed');
             }
@@ -545,7 +553,7 @@ export async function exportVideoForPlatform(
       throw new Error('Failed to download rendered video file');
     }
     const blob = await fileRes.blob();
-    return { blob, filename: finalFilename };
+    return { blob, filename: finalFilename, savedPath: savedLocalPath, exportFolder: savedFolder };
   } catch (streamErr: any) {
     console.warn('Streaming video export error, falling back to direct endpoint:', streamErr);
     const { data } = await api.post(
@@ -563,6 +571,23 @@ export async function exportVideoForPlatform(
     );
     return { blob: data };
   }
+}
+
+// Get system default folders (Downloads, Desktop, etc.)
+export async function getDefaultFolders(): Promise<{
+  home: string;
+  downloads: string;
+  desktop: string;
+  movies: string;
+}> {
+  const { data } = await api.get('/projects/default-folders');
+  return data;
+}
+
+// Reveal or open a folder in macOS Finder / Windows Explorer
+export async function openFolderInSystem(path: string): Promise<{ status: string; path: string }> {
+  const { data } = await api.post('/projects/open-folder', { path });
+  return data;
 }
 
 // Video cut/trim (in-place, replaces project video)

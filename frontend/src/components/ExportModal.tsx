@@ -5,6 +5,8 @@ import {
   exportVideoForPlatform,
   getExportUrl,
   translateSegments,
+  getDefaultFolders,
+  openFolderInSystem,
   type PlatformPreset,
 } from '../api/client';
 import {
@@ -29,6 +31,8 @@ import {
   Sliders,
   Settings2,
   CheckCircle2,
+  Folder,
+  FolderOpen,
 } from 'lucide-react';
 import { buildClipLayout, totalTimelineDuration, timelineToSource } from '../utils/clipTimemap';
 import SubtitleOverlay from './SubtitleOverlay';
@@ -148,7 +152,29 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
 
   const [videoFormat, setVideoFormat] = useState<'mp4' | 'mov' | 'webm'>('mp4');
   const [videoQuality, setVideoQuality] = useState<'1080p' | '4k' | '720p'>('1080p');
+  const [exportFolder, setExportFolder] = useState<string>(
+    () => localStorage.getItem('meatika_export_folder') || ''
+  );
+  const [defaultFolders, setDefaultFolders] = useState<{
+    home?: string;
+    downloads?: string;
+    desktop?: string;
+    movies?: string;
+  }>({});
+  const [savedLocalPath, setSavedLocalPath] = useState<string | null>(null);
   const initializedOpenRef = useRef(false);
+
+  // Fetch OS default user directories
+  useEffect(() => {
+    getDefaultFolders()
+      .then((f) => {
+        setDefaultFolders(f);
+        if (!localStorage.getItem('meatika_export_folder') && f.downloads) {
+          setExportFolder(f.downloads);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const selectedPreset =
     PLATFORM_PRESETS.find((p) => p.id === selectedPlatform) || PLATFORM_PRESETS[0];
@@ -391,6 +417,12 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
     setStatusMessage('Preparing render...');
     setDone(false);
     try {
+      setSavedLocalPath(null);
+      const safeName = (exportName.trim() || currentProject.name || 'meatika_video')
+        .replace(/[\\/:*?"<>|]/g, '')
+        .replace(/\s+/g, '_');
+      const targetFilename = `${safeName}.${videoFormat || 'mp4'}`;
+
       const result = await exportVideoForPlatform(
         currentProject.id,
         selectedPlatform,
@@ -407,25 +439,27 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         bgAudio === 'none',
         scaleMode,
         subtitleStyle,
-        bgAudio
+        bgAudio,
+        exportFolder?.trim() || undefined,
+        targetFilename
       );
       const blob = result.blob;
+      if (result.savedPath) {
+        setSavedLocalPath(result.savedPath);
+      }
       const isZip =
         blob.type === 'application/zip' || (splitEnabled && parseFloat(splitDuration) > 0);
       const ext = isZip ? 'zip' : videoFormat || 'mp4';
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      const safeName = (exportName.trim() || currentProject.name || 'meatika_video')
-        .replace(/[\\/:*?"<>|]/g, '')
-        .replace(/\s+/g, '_');
       a.download = result.filename || `${safeName}${isZip ? '_parts' : ''}.${ext}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
       setDone(true);
-      setTimeout(() => setDone(false), 4000);
+      setTimeout(() => setDone(false), 7000);
     } catch (e: any) {
       const msg = e?.response?.data
         ? (await e.response.data.text?.()) || 'Export failed'
@@ -948,6 +982,92 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                   </div>
                 </div>
 
+                {/* Destination Folder Path */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
+                      <Folder className="w-3.5 h-3.5 text-pink-400" />
+                      <span>Export Destination Folder</span>
+                    </label>
+                    <div className="flex items-center gap-1">
+                      {defaultFolders.downloads && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setExportFolder(defaultFolders.downloads!);
+                            localStorage.setItem('meatika_export_folder', defaultFolders.downloads!);
+                          }}
+                          className={`text-[10px] px-2 py-0.5 rounded transition-colors ${
+                            exportFolder === defaultFolders.downloads
+                              ? 'bg-pink-500/25 text-pink-300 font-bold border border-pink-500/30'
+                              : 'bg-zinc-800 text-zinc-400 hover:text-zinc-200'
+                          }`}
+                        >
+                          Downloads
+                        </button>
+                      )}
+                      {defaultFolders.desktop && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setExportFolder(defaultFolders.desktop!);
+                            localStorage.setItem('meatika_export_folder', defaultFolders.desktop!);
+                          }}
+                          className={`text-[10px] px-2 py-0.5 rounded transition-colors ${
+                            exportFolder === defaultFolders.desktop
+                              ? 'bg-pink-500/25 text-pink-300 font-bold border border-pink-500/30'
+                              : 'bg-zinc-800 text-zinc-400 hover:text-zinc-200'
+                          }`}
+                        >
+                          Desktop
+                        </button>
+                      )}
+                      {defaultFolders.movies && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setExportFolder(defaultFolders.movies!);
+                            localStorage.setItem('meatika_export_folder', defaultFolders.movies!);
+                          }}
+                          className={`text-[10px] px-2 py-0.5 rounded transition-colors ${
+                            exportFolder === defaultFolders.movies
+                              ? 'bg-pink-500/25 text-pink-300 font-bold border border-pink-500/30'
+                              : 'bg-zinc-800 text-zinc-400 hover:text-zinc-200'
+                          }`}
+                        >
+                          Movies
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="relative flex-1">
+                      <Folder className="w-3.5 h-3.5 text-zinc-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        type="text"
+                        value={exportFolder}
+                        onChange={(e) => {
+                          setExportFolder(e.target.value);
+                          localStorage.setItem('meatika_export_folder', e.target.value);
+                        }}
+                        className="w-full bg-[#181a1f] border border-[#26282e] focus:border-pink-500 rounded-xl pl-8 pr-3 py-2 text-xs text-zinc-200 font-mono focus:outline-none transition-colors"
+                        placeholder="/Users/username/Downloads"
+                      />
+                    </div>
+                    {exportFolder && (
+                      <button
+                        type="button"
+                        onClick={() => openFolderInSystem(exportFolder)}
+                        title="Open folder in Finder"
+                        className="px-3 py-2 bg-[#181a1f] border border-[#26282e] hover:border-pink-500 hover:bg-pink-950/20 text-zinc-400 hover:text-pink-300 rounded-xl text-xs font-semibold flex items-center gap-1.5 shrink-0 transition-colors shadow-sm"
+                      >
+                        <FolderOpen className="w-3.5 h-3.5 text-pink-400" />
+                        <span>Finder</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
                 {/* Real-Time Progress Bar & Status */}
                 {exporting && (
                   <div className="p-4 rounded-2xl bg-pink-950/30 border border-pink-500/40 space-y-2.5 animate-in fade-in">
@@ -974,9 +1094,28 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                 )}
 
                 {done && (
-                  <div className="p-3.5 rounded-2xl bg-emerald-950/60 border border-emerald-800 text-emerald-200 text-xs font-semibold flex items-center gap-2 animate-in fade-in">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    <span>Video successfully rendered and downloaded!</span>
+                  <div className="p-4 rounded-2xl bg-emerald-950/60 border border-emerald-800 text-emerald-200 text-xs space-y-2 animate-in fade-in">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2 font-bold">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                        <span>Video successfully rendered and saved!</span>
+                      </div>
+                      {savedLocalPath && (
+                        <button
+                          type="button"
+                          onClick={() => openFolderInSystem(savedLocalPath)}
+                          className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-[11px] font-bold flex items-center gap-1 shadow transition-all active:scale-95"
+                        >
+                          <FolderOpen className="w-3.5 h-3.5" />
+                          <span>Show in Finder</span>
+                        </button>
+                      )}
+                    </div>
+                    {savedLocalPath && (
+                      <p className="text-[11px] text-emerald-300/80 font-mono truncate bg-emerald-900/40 p-1.5 rounded-lg border border-emerald-700/50">
+                        {savedLocalPath}
+                      </p>
+                    )}
                   </div>
                 )}
               </div>

@@ -542,6 +542,8 @@ class VideoExportRequest(BaseModel):
     subtitle_size_pct: float = 4.0  # burned subtitle height as % of frame height
     subtitle_position: str = "bottom"  # bottom | middle | top
     subtitle_style: Optional[dict] = None  # full caption style (colors, outline, box)
+    export_folder: Optional[str] = None  # Destination folder path on local disk
+    output_filename: Optional[str] = None  # Custom output filename
 
 
 async def _build_tts_from_existing(segments, total_duration) -> str:
@@ -935,6 +937,57 @@ async def download_temp_file_endpoint(
     return FileResponse(file_path, media_type=media_type, filename=safe_file)
 
 
+class OpenFolderRequest(BaseModel):
+    path: str
+
+
+@router.get("/default-folders")
+async def get_default_folders_endpoint():
+    """Return common user directories (Downloads, Desktop, Movies, etc.)."""
+    home = os.path.expanduser("~")
+    downloads = os.path.join(home, "Downloads")
+    desktop = os.path.join(home, "Desktop")
+    movies = os.path.join(home, "Movies")
+    return {
+        "home": home,
+        "downloads": downloads if os.path.exists(downloads) else home,
+        "desktop": desktop if os.path.exists(desktop) else home,
+        "movies": movies if os.path.exists(movies) else home,
+    }
+
+
+@router.post("/open-folder")
+async def open_folder_in_finder_endpoint(body: OpenFolderRequest):
+    """Open a folder or reveal a file in macOS Finder / Windows Explorer."""
+    raw_path = os.path.expanduser(body.path.strip())
+    if not os.path.exists(raw_path):
+        parent = os.path.dirname(raw_path)
+        if os.path.exists(parent):
+            raw_path = parent
+        else:
+            raise HTTPException(404, f"Path not found: {raw_path}")
+
+    import sys
+    import subprocess
+    try:
+        if sys.platform == "darwin":
+            if os.path.isfile(raw_path):
+                subprocess.Popen(["open", "-R", raw_path])
+            else:
+                subprocess.Popen(["open", raw_path])
+        elif sys.platform == "win32":
+            if os.path.isfile(raw_path):
+                subprocess.Popen(["explorer", f"/select,{raw_path}"])
+            else:
+                subprocess.Popen(["explorer", raw_path])
+        else:
+            target = os.path.dirname(raw_path) if os.path.isfile(raw_path) else raw_path
+            subprocess.Popen(["xdg-open", target])
+        return {"status": "ok", "path": raw_path}
+    except Exception as e:
+        raise HTTPException(500, f"Could not open path: {e}")
+
+
 @router.post("/video-stream")
 async def export_video_stream_endpoint(
     project_id: str,
@@ -1159,8 +1212,28 @@ async def export_video_stream_endpoint(
                     final_filename = zip_name
                     final_path = zip_path
 
+            # Custom output filename if requested
+            if body.output_filename and body.output_filename.strip():
+                clean_name = body.output_filename.strip().replace("/", "_").replace("\\", "_")
+                ext = ".zip" if final_path.endswith(".zip") else Path(final_path).suffix or ".mp4"
+                if not clean_name.lower().endswith(ext.lower()):
+                    clean_name = f"{clean_name}{ext}"
+                final_filename = clean_name
+
+            # Copy directly to destination folder on local machine if requested
+            saved_local_path = None
+            if body.export_folder and body.export_folder.strip():
+                try:
+                    dest_dir = os.path.expanduser(body.export_folder.strip())
+                    os.makedirs(dest_dir, exist_ok=True)
+                    dest_file_path = os.path.join(dest_dir, final_filename)
+                    shutil.copy2(final_path, dest_file_path)
+                    saved_local_path = os.path.abspath(dest_file_path)
+                except Exception as save_err:
+                    print(f"Warning: Could not copy export to {body.export_folder}: {save_err}")
+
             out_basename = os.path.basename(final_path)
-            yield f"data: {json.dumps({'type': 'done', 'percent': 100, 'message': 'Video successfully rendered!', 'download_url': f'/api/projects/{project_id}/export/download-temp?file={out_basename}', 'filename': final_filename})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'percent': 100, 'message': 'Video successfully rendered!', 'download_url': f'/api/projects/{project_id}/export/download-temp?file={out_basename}', 'filename': final_filename, 'saved_path': saved_local_path, 'export_folder': body.export_folder})}\n\n"
 
         except Exception as e:
             import traceback
