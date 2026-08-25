@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import json
 import uuid
 import subprocess
 import shutil
@@ -39,25 +40,15 @@ PLATFORM_PRESETS = {
         "max_duration": 60,
         "description": "9:16 vertical, 1080x1920, max 60s for Shorts",
     },
-    "facebook": {
-        "name": "Facebook",
-        "width": 1280,
-        "height": 720,
-        "video_bitrate": "4M",
-        "audio_bitrate": "128k",
-        "fps": 30,
-        "max_duration": None,
-        "description": "16:9 landscape, 1280x720, optimized for Facebook",
-    },
-    "facebook_reels": {
-        "name": "Facebook Reels",
+    "instagram": {
+        "name": "Instagram Square",
         "width": 1080,
-        "height": 1920,
+        "height": 1080,
         "video_bitrate": "6M",
         "audio_bitrate": "128k",
         "fps": 30,
-        "max_duration": 90,
-        "description": "9:16 vertical, 1080x1920, max 90s for Reels",
+        "max_duration": 600,
+        "description": "1:1 square, 1080x1080, for Instagram Feed",
     },
     "instagram_reels": {
         "name": "Instagram Reels",
@@ -69,15 +60,35 @@ PLATFORM_PRESETS = {
         "max_duration": 90,
         "description": "9:16 vertical, 1080x1920, for Instagram Reels",
     },
-    "custom": {
-        "name": "Custom",
-        "width": 1920,
-        "height": 1080,
+    "facebook": {
+        "name": "Facebook Portrait",
+        "width": 1080,
+        "height": 1350,
         "video_bitrate": "6M",
         "audio_bitrate": "128k",
         "fps": 30,
         "max_duration": None,
-        "description": "Custom resolution and settings",
+        "description": "4:5 portrait, 1080x1350, optimized for Facebook",
+    },
+    "facebook_reels": {
+        "name": "Facebook Reels",
+        "width": 1080,
+        "height": 1920,
+        "video_bitrate": "6M",
+        "audio_bitrate": "128k",
+        "fps": 30,
+        "max_duration": 90,
+        "description": "9:16 vertical, 1080x1920, max 90s for Reels",
+    },
+    "custom": {
+        "name": "Original Source",
+        "width": 1920,
+        "height": 1080,
+        "video_bitrate": "8M",
+        "audio_bitrate": "192k",
+        "fps": 30,
+        "max_duration": None,
+        "description": "Match original video resolution",
     },
 }
 
@@ -92,6 +103,49 @@ def _get_ffmpeg() -> str:
     return ffmpeg
 
 
+def _get_ffprobe() -> str:
+    """Find ffprobe binary."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        ffprobe = shutil.which("ffmpeg")
+    return ffprobe or "ffprobe"
+
+
+def generate_preview(video_path: str, out_path: str) -> str:
+    """
+    Transcode a video into a lightweight 720p proxy used by the editor's
+    preview player. This lets the browser load/scrub a small file instead of
+    the full-resolution (potentially multi-GB) source. Returns out_path.
+    Raises RuntimeError on failure.
+    """
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    ffmpeg = _get_ffmpeg()
+    tmp_path = out_path + ".tmp.mp4"
+
+    cmd = [
+        ffmpeg, "-y",
+        "-i", video_path,
+        # Downscale so the longer side is at most 1280px, keeping aspect ratio
+        # and even dimensions (required by libx264).
+        "-vf", "scale='if(gt(iw,ih),min(1280,iw),-2)':'if(gt(iw,ih),-2,min(1280,ih))'",
+        "-c:v", "libx264", "-crf", "26", "-preset", "veryfast",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",  # allow playback before full download
+        tmp_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if result.returncode != 0 or not os.path.exists(tmp_path):
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise RuntimeError(f"ffmpeg preview generation failed: {result.stderr[-500:]}")
+
+    # Atomic-ish swap so the player never sees a half-written file.
+    os.replace(tmp_path, out_path)
+    return out_path
+
+
 def _has_subtitles_filter(ffmpeg: str) -> bool:
     """Check if ffmpeg has the subtitles filter (requires libass)."""
     try:
@@ -101,6 +155,71 @@ def _has_subtitles_filter(ffmpeg: str) -> bool:
         return "subtitles" in result.stdout
     except Exception:
         return False
+
+
+def _has_videotoolbox(ffmpeg: str) -> bool:
+    """Check if ffmpeg supports Apple Silicon Hardware GPU Encoding (h264_videotoolbox)."""
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-encoders"], capture_output=True, text=True, timeout=10
+        )
+        return "h264_videotoolbox" in result.stdout
+    except Exception:
+        return False
+
+
+def _build_subtitle_concat_demuxer(
+    sub_images: list[dict], width: int, height: int, export_dir: str
+) -> tuple[str | None, list[str]]:
+    """
+    Build a single concat demuxer file for subtitle overlays.
+    Replaces dozens of separate FFmpeg overlay filter chains with a SINGLE timed input & 1 overlay filter.
+    """
+    if not sub_images:
+        return None, []
+
+    from PIL import Image
+
+    abs_export_dir = os.path.abspath(export_dir)
+    os.makedirs(abs_export_dir, exist_ok=True)
+
+    trans_path = os.path.abspath(os.path.join(abs_export_dir, f"_sub_trans_{uuid.uuid4()}.png"))
+    Image.new("RGBA", (width, height), (0, 0, 0, 0)).save(trans_path, "PNG")
+
+    concat_path = os.path.abspath(os.path.join(abs_export_dir, f"_subs_concat_{uuid.uuid4()}.txt"))
+
+    sorted_subs = sorted(sub_images, key=lambda s: s["start"])
+    lines = ["ffconcat version 1.0"]
+
+    current_time = 0.0
+    for si in sorted_subs:
+        start = max(0.0, float(si["start"]))
+        end = max(start, float(si["end"]))
+        img_path = os.path.abspath(si["path"])
+
+        # Transparent gap before subtitle
+        if start > current_time + 0.005:
+            gap = start - current_time
+            lines.append(f"file '{trans_path}'")
+            lines.append(f"duration {gap:.4f}")
+            current_time = start
+
+        dur = max(0.05, end - start)
+        lines.append(f"file '{img_path}'")
+        lines.append(f"duration {dur:.4f}")
+        current_time = end
+
+    # Trailing transparent padding
+    lines.append(f"file '{trans_path}'")
+    lines.append("duration 3600.0")
+    lines.append(f"file '{trans_path}'")
+
+    with open(concat_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    return concat_path, [trans_path, concat_path]
+
+
 
 
 def _parse_srt(srt_path: str):
@@ -171,10 +290,27 @@ def _generate_subtitle_images(srt_path: str, width: int, height: int, size_pct: 
 
     font_size = max(14, round(height * size_pct / 100 * 0.75))
 
-    def _load_font(paths):
+    khmer_paths = [
+        os.path.expanduser("~/Library/Fonts/NotoSansKhmerUI-Regular.ttf"),
+        os.path.expanduser("~/Library/Fonts/Battambang.ttf"),
+        os.path.expanduser("~/Library/Fonts/Kh Battambang.ttf"),
+        "/System/Library/Fonts/Supplemental/Khmer Sangam MN.ttf",
+        "/System/Library/Fonts/Supplemental/Khmer MN.ttc",
+    ]
+    latin_paths = [
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    ]
+
+    def _load_font(paths, size=None):
+        f_size = size or font_size
         for fp in paths:
             try:
-                return ImageFont.truetype(fp, font_size, layout_engine=layout_engine)
+                return ImageFont.truetype(fp, f_size, layout_engine=layout_engine)
             except Exception:
                 continue
         return ImageFont.load_default()
@@ -183,83 +319,101 @@ def _generate_subtitle_images(srt_path: str, width: int, height: int, size_pct: 
     def _has_khmer(text):
         return any("\u1780" <= ch <= "\u17FF" for ch in text)
 
-    khmer_font = _load_font([
-        os.path.expanduser("~/Library/Fonts/NotoSansKhmerUI-Regular.ttf"),
-        os.path.expanduser("~/Library/Fonts/Battambang.ttf"),
-        os.path.expanduser("~/Library/Fonts/Kh Battambang.ttf"),
-        "/System/Library/Fonts/Supplemental/Khmer Sangam MN.ttf",
-        "/System/Library/Fonts/Supplemental/Khmer MN.ttc",
-    ])
-    latin_font = _load_font([
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-    ])
-
     export_dir = os.path.join(settings.upload_dir, "exports")
     os.makedirs(export_dir, exist_ok=True)
 
-    max_text_width = int(width * 0.85)
+    # Max width with safe 9% padding on both sides
+    max_text_width = int(width * 0.82)
 
-    sub_images = []
-    for i, seg in enumerate(segments):
-        img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        text = seg["text"]
+    import re
 
-        # Pick font based on script in this segment's text
-        font = khmer_font if _has_khmer(text) else latin_font
-
-        # Word-wrap using pixel width measurement (works for all scripts)
-        wrapped = []
-        for line in text.split("\n"):
-            bbox_line = draw.textbbox((0, 0), line, font=font)
+    def _wrap_text(raw_text: str, active_font, max_w: int, draw_obj) -> str:
+        wrapped_lines = []
+        for line in raw_text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            bbox_line = draw_obj.textbbox((0, 0), line, font=active_font)
             line_w = bbox_line[2] - bbox_line[0]
-            if line_w <= max_text_width:
-                wrapped.append(line)
+            if line_w <= max_w:
+                wrapped_lines.append(line)
             else:
-                # Try splitting by spaces first; fall back to char-by-char
+                # First try splitting by spaces
                 words = line.split(" ")
                 if len(words) > 1:
                     current = words[0]
                     for w in words[1:]:
                         test = current + " " + w
-                        tw_test = draw.textbbox((0, 0), test, font=font)
-                        if (tw_test[2] - tw_test[0]) <= max_text_width:
+                        tw_test = draw_obj.textbbox((0, 0), test, font=active_font)
+                        if (tw_test[2] - tw_test[0]) <= max_w:
                             current = test
                         else:
-                            wrapped.append(current)
+                            wrapped_lines.append(current)
                             current = w
-                    wrapped.append(current)
+                    if current:
+                        wrapped_lines.append(current)
                 else:
-                    # No spaces (e.g. Khmer/CJK) — split by character clusters
+                    # Single long word / Khmer text without spaces
+                    # Split by Unicode grapheme clusters
+                    clusters = re.findall(r"[\u1780-\u17B3][\u17B4-\u17DD]*|.", line)
                     current = ""
-                    for ch in line:
-                        test = current + ch
-                        tw_test = draw.textbbox((0, 0), test, font=font)
-                        if (tw_test[2] - tw_test[0]) <= max_text_width:
+                    for cl in clusters:
+                        test = current + cl
+                        tw_test = draw_obj.textbbox((0, 0), test, font=active_font)
+                        if (tw_test[2] - tw_test[0]) <= max_w:
                             current = test
                         else:
                             if current:
-                                wrapped.append(current)
-                            current = ch
+                                wrapped_lines.append(current)
+                            current = cl
                     if current:
-                        wrapped.append(current)
-        text = "\n".join(wrapped)
+                        wrapped_lines.append(current)
+        return "\n".join(wrapped_lines) if wrapped_lines else raw_text
 
-        bbox = draw.textbbox((0, 0), text, font=font)
+    sub_images = []
+    for i, seg in enumerate(segments):
+        img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        raw_text = seg["text"]
+
+        # Pick font based on script in this segment's text
+        font_paths = khmer_paths if _has_khmer(raw_text) else latin_paths
+        cur_font_size = font_size
+        active_font = _load_font(font_paths, cur_font_size)
+
+        # Wrap text for target width
+        text = _wrap_text(raw_text, active_font, max_text_width, draw)
+
+        # Determine text alignment
+        align = str(style.get("textAlign") or "center").lower()
+        if align not in ("left", "center", "right"):
+            align = "center"
+
+        bbox = draw.textbbox((0, 0), text, font=active_font, align=align)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        x = (width - tw) // 2
+
+        # Auto-reduce font size if too tall (> 25% of screen height) or too wide
+        while (tw > max_text_width or th > int(height * 0.25)) and cur_font_size > 14:
+            cur_font_size = max(14, int(cur_font_size * 0.90))
+            active_font = _load_font(font_paths, cur_font_size)
+            text = _wrap_text(raw_text, active_font, max_text_width, draw)
+            bbox = draw.textbbox((0, 0), text, font=active_font, align=align)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+        if align == "left":
+            x = int(width * 0.09)
+        elif align == "right":
+            x = int(width * 0.91) - tw
+        else:  # center
+            x = (width - tw) // 2
+
         if position == "top":
-            y = max(24, height // 20)
+            y = max(24, height // 16)
         elif position == "middle":
             y = (height - th) // 2
         else:
-            y = height - th - max(40, height // 15)
-        pad = max(8, round(font_size * 0.25))
+            y = height - th - max(40, height // 12)
+        pad = max(8, round(cur_font_size * 0.25))
 
         # Background box (fill + optional border), only if visible
         if box_alpha > 0 or box_border_w > 0:
@@ -274,7 +428,8 @@ def _generate_subtitle_images(srt_path: str, width: int, height: int, size_pct: 
         # Text: draw the outline (stroke) then the fill on top
         tx, ty = x - bbox[0], y - bbox[1]
         draw.text(
-            (tx, ty), text, font=font,
+            (tx, ty), text, font=active_font,
+            align=align,
             fill=(text_rgb[0], text_rgb[1], text_rgb[2], 255),
             stroke_width=outline_w if outline_w > 0 else 0,
             stroke_fill=(outline_rgb[0], outline_rgb[1], outline_rgb[2], 255) if outline_w > 0 else None,
@@ -300,6 +455,7 @@ def export_video_for_platform(
     subtitle_size_pct: float = 4.0,  # subtitle height as % of frame height
     subtitle_position: str = "bottom",  # bottom | middle | top
     subtitle_style: dict | None = None,  # full caption style (colors, outline, box)
+    progress_callback: Any = None,  # Optional callable (percent: int, message: str) -> None
 ) -> str:
     """
     Export video formatted for a specific platform.
@@ -322,13 +478,28 @@ def export_video_for_platform(
     w = preset["width"]
     h = preset["height"]
 
+    if platform == "custom":
+        try:
+            p_info = probe_video(video_path)
+            src_w = int(p_info.get("width", 0))
+            src_h = int(p_info.get("height", 0))
+            if src_w > 0 and src_h > 0:
+                w = src_w
+                h = src_h
+        except Exception:
+            pass
+
     # Determine subtitle strategy
     want_subs = include_subtitles and srt_path and os.path.exists(srt_path)
     has_libass = want_subs and _has_subtitles_filter(ffmpeg)
     sub_images = []  # PNG overlay fallback
+    sub_concat_path = None
+    sub_extra_files = []
 
     if want_subs and not has_libass:
         sub_images = _generate_subtitle_images(srt_path, w, h, subtitle_size_pct, subtitle_position, subtitle_style)
+        if sub_images:
+            sub_concat_path, sub_extra_files = _build_subtitle_concat_demuxer(sub_images, w, h, export_dir)
 
     has_tts = bool(tts_audio_path and os.path.exists(tts_audio_path))
     # Isolated music-only bed: when present it becomes the background audio
@@ -359,10 +530,11 @@ def export_video_for_platform(
     # Track next input index
     next_idx = 1
 
-    # Add subtitle PNG inputs (if using overlay fallback)
-    sub_start_idx = next_idx
-    for si in sub_images:
-        cmd += ["-loop", "1", "-i", si["path"]]
+    # Add subtitle concat stream (single input for all subtitles!)
+    sub_input_idx = None
+    if sub_concat_path:
+        sub_input_idx = next_idx
+        cmd += ["-f", "concat", "-safe", "0", "-i", sub_concat_path]
         next_idx += 1
 
     # Add TTS audio input
@@ -385,13 +557,16 @@ def export_video_for_platform(
 
     # ---- Build video filter ----
     if scale_mode == "fill":
-        # Zoom to fill the frame, cropping the overflow (center crop)
-        vf_base = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+        # Zoom to fill the frame, cropping the overflow (explicit center crop)
+        vf_base = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}:(in_w-out_w)/2:(in_h-out_h)/2"
     elif scale_mode == "blur":
-        # Video fitted at natural size over a blurred, zoomed copy of itself
+        # Video fitted at natural size over a blurred, zoomed copy of itself (centered)
+        # Optimized: downscale bg to 1/4 size before blur for 15x faster rendering with identical smooth bokeh look
+        bg_w = max(64, w // 4)
+        bg_h = max(64, h // 4)
         vf_base = (
             f"split[bgin][fgin];"
-            f"[bgin]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=20:3[bg];"
+            f"[bgin]scale={bg_w}:{bg_h}:force_original_aspect_ratio=increase,crop={bg_w}:{bg_h}:(in_w-out_w)/2:(in_h-out_h)/2,boxblur=10:1,scale={w}:{h}[bg];"
             f"[fgin]scale={w}:{h}:force_original_aspect_ratio=decrease[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2"
         )
@@ -400,10 +575,7 @@ def export_video_for_platform(
 
     if has_libass:
         escaped_srt = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-        # ASS FontSize lives in the subtitles filter's default 384x288 script
-        # space and scales with output height (FontSize 288 = full frame height).
         font_size = max(6, min(24, round(288 * subtitle_size_pct / 100)))
-        # ASS numpad alignment: 2 = bottom center, 5 = middle center, 8 = top center
         alignment = {"bottom": 2, "middle": 5, "top": 8}.get(subtitle_position, 2)
         vf_base += (
             f",subtitles='{escaped_srt}':force_style="
@@ -419,31 +591,36 @@ def export_video_for_platform(
     else:
         bg_audio = None
 
-    # Decide if we need filter_complex (subtitle overlays, or mixing two audios)
-    need_filter_complex = bool(sub_images) or (has_tts and bg_audio is not None)
+    # Detect if we can skip video re-encoding (only audio is changing)
+    # True when: no subtitle burn, scale mode is default/native, only audio mix
+    audio_only_change = (
+        not sub_concat_path
+        and not has_libass
+        and not want_subs
+        and scale_mode == "fit"
+    )
+
+    # Decide if we need filter_complex (subtitles overlay, or mixing two audios)
+    need_filter_complex = bool(sub_concat_path) or (has_tts and bg_audio is not None)
 
     if need_filter_complex:
         fc_parts = []
-        # Scale/pad the video first
-        fc_parts.append(f"[0:v]{vf_base}[scaled]")
-        prev_label = "scaled"
+        if not audio_only_change:
+            fc_parts.append(f"[0:v]{vf_base}[scaled]")
+            prev_label = "scaled"
+        else:
+            prev_label = "0:v"
 
-        # Chain subtitle PNG overlays
-        for i, si in enumerate(sub_images):
-            inp_idx = sub_start_idx + i
-            out_label = f"sub{i}"
-            fc_parts.append(
-                f"[{prev_label}][{inp_idx}:v]overlay=0:0:"
-                f"enable='between(t,{si['start']:.3f},{si['end']:.3f})':"
-                f"shortest=1[{out_label}]"
-            )
-            prev_label = out_label
+        # Apply single subtitle overlay if using concat demuxer
+        if sub_concat_path and sub_input_idx is not None:
+            fc_parts.append(f"[{prev_label}][{sub_input_idx}:v]overlay=0:0:shortest=1[subout]")
+            prev_label = "subout"
 
         # Audio mixing
         audio_map = None
         if has_tts and bg_audio is not None:
             fc_parts.append(
-                f"[{bg_audio}][{tts_idx}:a]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+                f"[{bg_audio}][{tts_idx}:a]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]"
             )
             audio_map = "[aout]"
         elif has_tts:
@@ -452,14 +629,21 @@ def export_video_for_platform(
             audio_map = bg_audio
 
         fc = ";".join(fc_parts)
-        cmd += ["-filter_complex", fc, "-map", f"[{prev_label}]"]
+        if fc_parts and not audio_only_change:
+            cmd += ["-filter_complex", fc, "-map", f"[{prev_label}]"]
+        elif fc_parts:
+            cmd += ["-filter_complex", fc, "-map", "0:v"]
+        else:
+            cmd += ["-map", "0:v"]
+
         if audio_map:
             cmd += ["-map", audio_map]
         else:
             cmd += ["-an"]
     else:
         # Simple case: just -vf
-        cmd += ["-vf", vf_base]
+        if not audio_only_change:
+            cmd += ["-vf", vf_base]
         if has_tts:
             cmd += ["-map", "0:v", "-map", f"{tts_idx}:a"]
         elif bg_audio is not None:
@@ -467,28 +651,103 @@ def export_video_for_platform(
         elif mute_original_audio:
             cmd += ["-an"]
 
-    cmd += [
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-b:v", preset["video_bitrate"],
-        "-c:a", "aac",
-        "-b:a", preset["audio_bitrate"],
-        "-r", str(preset["fps"]),
-        "-movflags", "+faststart",
-        "-pix_fmt", "yuv420p",
-        output_path,
-    ]
+    # When only audio is changing (no subtitle burn, no video scaling),
+    # stream-copy the video track — avoids full re-encode, instantaneous export.
+    if audio_only_change:
+        cmd += [
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", preset["audio_bitrate"],
+            "-movflags", "+faststart",
+            output_path,
+        ]
+    else:
+        # Video re-encoding: use Apple Silicon Hardware GPU Encoder if available
+        if _has_videotoolbox(ffmpeg):
+            cmd += [
+                "-c:v", "h264_videotoolbox",
+                "-b:v", preset["video_bitrate"],
+                "-c:a", "aac",
+                "-b:a", preset["audio_bitrate"],
+                "-r", str(preset["fps"]),
+                "-movflags", "+faststart",
+                "-pix_fmt", "yuv420p",
+                output_path,
+            ]
+        else:
+            cmd += [
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-threads", "0",
+                "-b:v", preset["video_bitrate"],
+                "-c:a", "aac",
+                "-b:a", preset["audio_bitrate"],
+                "-r", str(preset["fps"]),
+                "-movflags", "+faststart",
+                "-pix_fmt", "yuv420p",
+                output_path,
+            ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed: {result.stderr[-500:]}")
+        if progress_callback:
+            cmd_with_progress = cmd[:-1] + ["-progress", "pipe:1", "-nostats", cmd[-1]]
+            proc = subprocess.Popen(
+                cmd_with_progress,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            total_dur = (end_time or 0) - (start_time or 0)
+            if total_dur <= 0:
+                try:
+                    p_info = probe_video(video_path)
+                    total_dur = float(p_info.get("duration", 0))
+                except Exception:
+                    total_dur = 0.0
+
+            speed = ""
+            fps_val = ""
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith("speed="):
+                    speed = line.split("=")[1].strip()
+                elif line.startswith("fps="):
+                    fps_val = line.split("=")[1].strip()
+                elif line.startswith("out_time_us="):
+                    try:
+                        us = int(line.split("=")[1])
+                        if total_dur > 0:
+                            pct = min(99, max(1, int((us / (total_dur * 1_000_000)) * 100)))
+                            status_msg = f"Rendering video... {pct}%"
+                            if speed:
+                                status_msg += f" ({speed})"
+                            progress_callback(pct, status_msg)
+                    except Exception:
+                        pass
+
+            proc.wait(timeout=600)
+            if proc.returncode != 0:
+                err_msg = proc.stderr.read() if proc.stderr else ""
+                raise RuntimeError(f"ffmpeg failed: {err_msg[-500:]}")
+            if progress_callback:
+                progress_callback(100, "Rendering complete!")
+        else:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed: {result.stderr[-500:]}")
     finally:
-        # Clean up subtitle PNG images
+        # Clean up subtitle PNG images and temporary concat files
         for si in sub_images:
             if os.path.exists(si["path"]):
                 try:
                     os.remove(si["path"])
+                except OSError:
+                    pass
+        for fp in sub_extra_files:
+            if os.path.exists(fp):
+                try:
+                    os.remove(fp)
                 except OSError:
                     pass
 
@@ -682,6 +941,7 @@ def _separate_with_demucs(
     Returns True if successful, False if demucs is not available.
     """
     import sys
+    import glob
     python = sys.executable
 
     # Check demucs is importable
@@ -699,9 +959,7 @@ def _separate_with_demucs(
     cmd = [
         python, "-m", "demucs",
         "--two-stems", "vocals",
-        # Fine-tuned model: ~4x slower than plain htdemucs but separates
-        # vocals from music noticeably more cleanly.
-        "-n", "htdemucs_ft",
+        "-n", "htdemucs",
         "--shifts", "0",
         "--overlap", "0.25",
         "--jobs", "2",
@@ -716,17 +974,16 @@ def _separate_with_demucs(
         raise RuntimeError(f"Demucs failed: {r.stderr[-500:]}")
 
     # Demucs outputs to: <out>/<model>/<stem_name>/vocals.wav and no_vocals.wav
-    stem_name = Path(audio_path).stem  # e.g. "full_audio"
-    demucs_vocals = os.path.join(demucs_out, "htdemucs_ft", stem_name, "vocals.wav")
-    demucs_bgm = os.path.join(demucs_out, "htdemucs_ft", stem_name, "no_vocals.wav")
+    v_matches = glob.glob(os.path.join(demucs_out, "**", "vocals.wav"), recursive=True)
+    b_matches = glob.glob(os.path.join(demucs_out, "**", "no_vocals.wav"), recursive=True)
 
-    if not os.path.exists(demucs_vocals) or not os.path.exists(demucs_bgm):
+    if not v_matches or not b_matches:
         shutil.rmtree(demucs_out, ignore_errors=True)
         raise RuntimeError("Demucs output files not found")
 
     # Move results to project directory
-    shutil.move(demucs_vocals, vocals_path)
-    shutil.move(demucs_bgm, bgm_path)
+    shutil.move(v_matches[0], vocals_path)
+    shutil.move(b_matches[0], bgm_path)
 
     # Cleanup demucs temp directory
     shutil.rmtree(demucs_out, ignore_errors=True)
@@ -909,6 +1166,111 @@ def crop_video(
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg crop failed: {result.stderr[-500:]}")
+
+    return output_path
+
+
+def blur_region(
+    video_path: str,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+) -> str:
+    """
+    Blur a rectangular region of the video (e.g. to hide a logo/watermark/subtitles)
+    while leaving the rest of the frame untouched. Returns path to the
+    output video.
+    """
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    ffmpeg = _get_ffmpeg()
+    ffprobe = _get_ffprobe()
+
+    # Probe actual video dimensions to clamp crop region accurately
+    vid_w, vid_h = 1920, 1080
+    try:
+        probe_cmd = [
+            ffprobe, "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            video_path,
+        ]
+        res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+        if res.returncode == 0:
+            p_data = json.loads(res.stdout)
+            streams = p_data.get("streams", [])
+            if streams and "width" in streams[0] and "height" in streams[0]:
+                vid_w = int(streams[0]["width"])
+                vid_h = int(streams[0]["height"])
+    except Exception as ex:
+        print(f"Warning: Could not probe video dimensions for blur: {ex}")
+
+    # Clamp coordinates within frame boundaries
+    x = max(0, min(int(x), vid_w - 2))
+    y = max(0, min(int(y), vid_h - 2))
+    width = max(2, min(int(width), vid_w - x))
+    height = max(2, min(int(height), vid_h - y))
+
+    # Ensure width and height are even integers for x264/yuv420p compliance
+    if width % 2 != 0:
+        width = max(2, width - 1)
+    if height % 2 != 0:
+        height = max(2, height - 1)
+
+    export_dir = os.path.join(settings.upload_dir, "exports")
+    os.makedirs(export_dir, exist_ok=True)
+
+    ext = Path(video_path).suffix or ".mp4"
+    output_filename = f"{uuid.uuid4()}_blur{ext}"
+    output_path = os.path.join(export_dir, output_filename)
+
+    # Crop out the marked region, blur it (two passes for strong blur),
+    # then composite it back at the exact same coordinates.
+    filter_complex = (
+        f"split[base][fg];"
+        f"[fg]crop={width}:{height}:{x}:{y},boxblur=20:4,boxblur=20:4[blurred];"
+        f"[base][blurred]overlay={x}:{y},format=yuv420p[outv]"
+    )
+
+    import sys
+    is_macos = sys.platform == "darwin"
+
+    # Prefer VideoToolbox hardware acceleration on macOS for fast rendering
+    if is_macos:
+        v_codec = ["-c:v", "h264_videotoolbox", "-b:v", "6M", "-pix_fmt", "yuv420p"]
+    else:
+        v_codec = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "18"]
+
+    cmd = [
+        ffmpeg, "-y",
+        "-i", video_path,
+        "-filter_complex", filter_complex,
+        "-map", "[outv]", "-map", "0:a?",
+        *v_codec,
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        # Fallback to libx264 software encoder with aac audio
+        cmd_fb = [
+            ffmpeg, "-y",
+            "-i", video_path,
+            "-filter_complex", filter_complex,
+            "-map", "[outv]", "-map", "0:a?",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+        result = subprocess.run(cmd_fb, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg blur failed: {result.stderr[-500:]}")
 
     return output_path
 

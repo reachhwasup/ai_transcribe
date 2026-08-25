@@ -76,6 +76,7 @@ class ProjectResponse(BaseModel):
     description: str
     video_filename: str
     video_path: str
+    preview_status: str = "none"
     duration: float
     status: str
     language: str

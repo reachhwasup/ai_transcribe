@@ -14,31 +14,56 @@ VOICE_MAP = {
     "km": {
         "female": "km-KH-SreymomNeural",
         "male": "km-KH-PisethNeural",
+        "child_boy": "km-KH-PisethNeural",
+        "child_girl": "km-KH-SreymomNeural",
+        "child": "km-KH-SreymomNeural",
         "young": "km-KH-SreymomNeural",
+        "grandpa": "km-KH-PisethNeural",
+        "grandma": "km-KH-SreymomNeural",
         "old": "km-KH-PisethNeural",
     },
     "zh": {
         "female": "zh-CN-XiaoxiaoNeural",
         "male": "zh-CN-YunxiNeural",
+        "child_boy": "zh-CN-XiaoyiNeural",
+        "child_girl": "zh-CN-XiaoyiNeural",
+        "child": "zh-CN-XiaoyiNeural",
         "young": "zh-CN-XiaoyiNeural",
+        "grandpa": "zh-CN-YunjianNeural",
+        "grandma": "zh-CN-XiaoxiaoNeural",
         "old": "zh-CN-YunjianNeural",
     },
     "en": {
         "female": "en-US-AvaMultilingualNeural",
         "male": "en-US-AndrewMultilingualNeural",
+        "child_boy": "en-US-AnaNeural",
+        "child_girl": "en-US-AnaNeural",
+        "child": "en-US-AnaNeural",
         "young": "en-US-AnaNeural",
+        "grandpa": "en-US-EricNeural",
+        "grandma": "en-US-JennyNeural",
         "old": "en-US-EricNeural",
     },
     "ja": {
         "female": "ja-JP-NanamiNeural",
         "male": "ja-JP-KeitaNeural",
+        "child_boy": "ja-JP-KeitaNeural",
+        "child_girl": "ja-JP-NanamiNeural",
+        "child": "ja-JP-NanamiNeural",
         "young": "ja-JP-NanamiNeural",
+        "grandpa": "ja-JP-KeitaNeural",
+        "grandma": "ja-JP-NanamiNeural",
         "old": "ja-JP-KeitaNeural",
     },
     "ko": {
         "female": "ko-KR-SunHiNeural",
         "male": "ko-KR-InJoonNeural",
+        "child_boy": "ko-KR-InJoonNeural",
+        "child_girl": "ko-KR-SunHiNeural",
+        "child": "ko-KR-SunHiNeural",
         "young": "ko-KR-SunHiNeural",
+        "grandpa": "ko-KR-InJoonNeural",
+        "grandma": "ko-KR-SunHiNeural",
         "old": "ko-KR-InJoonNeural",
     },
 }
@@ -46,29 +71,120 @@ VOICE_MAP = {
 # Default fallback (Khmer)
 DEFAULT_VOICE_MAP = VOICE_MAP["km"]
 
-# Emotion → prosody offsets (rate %, pitch Hz, volume %).
-# edge-tts applies these natively for every voice, including Khmer —
-# unlike SSML express-as styles, which the Edge endpoint rejects
-# (it reads the XML tags aloud).
-EMOTION_PROSODY: dict[str, tuple[int, int, int]] = {
-    "cheerful": (6, 15, 5),
-    "happy": (6, 15, 5),
-    "excited": (12, 25, 10),
-    "sad": (-10, -15, -5),
-    "angry": (8, -5, 15),
-    "calm": (-6, -5, 0),
-    "serious": (-4, -10, 0),
-    "fearful": (10, 20, 0),
+VOICE_POOLS = {
+    "km": {
+        "female": ["km-KH-SreymomNeural"],
+        "male": ["km-KH-PisethNeural"],
+        "child_boy": ["km-KH-PisethNeural"],
+        "child_girl": ["km-KH-SreymomNeural"],
+        "child": ["km-KH-SreymomNeural"],
+        "grandpa": ["km-KH-PisethNeural"],
+        "grandma": ["km-KH-SreymomNeural"],
+    },
+    "zh": {
+        "female": ["zh-CN-XiaoxiaoNeural", "zh-CN-XiaoyiNeural", "zh-CN-liaoning-XiaobeiNeural", "zh-CN-shaanxi-XiaoniNeural"],
+        "male": ["zh-CN-YunxiNeural", "zh-CN-YunjianNeural", "zh-CN-YunyangNeural", "zh-CN-YunxiaNeural"],
+        "child": ["zh-CN-XiaoyiNeural"],
+    },
+    "en": {
+        "female": ["en-US-AvaMultilingualNeural", "en-US-JennyNeural", "en-US-AriaNeural", "en-US-MichelleNeural"],
+        "male": ["en-US-AndrewMultilingualNeural", "en-US-GuyNeural", "en-US-ChristopherNeural", "en-US-BrianNeural"],
+        "child": ["en-US-AnaNeural"],
+    },
+    "ja": {
+        "female": ["ja-JP-NanamiNeural", "ja-JP-MayuNeural", "ja-JP-AoiNeural"],
+        "male": ["ja-JP-KeitaNeural", "ja-JP-DaichiNeural", "ja-JP-NaokiNeural"],
+        "child": ["ja-JP-NanamiNeural"],
+    },
+    "ko": {
+        "female": ["ko-KR-SunHiNeural", "ko-KR-JiMinNeural", "ko-KR-SeoHyeonNeural"],
+        "male": ["ko-KR-InJoonNeural", "ko-KR-HyunsuMultilingualNeural", "ko-KR-BongJinNeural"],
+        "child": ["ko-KR-SunHiNeural"],
+    },
 }
 
 
-def _emotion_prosody(emotion: str, base_rate: str = "+0%") -> tuple[str, str, str]:
-    """Combine the caller's rate with emotion offsets → (rate, pitch, volume)."""
+def assign_speaker_voices(segments: list, language: str = "") -> list:
+    """Give each distinct detected speaker their own TTS voice & profile."""
+    pools = VOICE_POOLS.get(language, VOICE_POOLS["km"])
+    assigned: dict[tuple, str] = {}
+    next_index = {"female": 0, "male": 0, "child": 0, "grandma": 0, "grandpa": 0, "child_boy": 0, "child_girl": 0}
+
+    for seg in segments:
+        vp = str(seg.get("voice_profile") or "").lower().strip()
+        speaker = str(seg.get("speaker") or "").strip().lower()
+
+        if vp in ("grandma", "elderly_female") or any(k in speaker for k in ["grandma", "grandmother", "madame", "mrs", "elderly woman", "old woman", "យាយ", "លោកយាយ", "ជីដូន", "ម៉ែ", "夫人", "婆婆", "老奶奶", "华夫人"]):
+            gender = "grandma"
+            seg["voice_profile"] = "grandma"
+        elif vp in ("grandpa", "elderly_male") or any(k in speaker for k in ["grandpa", "grandfather", "master", "elder", "old man", "elderly man", "តា", "លោកតា", "ជីតា", "ឪ", "老爷", "老爷爷", "老太爷"]):
+            gender = "grandpa"
+            seg["voice_profile"] = "grandpa"
+        elif vp in ("child_boy", "boy") or any(k in speaker for k in ["boy", "son", "young boy", "little boy", "ក្មេងប្រុស", "កូនប្រុស", "男孩", "童子"]):
+            gender = "child_boy"
+            seg["voice_profile"] = "child_boy"
+        elif vp in ("child_girl", "girl") or any(k in speaker for k in ["girl", "daughter", "young girl", "little girl", "ក្មេងស្រី", "កូនស្រី", "女孩", "丫头"]):
+            gender = "child_girl"
+            seg["voice_profile"] = "child_girl"
+        elif vp == "child" or any(k in speaker for k in ["child", "kid", "baby", "young", "ក្មេង", "កូន", "小孩"]):
+            gender = "child"
+            seg["voice_profile"] = "child"
+        elif vp == "male" or any(k in speaker for k in ["male", "man", "lord", "officer", "scholar", "swordsman", "leader", "boss", "father", "guy", "brother", "husband", "ប្រុស", "លោក", "បង", "男", "公子", "唐伯虎", "秀才"]):
+            gender = "male"
+            seg["voice_profile"] = "male"
+        else:
+            gender = "female"
+            seg["voice_profile"] = "female"
+
+        key = (speaker, gender)
+        if key not in assigned:
+            pool = list(pools.get(gender) or pools.get("female") or [DEFAULT_VOICE_MAP["female"]])
+            assigned[key] = pool[next_index.get(gender, 0) % len(pool)]
+            next_index[gender] = next_index.get(gender, 0) + 1
+        seg["voice_name"] = assigned[key]
+    return segments
+
+
+# Emotion → prosody offsets (rate %, pitch Hz, volume %) tuned for natural, warm human speech without robotic artifacts.
+EMOTION_PROSODY: dict[str, tuple[int, int, int]] = {
+    "cheerful": (3, 2, 0),
+    "happy": (3, 2, 0),
+    "excited": (4, 4, 1),
+    "sad": (-4, -2, -1),
+    "angry": (3, 2, 1),
+    "scream": (5, 4, 2),
+    "screaming": (5, 4, 2),
+    "shout": (4, 3, 2),
+    "shouting": (4, 3, 2),
+    "calm": (-2, -2, 0),
+    "serious": (-2, -2, 0),
+    "fearful": (3, 2, 0),
+    "surprised": (3, 3, 1),
+    "whisper": (-4, -2, -2),
+    "whispering": (-4, -2, -2),
+}
+
+
+def _emotion_prosody(emotion: str, base_rate: str = "+0%", voice_profile: str = "") -> tuple[str, str, str]:
+    """Combine the caller's rate with emotion offsets and voice profile → (rate, pitch, volume)."""
     try:
         base = int(base_rate.strip().rstrip("%"))
     except ValueError:
         base = 0
-    r, p, v = EMOTION_PROSODY.get((emotion or "").lower(), (0, 0, 0))
+    r, p, v = EMOTION_PROSODY.get((emotion or "").lower().strip(), (0, 0, 0))
+    vp = (voice_profile or "").lower().strip()
+    if vp in ("child_boy", "boy"):
+        p += 7
+        r += 5
+    elif vp in ("child_girl", "girl", "child", "young"):
+        p += 8
+        r += 4
+    elif vp in ("grandpa", "elderly_male", "old_man"):
+        p -= 4
+        r -= 6
+    elif vp in ("grandma", "elderly_female", "old_woman", "elderly", "old"):
+        p -= 2
+        r -= 5
     return (f"{base + r:+d}%", f"{p:+d}Hz", f"{v:+d}%")
 
 
@@ -143,17 +259,6 @@ def _get_voxcpm_model():
                     settings.voxcpm_model_path,
                     load_denoiser=False,
                 )
-                # float16 on MPS/CUDA for ~2× faster inference
-                try:
-                    if device in ("mps", "cuda"):
-                        _voxcpm_model = _voxcpm_model.to(device).half()
-                    else:
-                        _voxcpm_model = _voxcpm_model.to(device)
-                except Exception:
-                    try:
-                        _voxcpm_model = _voxcpm_model.to(device)
-                    except Exception:
-                        pass
                 print("[VoxCPM] Model ready.")
     return _voxcpm_model
 
@@ -162,15 +267,25 @@ def _get_voxcpm_model():
 def _build_voxcpm_prompt(text: str, voice_profile: str, emotion: str) -> str:
     """Prepend a VoxCPM voice design description to the text."""
     age_map = {
-        "young": "young",
-        "old": "elderly",
+        "child_boy": "young child",
+        "child_girl": "young child",
+        "child": "young child",
+        "young": "young teenager",
         "female": "middle-aged",
         "male": "middle-aged",
+        "grandpa": "elderly grandfather",
+        "grandma": "elderly grandmother",
+        "old": "elderly",
     }
     gender_map = {
         "female": "female",
-        "young": "female",
         "male": "male",
+        "child_boy": "male",
+        "child_girl": "female",
+        "child": "female",
+        "young": "female",
+        "grandpa": "male",
+        "grandma": "female",
         "old": "male",
     }
     emotion_map = {
@@ -182,6 +297,7 @@ def _build_voxcpm_prompt(text: str, voice_profile: str, emotion: str) -> str:
         "calm": "calm and soothing",
         "serious": "clear and professional",
         "fearful": "tense and anxious",
+        "whisper": "soft whispering and breathy",
         "neutral": "natural and clear",
         "": "natural and clear",
     }
@@ -193,7 +309,17 @@ def _build_voxcpm_prompt(text: str, voice_profile: str, emotion: str) -> str:
 
 
 # Fixed seed per voice profile, used once to create the reference sample.
-_VOXCPM_VOICE_SEEDS = {"female": 42, "male": 1337, "young": 7, "old": 99}
+_VOXCPM_VOICE_SEEDS = {
+    "female": 42,
+    "male": 1337,
+    "child_boy": 105,
+    "child_girl": 7,
+    "child": 7,
+    "young": 7,
+    "grandpa": 99,
+    "grandma": 204,
+    "old": 99,
+}
 
 # Spoken by the generated reference sample; must match its audio exactly.
 _VOXCPM_REF_TEXT = "ខ្ញុំរីករាយណាស់ដែលបានជួបអ្នកនៅថ្ងៃនេះ ហើយសូមស្វាគមន៍មកកាន់កម្មវិធីរបស់យើង"
@@ -244,42 +370,56 @@ async def _generate_voxcpm_audio(
     text: str,
     voice_profile: str = "female",
     emotion: str = "",
+    reference_wav_path: str = "",
+    timesteps: Optional[int] = None,
 ) -> str:
-    """Generate TTS audio with VoxCPM2, cloning the profile's reference voice."""
+    """Generate TTS audio with VoxCPM2, cloning the profile's reference voice or custom audio."""
     import soundfile as sf
     import numpy as np
 
     model = await asyncio.to_thread(_get_voxcpm_model)
+    infer_steps = timesteps or settings.voxcpm_inference_steps or 10
 
     def _generate():
+        if reference_wav_path and os.path.exists(reference_wav_path):
+            return model.generate(
+                text,
+                reference_wav_path=reference_wav_path,
+                cfg_value=2.0,
+                inference_timesteps=infer_steps,
+                normalize=False,
+            )
         ref_wav, ref_text = _get_voxcpm_reference(model, voice_profile)
         return model.generate(
             text,
             prompt_wav_path=ref_wav,
             prompt_text=ref_text,
             cfg_value=2.0,
-            inference_timesteps=settings.voxcpm_inference_steps,
+            inference_timesteps=infer_steps,
             normalize=False,
         )
 
-    # Autoregressive TTS badcases: looping (audio far too long for the text)
-    # or truncation (far too short). Generation is stochastic, so retry when
-    # the duration is implausible; among attempts prefer the one closest to
-    # the estimate — never blindly the shortest, which favors truncated takes.
     sample_rate = model.tts_model.sample_rate
     est = _estimated_speech_seconds(text)
     ceiling = max(2.0, est * 1.8 + 0.8)
     floor = est * 0.45
-    attempts = []
-    for attempt in range(3):
-        candidate = await asyncio.to_thread(_generate)
-        dur = len(candidate) / sample_rate
-        attempts.append((dur, candidate))
-        if floor <= dur <= ceiling:
-            break
-        kind = "repeated speech" if dur > ceiling else "truncated speech"
-        print(f"[VoxCPM] {dur:.1f}s audio for ~{est:.1f}s of text — likely {kind}, retrying ({attempt + 1}/2)")
-    dur, wav = min(attempts, key=lambda t: abs(t[0] - max(est, 0.6)))
+
+    # Run primary generation
+    candidate = await asyncio.to_thread(_generate)
+    dur = len(candidate) / sample_rate
+
+    # If first pass is within normal duration window, use it directly (saves 2x-3x time!)
+    if floor <= dur <= ceiling:
+        wav = candidate
+    else:
+        attempts = [(dur, candidate)]
+        for _ in range(2):
+            candidate = await asyncio.to_thread(_generate)
+            dur = len(candidate) / sample_rate
+            attempts.append((dur, candidate))
+            if floor <= dur <= ceiling:
+                break
+        dur, wav = min(attempts, key=lambda t: abs(t[0] - max(est, 0.6)))
 
     export_dir = os.path.join(settings.upload_dir, "tts")
     os.makedirs(export_dir, exist_ok=True)
@@ -291,6 +431,59 @@ async def _generate_voxcpm_audio(
     return output_path
 
 
+def _clean_and_detect_emotion(text: str, default_emotion: str = "") -> tuple[str, str]:
+    """Extract emotion from direction tags, strip all bracketed notes, and detect emotional keywords."""
+    detected_emotion = ""
+    # If default_emotion is provided and NOT "neutral", treat it as an explicit emotion choice
+    if default_emotion and default_emotion.lower().strip() not in ("neutral", "auto", "default", "none", ""):
+        detected_emotion = default_emotion.lower().strip()
+
+    bracket_tags = re.findall(r'[\(\[\{]([^\)\]\}]+)[\)\]\}]', text)
+    for tag_str in bracket_tags:
+        t = tag_str.lower().strip()
+        if any(k in t for k in ("whisper", "ខ្សឹប", "secret", "breathy", "shh", "psst")):
+            detected_emotion = "whisper"
+        elif any(k in t for k in ("fear", "fearful", "scared", "terrified", "panic", "panicked", "ភ័យ", "ខ្លាច")):
+            detected_emotion = "fearful"
+        elif any(k in t for k in ("scream", "screaming", "shout", "shouting", "yell", "yelling", "roar", "ស្រែក")):
+            detected_emotion = "scream"
+        elif any(k in t for k in ("angry", "furious", "mad", "rage", "ខឹង", "កំហឹង")):
+            detected_emotion = "angry"
+        elif any(k in t for k in ("happy", "cheerful", "joy", "laugh", "smile", "សប្បាយ", "រីករាយ")):
+            detected_emotion = "happy"
+        elif any(k in t for k in ("sad", "crying", "grief", "depressed", "melancholy", "ពិបាកចិត្ត", "យំ", "សោកសៅ")):
+            detected_emotion = "sad"
+        elif any(k in t for k in ("excited", "enthusiastic", "energy", "រំភើប")):
+            detected_emotion = "excited"
+        elif any(k in t for k in ("serious", "stern", "authoritative", "ម៉ឺងម៉ាត់")):
+            detected_emotion = "serious"
+        elif any(k in t for k in ("calm", "gentle", "soft", "ស្ងប់")):
+            detected_emotion = "calm"
+
+    # Strip ALL bracketed/parenthesized direction tags so TTS NEVER pronounces them
+    clean = re.sub(r'[\(\[\{][^\)\]\}]*[\)\]\}]', '', text)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    clean_text = clean if clean else text
+
+    return clean_text, detected_emotion or "neutral"
+
+
+async def _get_active_tts_engine() -> str:
+    """Dynamically get active TTS engine from db/settings."""
+    try:
+        from backend.database.db import async_session
+        from sqlalchemy import select
+        from backend.database.models import AppSetting
+        async with async_session() as db:
+            res = await db.execute(select(AppSetting.value).where(AppSetting.key == "tts_engine"))
+            val = res.scalar_one_or_none()
+            if val:
+                return val
+    except Exception:
+        pass
+    return settings.tts_engine or "edge-tts"
+
+
 async def generate_segment_audio(
     text: str,
     voice_profile: str = "female",
@@ -298,14 +491,60 @@ async def generate_segment_audio(
     voice_name: str = "",
     language: str = "",
     emotion: str = "",
+    pitch: str = "",
+    engine: str = "",
+    reference_audio: str = "",
+    timesteps: Optional[int] = None,
+    apply_fx: bool = True,
 ) -> str:
-    """Generate TTS audio for a single text segment. Returns path to mp3 file."""
-    if settings.tts_engine == "voxcpm":
-        return await _generate_voxcpm_audio(text, voice_profile, emotion)
+    clean_text, detected_emotion = _clean_and_detect_emotion(text, emotion)
+    active_engine = await _get_active_tts_engine()
+    requested_engine = (engine or "").lower().strip()
+
+    # Resolve local reference audio file if provided
+    ref_wav_path = ""
+    if reference_audio:
+        ref_audio_clean = reference_audio.replace("/uploads/", "")
+        candidate_path = os.path.join(settings.upload_dir, ref_audio_clean)
+        if os.path.exists(candidate_path):
+            ref_wav_path = candidate_path
+        elif os.path.exists(reference_audio):
+            ref_wav_path = reference_audio
+
+    # Determine whether to use VoxCPM or Edge-TTS:
+    # 1. If global active_engine == "edge-tts" or requested_engine == "edge-tts":
+    #    STRICTLY enforce Edge-TTS (clear any legacy voxcpm voice names)
+    # 2. If global active_engine == "voxcpm" or requested_engine == "voxcpm":
+    #    Use VoxCPM (with voice cloning if ref_wav_path is present)
+    # 3. Otherwise default to Edge-TTS
+    is_voxcpm = False
+    if active_engine == "edge-tts" or requested_engine.startswith("edge"):
+        is_voxcpm = False
+        if voice_name and "voxcpm" in voice_name.lower():
+            voice_name = ""
+    elif active_engine == "voxcpm" or requested_engine == "voxcpm":
+        is_voxcpm = True
+    elif voice_name and "voxcpm" in voice_name.lower():
+        is_voxcpm = True
+    elif bool(ref_wav_path) and active_engine != "edge-tts":
+        is_voxcpm = True
+    if is_voxcpm:
+        try:
+            return await _generate_voxcpm_audio(
+                clean_text,
+                voice_profile,
+                detected_emotion,
+                reference_wav_path=ref_wav_path,
+                timesteps=timesteps,
+            )
+        except Exception as e:
+            print(f"[VoxCPM] Generation failed: {e}. Falling back to Edge-TTS.")
+            if voice_name and "voxcpm" in voice_name.lower():
+                voice_name = ""
 
     import edge_tts
 
-    detected_lang = _detect_text_language(text)
+    detected_lang = _detect_text_language(clean_text)
     lang = detected_lang or language or ""
 
     if voice_name:
@@ -314,15 +553,44 @@ async def generate_segment_audio(
         lang_map = VOICE_MAP.get(lang, DEFAULT_VOICE_MAP)
         voice = lang_map.get(voice_profile, lang_map.get("female", DEFAULT_VOICE_MAP["female"]))
 
-    tts_rate, tts_pitch, tts_volume = _emotion_prosody(emotion, rate)
+    tts_rate, tts_pitch, tts_volume = _emotion_prosody(detected_emotion, rate, voice_profile=voice_profile)
+    if pitch and pitch != "+0Hz":
+        tts_pitch = pitch
 
     export_dir = os.path.join(settings.upload_dir, "tts")
     os.makedirs(export_dir, exist_ok=True)
-
     output_path = os.path.join(export_dir, f"{uuid.uuid4()}.mp3")
 
-    communicate = edge_tts.Communicate(text, voice, rate=tts_rate, pitch=tts_pitch, volume=tts_volume)
-    await communicate.save(output_path)
+    communicate = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            communicate = edge_tts.Communicate(clean_text, voice, rate=tts_rate, pitch=tts_pitch, volume=tts_volume)
+            await communicate.save(output_path)
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                await asyncio.sleep(0.3 * (attempt + 1))
+
+    if last_err and (not os.path.exists(output_path) or os.path.getsize(output_path) == 0):
+        raise last_err
+
+    # Apply transparent mastering filter graph
+    if apply_fx:
+        filter_chain = _build_filter_chain(voice_profile=voice_profile, emotion=detected_emotion)
+        if filter_chain and os.path.exists(output_path):
+            ffmpeg = _get_ffmpeg()
+            filtered_path = os.path.join(export_dir, f"{uuid.uuid4()}_fx.mp3")
+            fx_cmd = [ffmpeg, "-y", "-i", output_path, "-af", filter_chain] + _codec_for_ext(filtered_path) + [filtered_path]
+            try:
+                res = await asyncio.to_thread(subprocess.run, fx_cmd, capture_output=True, text=True, timeout=30)
+                if res.returncode == 0 and os.path.exists(filtered_path) and os.path.getsize(filtered_path) > 0:
+                    _cleanup_files([output_path])
+                    return filtered_path
+            except Exception:
+                pass
 
     return output_path
 
@@ -335,16 +603,28 @@ async def generate_fitted_segment_audio(
     voice_name: str = "",
     language: str = "",
     emotion: str = "",
+    engine: str = "",
+    reference_audio: str = "",
     max_duration: Optional[float] = None,
+    max_speedup: Optional[float] = 2.0,
 ) -> tuple:
     """Generate TTS audio for a single segment.
 
-    Speech always plays at natural pace when possible: if it's longer than
-    target_duration, the segment extends into the free room before the next
-    segment (max_duration). Only when even that room is too small is the
-    speech compressed (up to 2×) so it can never overlap the next segment.
+    Speech dynamically scales speed (atempo) to finish speaking within the allocated
+    time limit before the next segment starts, completely preventing voice overlap.
     Returns (path_to_fitted_mp3, actual_duration)."""
-    raw_path = await generate_segment_audio(text, voice_profile, rate, voice_name=voice_name, language=language, emotion=emotion)
+    clean_text, detected_emotion = _clean_and_detect_emotion(text, emotion)
+    raw_path = await generate_segment_audio(
+        clean_text,
+        voice_profile,
+        rate,
+        voice_name=voice_name,
+        language=language,
+        emotion=detected_emotion,
+        engine=engine,
+        reference_audio=reference_audio,
+        apply_fx=False,
+    )
 
     ffmpeg = _get_ffmpeg()
     export_dir = os.path.join(settings.upload_dir, "tts")
@@ -352,26 +632,39 @@ async def generate_fitted_segment_audio(
 
     # Probe the natural audio duration
     raw_duration = _probe_duration(ffmpeg, raw_path)
+    spd_cap = min(3.0, max(1.2, max_speedup)) if max_speedup is not None else 2.5
 
     if raw_duration > 0 and target_duration > 0:
-        if max_duration is None:
-            room = max(raw_duration, target_duration)  # no neighbor — extend freely
-        else:
-            room = max(target_duration, max_duration)
-        if raw_duration <= room:
-            # Natural pace; extends into free room when longer than the slot
+        # Determine ceiling: if max_duration is specified and > 0, use it, else lock to target_duration
+        ceiling = max_duration if (max_duration is not None and max_duration > 0) else target_duration
+
+        if raw_duration <= target_duration:
+            # Voice naturally fits inside the character's speaking window
             actual_duration = raw_duration
+        elif raw_duration <= ceiling:
+            # Audio is longer than target_duration but fits within ceiling:
+            # Accelerate dynamically so speech stays fast and snappy with the video action
+            target_fit = max(target_duration, raw_duration / 1.35)
+            tempo = min(raw_duration / target_fit, spd_cap)
+            actual_duration = max(0.2, raw_duration / tempo)
         else:
-            # Room exhausted — compress (up to 2×) to avoid overlapping the next segment
-            tempo = min(raw_duration / room, 2.0)
-            actual_duration = raw_duration / tempo
+            # Audio exceeds ceiling: accelerate with atempo so speech finishes strictly within the allocated window
+            tempo = min(raw_duration / ceiling, spd_cap)
+            actual_duration = max(0.2, raw_duration / tempo)
     else:
         actual_duration = target_duration
 
-    # Pass the exact tempo we decided on — _build_tempo_cmd's own cap
-    # defaults to 1.0 and would otherwise silently skip the speed-up.
-    tempo_cap = raw_duration / actual_duration if actual_duration > 0 else 1.0
-    cmd = _build_tempo_cmd(ffmpeg, raw_path, fitted_path, actual_duration, max_speedup=max(1.0, tempo_cap))
+    # Pass the exact tempo we decided on
+    tempo_cap = (raw_duration / actual_duration) if (actual_duration > 0 and raw_duration > 0) else 1.0
+    cmd = _build_tempo_cmd(
+        ffmpeg,
+        raw_path,
+        fitted_path,
+        actual_duration,
+        max_speedup=max(1.0, tempo_cap, spd_cap),
+        voice_profile=voice_profile,
+        emotion=detected_emotion,
+    )
     result = await asyncio.to_thread(
         subprocess.run, cmd, capture_output=True, text=True, timeout=120
     )
@@ -513,9 +806,29 @@ def _codec_for_ext(path: str) -> list:
     return ["-c:a", "libmp3lame", "-b:a", "192k"]
 
 
-def _build_tempo_cmd(ffmpeg: str, input_path: str, output_path: str, target_duration: float, max_speedup: float = 1.0) -> list:
-    """Build ffmpeg command to adjust audio tempo to fit target duration."""
-    # Get input duration first
+def _build_filter_chain(voice_profile: str = "", emotion: str = "", atempo_filters: Optional[list[str]] = None) -> str:
+    """Build clean ffmpeg audio graph preserving pristine neural vocal warmth and natural clarity."""
+    filters = []
+
+    # Clean transparent peak limiter to prevent clipping without altering vocal timbre
+    filters.append("alimiter=limit=0.98")
+
+    if atempo_filters:
+        filters.extend(atempo_filters)
+
+    return ",".join(filters) if filters else ""
+
+
+def _build_tempo_cmd(
+    ffmpeg: str,
+    input_path: str,
+    output_path: str,
+    target_duration: float,
+    max_speedup: float = 2.0,
+    voice_profile: str = "",
+    emotion: str = "",
+) -> list:
+    """Build ffmpeg command to apply child formant/pitch filters, emotion enhancements, and tempo adjustment."""
     probe_cmd = [
         ffmpeg.replace("ffmpeg", "ffprobe") if "ffmpeg" in ffmpeg else "ffprobe",
         "-v", "error",
@@ -527,40 +840,39 @@ def _build_tempo_cmd(ffmpeg: str, input_path: str, output_path: str, target_dura
         probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
         input_duration = float(probe.stdout.strip())
     except (ValueError, subprocess.TimeoutExpired):
-        input_duration = target_duration  # fallback: no tempo change
+        input_duration = target_duration
 
-    if input_duration <= 0 or target_duration <= 0:
-        # Simple copy/convert
-        return [ffmpeg, "-y", "-i", input_path] + _codec_for_ext(output_path) + [output_path]
-
-    tempo = input_duration / target_duration
-    # Only speed up, never slow down — if audio is shorter than target, keep natural speed
-    if tempo < 1.0:
-        # Audio is already shorter than target; no need to stretch/slow it
-        return [ffmpeg, "-y", "-i", input_path] + _codec_for_ext(output_path) + [output_path]
-    # Cap speedup so speech doesn't become unintelligible
-    tempo = min(tempo, max_speedup)
-
-    # Chain atempo filters if needed (each can handle 0.5-100.0 range)
     atempo_filters = []
-    remaining = tempo
-    while remaining > 100.0:
-        atempo_filters.append("atempo=100.0")
-        remaining /= 100.0
-    while remaining < 0.5:
-        atempo_filters.append("atempo=0.5")
-        remaining /= 0.5
-    atempo_filters.append(f"atempo={remaining:.4f}")
+    if input_duration > 0 and target_duration > 0:
+        tempo = input_duration / target_duration
+        if tempo > 1.001:
+            tempo = min(tempo, max_speedup)
+            remaining = tempo
+            while remaining > 2.0:
+                atempo_filters.append("atempo=2.0")
+                remaining /= 2.0
+            if remaining > 1.001:
+                atempo_filters.append(f"atempo={remaining:.4f}")
+        elif tempo < 0.999:
+            remaining = max(0.5, tempo)
+            while remaining < 0.5:
+                atempo_filters.append("atempo=0.5")
+                remaining /= 0.5
+            if remaining < 0.999:
+                atempo_filters.append(f"atempo={remaining:.4f}")
 
-    af = ",".join(atempo_filters)
+    af = _build_filter_chain(voice_profile=voice_profile, emotion=emotion, atempo_filters=atempo_filters)
 
-    return [
-        ffmpeg, "-y",
-        "-i", input_path,
-        "-af", af,
-    ] + _codec_for_ext(output_path) + [
-        output_path,
-    ]
+    if af:
+        return [
+            ffmpeg, "-y",
+            "-i", input_path,
+            "-af", af,
+        ] + _codec_for_ext(output_path) + [
+            output_path,
+        ]
+
+    return [ffmpeg, "-y", "-i", input_path] + _codec_for_ext(output_path) + [output_path]
 
 
 def _cleanup_files(paths: list[str]):

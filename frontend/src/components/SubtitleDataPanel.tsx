@@ -1,625 +1,809 @@
-import { useState, useEffect, useRef, RefObject } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import { useProjectStore } from '../stores/projectStore';
-import type { Segment } from '../types';
 import {
-  Plus,
+  importSrtFile,
+  translateSegments,
+  translateSegmentsStream,
+  fillMissingCaptions,
+  shiftProjectTimestamps,
+  getExportUrl,
+  type TranslateProgressEvent,
+} from '../api/client';
+import type { Segment } from '../types';
+import { buildClipLayout, timelineToSource } from '../utils/clipTimemap';
+import CaptionPropertiesPanel from './CaptionPropertiesPanel';
+import {
+  UploadCloud,
+  ChevronDown,
+  Play,
   Pencil,
   Trash2,
-  Check,
-  X,
-  Volume2,
-  ChevronDown,
   Loader2,
-  RefreshCw,
+  Sparkles,
+  Plus,
+  Languages,
+  FileText,
+  Palette,
+  Search,
+  X,
+  Download,
+  Check,
+  User,
+  RotateCcw,
 } from 'lucide-react';
 
-import { buildClipLayout, timelineToSource } from '../utils/clipTimemap';
+const SUPPORTED_LANGUAGES = [
+  { id: 'km', name: 'Khmer (ខ្មែរ)', flag: '🇰🇭' },
+  { id: 'auto', name: 'Auto (Original Audio)', flag: '🌐' },
+  { id: 'en', name: 'English', flag: '🇺🇸' },
+  { id: 'zh', name: 'Chinese (中文)', flag: '🇨🇳' },
+  { id: 'ja', name: 'Japanese (日本語)', flag: '🇯🇵' },
+  { id: 'ko', name: 'Korean (한국어)', flag: '🇰🇷' },
+  { id: 'th', name: 'Thai (ไทย)', flag: '🇹🇭' },
+  { id: 'vi', name: 'Vietnamese', flag: '🇻🇳' },
+  { id: 'fr', name: 'French', flag: '🇫🇷' },
+  { id: 'es', name: 'Spanish', flag: '🇪🇸' },
+];
 
-const VOICE_OPTIONS = [
-  { id: '', label: 'Auto (ស្វ័យ)', gender: '' },
-  { id: 'km-KH-SreymomNeural', label: '🎀 ស្រីមុំ (ស្រី)', gender: 'F' },
-  { id: 'km-KH-PisethNeural', label: '👔 ពិសិដ្ឋ (ប្រុស)', gender: 'M' },
-  { id: 'zh-CN-XiaoxiaoNeural', label: '🎀 晓晓 (女)', gender: 'F' },
-  { id: 'zh-CN-XiaoyiNeural', label: '🎀 晓依 (女)', gender: 'F' },
-  { id: 'zh-CN-YunxiNeural', label: '👔 云希 (男)', gender: 'M' },
-  { id: 'zh-CN-YunjianNeural', label: '👔 云健 (男)', gender: 'M' },
-  { id: 'en-US-AvaMultilingualNeural', label: '🎀 Ava (ស្រី)', gender: 'F' },
-  { id: 'en-US-EmmaMultilingualNeural', label: '🎀 Emma (ស្រី)', gender: 'F' },
-  { id: 'en-US-AndrewMultilingualNeural', label: '👔 Andrew (ប្រុស)', gender: 'M' },
-  { id: 'en-US-BrianMultilingualNeural', label: '👔 Brian (ប្រុស)', gender: 'M' },
-  { id: 'fr-FR-VivienneMultilingualNeural', label: '🎀 Vivienne (ស្រី)', gender: 'F' },
-  { id: 'fr-FR-RemyMultilingualNeural', label: '👔 Rémy (ប្រុស)', gender: 'M' },
-  { id: 'de-DE-SeraphinaMultilingualNeural', label: '🎀 Seraphina (ស្រី)', gender: 'F' },
-  { id: 'de-DE-FlorianMultilingualNeural', label: '👔 Florian (ប្រុស)', gender: 'M' },
+const EXPORT_FORMATS = [
+  { fmt: 'srt', label: 'SubRip Subtitle (.SRT)', desc: 'Standard video subtitles' },
+  { fmt: 'vtt', label: 'WebVTT File (.VTT)', desc: 'Web video subtitle format' },
+  { fmt: 'txt', label: 'Plain Text (.TXT)', desc: 'Full text dialogue script' },
+  { fmt: 'json', label: 'JSON Dataset (.JSON)', desc: 'Timed subtitle objects' },
 ];
 
 interface Props {
-  videoRef: RefObject<HTMLVideoElement | null>;
+  videoRef?: React.RefObject<HTMLVideoElement | null>;
 }
 
 export default function SubtitleDataPanel({ videoRef }: Props) {
   const {
     currentProject,
-    currentTime,
     activeSegmentId,
+    currentTime,
+    setCurrentTime,
+    isPlaying,
+    videoClips,
     updateSegment,
     deleteSegment,
+    deleteAllSegments,
     addSegment,
     setActiveSegment,
-    bulkSetVoice,
-    isGeneratingAudio,
     isTranscribing,
-    retranscribeSelected,
-    videoClips,
-    setSelectedSegmentIds,
+    transcribeProgress,
+    transcribePercent,
+    transcribeChunkInfo,
+    generateTranscript,
+    loadProject,
   } = useProjectStore();
 
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editText, setEditText] = useState('');
-  const [editStart, setEditStart] = useState('');
-  const [editEnd, setEditEnd] = useState('');
-  const [showAddForm, setShowAddForm] = useState(false);
-  const [newStart, setNewStart] = useState('');
-  const [newEnd, setNewEnd] = useState('');
-  const [newText, setNewText] = useState('');
-  const activeRef = useRef<HTMLTableRowElement>(null);
+  const clipLayout = useMemo(() => buildClipLayout(videoClips), [videoClips]);
+
+  const seekToSegment = (seg: Segment) => {
+    setActiveSegment(seg.id);
+    setCurrentTime(seg.start_time);
+    if (videoRef?.current) {
+      if (clipLayout.length > 0) {
+        const res = timelineToSource(clipLayout, seg.start_time);
+        videoRef.current.currentTime = res ? res.sourceTime : seg.start_time;
+      } else {
+        videoRef.current.currentTime = seg.start_time;
+      }
+    }
+  };
 
   const segments = currentProject?.segments || [];
 
+  // Active top tab: 'captions' or 'style'
+  const [panelTab, setPanelTab] = useState<'captions' | 'style'>('captions');
+  const [selectedLanguage, setSelectedLanguage] = useState(SUPPORTED_LANGUAGES[0]);
+  const [showLangDropdown, setShowLangDropdown] = useState(false);
+  const [showExportDropdown, setShowExportDropdown] = useState(false);
+
+  // Search
+  const [searchQuery, setSearchQuery] = useState('');
+
+  // Import, Translate & Gap Filling states
+  const [isImporting, setIsImporting] = useState(false);
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [isFillingGaps, setIsFillingGaps] = useState(false);
+  const [fillGapsStatus, setFillGapsStatus] = useState<string | null>(null);
+  const [singleTranslatingId, setSingleTranslatingId] = useState<string | null>(null);
+  const [translationProgress, setTranslationProgress] = useState<TranslateProgressEvent | null>(null);
+  const translateAbortRef = useRef<AbortController | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Inline editing
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState('');
+
+  const activeRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll to active playing subtitle only when paused/clicked (prevents list jumping during playback)
   useEffect(() => {
-    if (activeSegmentId && activeRef.current) {
-      activeRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    if (activeSegmentId && activeRef.current && !isPlaying) {
+      activeRef.current.scrollIntoView({ behavior: 'auto', block: 'nearest' });
     }
-  }, [activeSegmentId]);
+  }, [activeSegmentId, isPlaying]);
 
-  // Sync local selectedIds to store whenever it changes
+  // Auto-scroll to newly generated segments
+  const prevCountRef = useRef(segments.length);
   useEffect(() => {
-    setSelectedSegmentIds(selectedIds);
-  }, [selectedIds, setSelectedSegmentIds]);
+    if (isTranscribing && segments.length > prevCountRef.current) {
+      const last = segments[segments.length - 1];
+      if (last) {
+        const el = document.getElementById(`seg-${last.id}`);
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    }
+    prevCountRef.current = segments.length;
+  }, [segments.length, isTranscribing]);
 
-  // Delete selected segments with Delete/Backspace key
+  // Auto-scroll to currently translating segment
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (selectedIds.size === 0) return;
-      if (e.key !== 'Delete' && e.key !== 'Backspace') return;
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target as HTMLElement)?.isContentEditable) return;
-      e.preventDefault();
-      handleDeleteSelected();
+    if (isTranslating && translationProgress?.segmentId) {
+      const el = document.getElementById(`seg-${translationProgress.segmentId}`);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }, [isTranslating, translationProgress?.segmentId]);
+
+  useEffect(() => {
+    return () => {
+      if (translateAbortRef.current) {
+        translateAbortRef.current.abort();
+      }
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedIds]);
+  }, []);
 
-  const toggleSelect = (id: string) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
-
-  const toggleSelectAll = () => {
-    if (selectedIds.size === segments.length) {
-      setSelectedIds(new Set());
-    } else {
-      setSelectedIds(new Set(segments.map((s) => s.id)));
+  const handleImportSrt = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !currentProject?.id) return;
+    setIsImporting(true);
+    try {
+      await importSrtFile(currentProject.id, file);
+      await loadProject(currentProject.id);
+    } catch (err) {
+      console.error('Import failed:', err);
+    } finally {
+      setIsImporting(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
-  const startEdit = (seg: Segment) => {
+  const handleExport = (format: string) => {
+    if (!currentProject?.id) return;
+    const url = getExportUrl(currentProject.id, format, selectedLanguage.id);
+    window.open(url, '_blank');
+    setShowExportDropdown(false);
+  };
+
+  const handleTranslateAll = () => {
+    if (!currentProject?.id || segments.length === 0) return;
+    if (isTranslating && translateAbortRef.current) {
+      translateAbortRef.current.abort();
+      setIsTranslating(false);
+      setTranslationProgress(null);
+      return;
+    }
+
+    const targetLang = (selectedLanguage.id && selectedLanguage.id !== 'auto') ? selectedLanguage.id : (currentProject.language || 'km');
+    setIsTranslating(true);
+    setTranslationProgress({ current: 0, total: segments.length, percent: 0 });
+
+    const controller = translateSegmentsStream(
+      currentProject.id,
+      targetLang,
+      undefined,
+      (progress) => setTranslationProgress(progress),
+      (updatedSeg) => {
+        useProjectStore.setState((state) => ({
+          currentProject: state.currentProject
+            ? {
+                ...state.currentProject,
+                segments: state.currentProject.segments.map((s) =>
+                  s.id === updatedSeg.id ? { ...s, text: updatedSeg.text, speaker: updatedSeg.speaker || s.speaker } : s
+                ),
+              }
+            : null,
+        }));
+      },
+      async () => {
+        setIsTranslating(false);
+        setTranslationProgress(null);
+        translateAbortRef.current = null;
+        await loadProject(currentProject.id);
+      },
+      async () => {
+        setIsTranslating(false);
+        setTranslationProgress(null);
+        translateAbortRef.current = null;
+        await loadProject(currentProject.id);
+      }
+    );
+
+    translateAbortRef.current = controller;
+  };
+
+  const handleTranslateSingleLine = async (segId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!currentProject?.id || !segId) return;
+    const targetLang = (selectedLanguage.id && selectedLanguage.id !== 'auto') ? selectedLanguage.id : (currentProject.language || 'km');
+    setSingleTranslatingId(segId);
+    try {
+      await translateSegments(currentProject.id, targetLang, [segId]);
+      await loadProject(currentProject.id);
+    } catch (err) {
+      console.error('Failed to translate line:', err);
+    } finally {
+      setSingleTranslatingId(null);
+    }
+  };
+
+  const handleFillMissingGaps = async () => {
+    if (!currentProject?.id || isFillingGaps) return;
+    setIsFillingGaps(true);
+    setFillGapsStatus('Scanning video for blank gaps...');
+    try {
+      const res = await fillMissingCaptions(currentProject.id, 1.5);
+      setFillGapsStatus(res.message);
+      await loadProject(currentProject.id);
+      setTimeout(() => setFillGapsStatus(null), 4000);
+    } catch (err: any) {
+      console.error('Failed to fill missing captions:', err);
+      setFillGapsStatus(err?.response?.data?.detail || 'Failed to scan gaps');
+      setTimeout(() => setFillGapsStatus(null), 4000);
+    } finally {
+      setIsFillingGaps(false);
+    }
+  };
+
+  const handleStartEdit = (seg: Segment) => {
     setEditingId(seg.id);
     setEditText(seg.text);
-    setEditStart(formatTimeInput(seg.start_time));
-    setEditEnd(formatTimeInput(seg.end_time));
   };
 
-  const saveEdit = async () => {
-    if (!editingId) return;
-    await updateSegment(editingId, {
-      text: editText,
-      start_time: parseTimeInput(editStart),
-      end_time: parseTimeInput(editEnd),
-      audio_url: '',
-    });
+  const handleSaveEdit = async () => {
+    if (!editingId || !currentProject?.id) return;
+    await updateSegment(editingId, { text: editText });
     setEditingId(null);
   };
 
-  const cancelEdit = () => setEditingId(null);
-
-  const handleAddText = () => {
-    // currentTime is in timeline space; convert to source time for segment placement
-    let sourceTime = 0;
-    if (videoClips.length > 0) {
-      const layout = buildClipLayout(videoClips);
-      const result = timelineToSource(layout, currentTime);
-      sourceTime = result ? result.sourceTime : layout[0]?.clip.source_start ?? 0;
-    } else {
-      sourceTime = currentTime;
+  const handleShiftTimestamps = async (offsetSec: number) => {
+    if (!currentProject?.id) return;
+    try {
+      await shiftProjectTimestamps(currentProject.id, offsetSec);
+      await loadProject(currentProject.id);
+    } catch (err) {
+      console.error('Failed to shift timestamps:', err);
     }
-    setNewStart(formatTimeInput(sourceTime));
-    setNewEnd(formatTimeInput(sourceTime + 3));
-    setNewText('អត្ថបទថ្មី');
-    setShowAddForm(true);
   };
 
-  const confirmAdd = async () => {
+  const handleAddNewSegment = async () => {
+    if (!currentProject) return;
+    const start = currentTime;
+    const end = Math.min(currentProject.duration || 60, start + 3.0);
     await addSegment({
-      start_time: parseTimeInput(newStart),
-      end_time: parseTimeInput(newEnd),
-      text: newText,
-      speaker: '',
+      start_time: start,
+      end_time: end,
+      text: 'Subtitle line',
+      speaker: 'Speaker 1',
       voice_profile: 'female',
     });
-    setShowAddForm(false);
+    if (currentProject.id) await loadProject(currentProject.id);
   };
 
-  const cancelAdd = () => setShowAddForm(false);
-
-  const handleDeleteSelected = async () => {
-    if (selectedIds.size === 0) return;
-    if (!confirm(`Delete ${selectedIds.size} segment(s)?`)) return;
-    for (const id of selectedIds) {
-      await deleteSegment(id);
+  const handlePlayFromSegment = (seg: Segment, e: React.MouseEvent) => {
+    e.stopPropagation();
+    seekToSegment(seg);
+    if (videoRef?.current) {
+      videoRef.current.play().catch(() => {});
     }
-    setSelectedIds(new Set());
-  };
-
-  const handleBulkVoice = async (voice: string) => {
-    const ids = selectedIds.size > 0 ? Array.from(selectedIds) : undefined;
-    await bulkSetVoice(voice, ids);
-  };
-
-  const handleVoiceChange = async (segId: string, voice: string) => {
-    await updateSegment(segId, { voice_profile: voice, voice_name: '', audio_url: '', audio_speed: 1.0 });
-  };
-
-  const handleSpeedChange = async (segId: string, speed: number) => {
-    await updateSegment(segId, { audio_speed: speed, audio_url: '' });
-  };
-
-  const handleVoiceNameChange = async (segId: string, voiceName: string) => {
-    await updateSegment(segId, { voice_name: voiceName, audio_url: '' });
-  };
-
-
-  const seekTo = (time: number) => {
-    if (videoRef.current) videoRef.current.currentTime = time;
   };
 
   const formatTime = (s: number) => {
-    const mins = Math.floor(s / 60);
-    const secs = Math.floor(s % 60);
-    const ms = Math.floor((s % 1) * 100);
-    return `${mins.toString().padStart(2, '0')}:${secs
-      .toString()
-      .padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
   };
 
-  const formatTimeInput = (s: number) => {
-    const mins = Math.floor(s / 60);
-    const secs = (s % 60).toFixed(2);
-    return `${mins.toString().padStart(2, '0')}:${parseFloat(secs) < 10 ? '0' : ''}${secs}`;
-  };
-
-  const parseTimeInput = (t: string) => {
-    const parts = t.split(':');
-    if (parts.length === 2) {
-      return parseInt(parts[0]) * 60 + parseFloat(parts[1]);
-    }
-    return parseFloat(t) || 0;
-  };
+  // Filtered segments
+  const displayedSegments = useMemo(() => {
+    const base = segments.filter(
+      (s) => s.speaker !== 'Freeze' && s.voice_profile !== 'freeze' && !s.text.includes('Freeze Frame')
+    );
+    if (!searchQuery.trim()) return base;
+    const q = searchQuery.toLowerCase();
+    return base.filter(
+      (s) => s.text.toLowerCase().includes(q) || (s.speaker || '').toLowerCase().includes(q)
+    );
+  }, [segments, searchQuery]);
 
   return (
-    <div className="flex flex-col h-full" style={{ backgroundColor: 'var(--bg-base)' }}>
-      {/* Toolbar */}
-      <div className="flex items-center gap-1 px-3 py-2 border-b border-zinc-800 shrink-0 bg-zinc-900/60">
-        <div className="flex items-center gap-1.5 text-xs font-semibold text-zinc-300 mr-2">
-          <span className="text-base">📝</span> Subtitles
-          {segments.length > 0 && (
-            <span className="ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-zinc-800 text-zinc-400">
-              {segments.length}
-            </span>
-          )}
+    <div className="flex flex-col h-full bg-[#111216] text-[#e1e4ea] select-none font-sans overflow-hidden">
+      {/* 1. Header: Tabs & Quick Action Buttons */}
+      <div className="px-4 py-2.5 border-b border-[#1f222a] bg-[#14161c] flex items-center justify-between gap-2 shrink-0">
+        {/* Captions vs Style Tabs */}
+        <div className="flex items-center gap-1 bg-[#1a1c24] p-1 rounded-xl border border-[#272b36]">
+          <button
+            onClick={() => setPanelTab('captions')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+              panelTab === 'captions'
+                ? 'bg-pink-600 text-white shadow-md'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <FileText className="w-3.5 h-3.5" />
+            <span>Captions</span>
+            {segments.length > 0 && (
+              <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] bg-black/30 font-mono">
+                {segments.length}
+              </span>
+            )}
+          </button>
+
+          <button
+            onClick={() => setPanelTab('style')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+              panelTab === 'style'
+                ? 'bg-pink-600 text-white shadow-md'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <Palette className="w-3.5 h-3.5" />
+            <span>Style</span>
+          </button>
         </div>
 
-        <div className="h-4 w-px bg-zinc-700 mx-1" />
+        {/* Right Tools: Import, Export, Add Line */}
+        <div className="flex items-center gap-1.5">
+          <input
+            type="file"
+            ref={fileInputRef}
+            accept=".srt,.vtt,.txt,.ass"
+            onChange={handleImportSrt}
+            className="hidden"
+          />
 
-        <button
-          onClick={handleAddText}
-          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs text-zinc-300 hover:bg-zinc-700 hover:text-white transition-colors"
-          title="Add a new text segment at the current time"
-        >
-          <Plus className="w-3.5 h-3.5" /> Add
-        </button>
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isImporting}
+            className="p-1.5 rounded-lg bg-[#1a1c24] hover:bg-[#232732] border border-[#272b36] text-zinc-300 hover:text-white transition-colors"
+            title="Import Subtitle (.SRT, .VTT)"
+          >
+            {isImporting ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-pink-400" />
+            ) : (
+              <UploadCloud className="w-3.5 h-3.5 text-pink-400" />
+            )}
+          </button>
 
-        <button
-          onClick={() => {
-            const seg = segments.find((s) => s.id === activeSegmentId);
-            if (seg) startEdit(seg);
-          }}
-          disabled={!activeSegmentId || editingId !== null}
-          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs text-amber-400 hover:bg-amber-900/30 hover:text-amber-300 transition-colors disabled:opacity-30"
-          title={activeSegmentId ? 'Edit active segment' : 'Select a segment to edit'}
-        >
-          <Pencil className="w-3.5 h-3.5" /> Edit
-        </button>
-
-        <button
-          onClick={handleDeleteSelected}
-          disabled={selectedIds.size === 0}
-          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs text-red-400 hover:bg-red-900/30 hover:text-red-300 transition-colors disabled:opacity-30"
-          title={selectedIds.size > 0 ? `Delete ${selectedIds.size} selected` : 'Select segments to delete'}
-        >
-          <Trash2 className="w-3.5 h-3.5" />
-          {selectedIds.size > 0 && <span>{selectedIds.size}</span>}
-        </button>
-
-        <button
-          onClick={async () => {
-            const ids = Array.from(selectedIds);
-            if (ids.length === 0) return;
-            if (!confirm(`Re-transcribe ${ids.length} selected segment(s)?`)) return;
-            await retranscribeSelected(ids);
-          }}
-          disabled={selectedIds.size === 0 || isTranscribing}
-          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs text-cyan-400 hover:bg-cyan-900/30 hover:text-cyan-300 transition-colors disabled:opacity-30"
-          title={selectedIds.size > 0 ? `Re-transcribe ${selectedIds.size} selected` : 'Select segments to re-transcribe'}
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-          {selectedIds.size > 0 && <span>{selectedIds.size}</span>}
-        </button>
-
-        <div className="flex-1" />
-
-        {/* Bulk voice — compact dropdown style */}
-        {segments.length > 0 && (
-          <div className="flex items-center gap-1">
-            <span className="text-[10px] text-zinc-500">Voice:</span>
+          {/* Export Dropdown */}
+          <div className="relative">
             <button
-              onClick={() => handleBulkVoice('male')}
-              className="px-2 py-1 rounded text-[10px] font-medium bg-blue-900/30 text-blue-400 hover:bg-blue-900/50 transition-colors"
-              title={selectedIds.size > 0 ? `Set ${selectedIds.size} selected to Male` : 'Set all to Male'}
+              onClick={() => setShowExportDropdown(!showExportDropdown)}
+              disabled={segments.length === 0}
+              className="p-1.5 rounded-lg bg-[#1a1c24] hover:bg-[#232732] border border-[#272b36] text-zinc-300 hover:text-white transition-colors disabled:opacity-40"
+              title="Export Subtitles"
             >
-              M
+              <Download className="w-3.5 h-3.5 text-purple-400" />
             </button>
-            <button
-              onClick={() => handleBulkVoice('female')}
-              className="px-2 py-1 rounded text-[10px] font-medium bg-pink-900/30 text-pink-400 hover:bg-pink-900/50 transition-colors"
-              title={selectedIds.size > 0 ? `Set ${selectedIds.size} selected to Female` : 'Set all to Female'}
-            >
-              F
-            </button>
-            <button
-              onClick={() => handleBulkVoice('young')}
-              className="px-2 py-1 rounded text-[10px] font-medium bg-green-900/30 text-green-400 hover:bg-green-900/50 transition-colors"
-              title={selectedIds.size > 0 ? `Set ${selectedIds.size} selected to Young` : 'Set all to Young'}
-            >
-              Y
-            </button>
-            <button
-              onClick={() => handleBulkVoice('old')}
-              className="px-2 py-1 rounded text-[10px] font-medium bg-amber-900/30 text-amber-400 hover:bg-amber-900/50 transition-colors"
-              title={selectedIds.size > 0 ? `Set ${selectedIds.size} selected to Old` : 'Set all to Old'}
-            >
-              O
-            </button>
+
+            {showExportDropdown && (
+              <div className="absolute right-0 top-full mt-1.5 w-48 bg-[#1a1c24] border border-[#2d313d] rounded-xl shadow-2xl py-1 z-50 animate-in fade-in">
+                {EXPORT_FORMATS.map((item) => (
+                  <button
+                    key={item.fmt}
+                    onClick={() => handleExport(item.fmt)}
+                    className="w-full px-3 py-2 text-left hover:bg-[#252834] transition-colors flex flex-col"
+                  >
+                    <span className="text-xs font-semibold text-zinc-200">{item.label}</span>
+                    <span className="text-[10px] text-zinc-500">{item.desc}</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
-        )}
+
+          {/* Add Line */}
+          <button
+            onClick={handleAddNewSegment}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-pink-500/20 hover:bg-pink-500/30 text-pink-300 hover:text-white text-xs font-semibold border border-pink-500/40 transition-colors"
+            title="Add new subtitle line"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <span>Add</span>
+          </button>
+        </div>
       </div>
 
-      {/* Add Segment Modal */}
-      {showAddForm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={cancelAdd}>
-          <div
-            className="bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl w-full max-w-md p-5 space-y-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-white">Add New Segment</h3>
-              <button onClick={cancelAdd} className="p-1 rounded hover:bg-zinc-700 transition-colors">
-                <X className="w-4 h-4 text-zinc-400" />
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="text-[11px] text-zinc-400 uppercase tracking-wide block mb-1">Start</label>
+      {/* 2. Main Content Area */}
+      {panelTab === 'style' ? (
+        <div className="flex-1 overflow-y-auto">
+          <CaptionPropertiesPanel />
+        </div>
+      ) : (
+        <div className="flex-1 flex flex-col overflow-hidden">
+          {/* Simple Search Bar */}
+          {segments.length > 0 && (
+            <div className="px-4 py-2 border-b border-[#1b1d24] bg-[#14151a] flex items-center justify-between gap-2 shrink-0">
+              <div className="relative flex-1 flex items-center">
+                <Search className="w-3.5 h-3.5 absolute left-2.5 text-zinc-500 pointer-events-none" />
                 <input
                   type="text"
-                  value={newStart}
-                  onChange={(e) => setNewStart(e.target.value)}
-                  placeholder="00:00.00"
-                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-600 rounded-lg text-sm text-white font-mono focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30"
+                  placeholder="Search dialogue..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="w-full pl-8 pr-7 py-1 rounded-lg bg-[#181a20] border border-[#242730] text-xs text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-pink-500/60 transition-all"
                 />
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery('')}
+                    className="absolute right-2 text-zinc-400 hover:text-white"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                )}
               </div>
-              <div>
-                <label className="text-[11px] text-zinc-400 uppercase tracking-wide block mb-1">End</label>
-                <input
-                  type="text"
-                  value={newEnd}
-                  onChange={(e) => setNewEnd(e.target.value)}
-                  placeholder="00:03.00"
-                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-600 rounded-lg text-sm text-white font-mono focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30"
-                />
+
+              <div className="flex items-center gap-1 bg-[#181a20] px-2 py-1 rounded-lg border border-[#242730] shrink-0 text-[11px]">
+                <span className="text-[10px] text-zinc-500 font-mono">Sync:</span>
+                <button
+                  onClick={() => handleShiftTimestamps(-0.5)}
+                  className="px-1.5 py-0.5 rounded bg-zinc-800/60 hover:bg-zinc-700 text-zinc-300 hover:text-white font-mono transition-colors"
+                  title="Shift all captions 0.5s earlier (-0.5s)"
+                >
+                  -0.5s
+                </button>
+                <button
+                  onClick={() => handleShiftTimestamps(0.5)}
+                  className="px-1.5 py-0.5 rounded bg-zinc-800/60 hover:bg-zinc-700 text-zinc-300 hover:text-white font-mono transition-colors"
+                  title="Shift all captions 0.5s later (+0.5s)"
+                >
+                  +0.5s
+                </button>
+                <button
+                  onClick={() => handleShiftTimestamps(1.0)}
+                  className="px-1.5 py-0.5 rounded bg-zinc-800/60 hover:bg-zinc-700 text-zinc-300 hover:text-white font-mono transition-colors"
+                  title="Shift all captions 1.0s later (+1.0s)"
+                >
+                  +1.0s
+                </button>
               </div>
-            </div>
 
-            <div>
-              <label className="text-[11px] text-zinc-400 uppercase tracking-wide block mb-1">Text</label>
-              <textarea
-                value={newText}
-                onChange={(e) => setNewText(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); confirmAdd(); } if (e.key === 'Escape') cancelAdd(); }}
-                rows={3}
-                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-600 rounded-lg text-sm text-white font-khmer focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30 resize-none"
-                autoFocus
-              />
-            </div>
-
-            <div className="flex justify-end gap-2 pt-1">
               <button
-                onClick={cancelAdd}
-                className="px-4 py-2 rounded-lg text-xs font-medium text-zinc-300 bg-zinc-700 hover:bg-zinc-600 transition-colors"
+                onClick={() => deleteAllSegments()}
+                className="p-1 text-zinc-500 hover:text-red-400 transition-colors shrink-0"
+                title="Clear all captions"
               >
-                Cancel
+                <Trash2 className="w-3.5 h-3.5" />
               </button>
+            </div>
+          )}
+
+          {/* Clean Subtitle Scroll Area */}
+          <div className="flex-1 overflow-y-auto p-3 space-y-2">
+            {/* Live Progress Banner during Gap Filling */}
+            {fillGapsStatus && (
+              <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/40 flex items-center justify-between text-xs animate-in fade-in">
+                <div className="flex items-center gap-2 text-amber-200 font-semibold">
+                  {isFillingGaps ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                  ) : (
+                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  )}
+                  <span>{fillGapsStatus}</span>
+                </div>
+              </div>
+            )}
+
+            {/* Live Progress Banner during Generation */}
+            {isTranscribing && (
+              <div className="p-3 rounded-xl bg-purple-950/40 border border-purple-500/40 flex flex-col gap-1.5 animate-in fade-in">
+                <div className="flex items-center justify-between text-xs">
+                  <div className="flex items-center gap-2 text-purple-200 font-semibold">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-purple-400" />
+                    <span>Transcribing Speech...</span>
+                  </div>
+                  <span className="font-mono text-pink-300 font-bold">
+                    {transcribeChunkInfo ? `Part ${transcribeChunkInfo.current}/${transcribeChunkInfo.total} · ` : ''}
+                    {transcribePercent || 0}%
+                  </span>
+                </div>
+                <div className="w-full bg-black/40 h-1.5 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-purple-500 to-pink-500 rounded-full transition-all duration-300"
+                    style={{ width: `${Math.max(5, transcribePercent || 0)}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Live Translation Progress */}
+            {isTranslating && translationProgress && (
+              <div className="p-3.5 rounded-xl bg-gradient-to-r from-blue-950/80 to-indigo-950/80 border border-blue-500/50 flex flex-col gap-2 shadow-lg animate-in fade-in">
+                <div className="flex items-center justify-between text-xs">
+                  <div className="flex items-center gap-2 text-blue-200 font-bold">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
+                    <span>Translating Segment {translationProgress.current} of {translationProgress.total}</span>
+                  </div>
+                  <span className="font-mono text-blue-300 font-bold">
+                    {translationProgress.percent}%
+                  </span>
+                </div>
+                <div className="w-full bg-black/50 h-2 rounded-full overflow-hidden border border-blue-500/30">
+                  <div
+                    className="h-full bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500 rounded-full transition-all duration-300 ease-out"
+                    style={{ width: `${Math.max(5, translationProgress.percent)}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Empty State */}
+            {displayedSegments.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-2 text-zinc-500">
+                <Sparkles className="w-8 h-8 text-pink-400/80 mb-1" />
+                <h4 className="text-sm font-semibold text-zinc-300">No Captions</h4>
+                <p className="text-xs max-w-xs leading-relaxed text-zinc-400">
+                  Click <strong className="text-pink-400">"Generate Captions"</strong> below to create AI subtitles with voice timing.
+                </p>
+              </div>
+            ) : (
+              /* Clean Minimal Cards */
+              displayedSegments.map((seg, idx) => {
+                const isActive = activeSegmentId === seg.id;
+                const isEditing = editingId === seg.id;
+                const isThisTranslating =
+                  (isTranslating && translationProgress?.segmentId === seg.id) ||
+                  singleTranslatingId === seg.id;
+
+                return (
+                  <div
+                    key={seg.id}
+                    id={`seg-${seg.id}`}
+                    ref={isActive ? activeRef : undefined}
+                    onClick={() => seekToSegment(seg)}
+                    className={`p-3 rounded-xl border transition-all cursor-pointer group relative ${
+                      isThisTranslating
+                        ? 'bg-[#151928] border-blue-500/80 shadow-lg ring-1 ring-blue-500/50 animate-pulse'
+                        : isActive
+                        ? 'bg-[#1a1c26] border-pink-500/60 shadow-md ring-1 ring-pink-500/30'
+                        : 'bg-[#14161c] border-[#1e212a] hover:border-zinc-700 hover:bg-[#161820]'
+                    }`}
+                  >
+                    {/* Active Left Indicator Bar */}
+                    {isActive && (
+                      <div className="absolute left-0 top-2 bottom-2 w-1 bg-pink-500 rounded-r" />
+                    )}
+
+                    {/* Top Row: Line Index (#1), Exact Time Range, Speaker Name + Action Buttons */}
+                    <div className="flex items-center justify-between text-[11px] font-mono mb-2">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {/* Line Index (#1) */}
+                        <span className="text-pink-400 font-bold text-xs">#{idx + 1}</span>
+
+                        {/* Exact Time Range (00:04 - 00:07) */}
+                        <span className="text-zinc-200 font-medium px-2 py-0.5 rounded bg-black/40 border border-zinc-800 text-[11px]">
+                          {formatTime(seg.start_time)} - {formatTime(seg.end_time)}
+                        </span>
+
+                        {/* Speaker Name */}
+                        <span className="px-2 py-0.5 rounded-full bg-purple-950/60 text-purple-300 border border-purple-800/40 text-[10px] font-semibold flex items-center gap-1">
+                          <User className="w-2.5 h-2.5 text-purple-400" />
+                          <span>{seg.speaker || 'Speaker 1'}</span>
+                        </span>
+
+                        {isThisTranslating && (
+                          <span className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 border border-blue-500/40 font-semibold animate-pulse">
+                            <Loader2 className="w-2.5 h-2.5 animate-spin" /> Translating...
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Action Buttons: Re-translate, Edit, Delete */}
+                      <div className="flex items-center gap-1 opacity-70 group-hover:opacity-100 transition-opacity bg-black/30 p-0.5 rounded-lg border border-zinc-800">
+                        {/* Re-translate this line */}
+                        <button
+                          onClick={(e) => handleTranslateSingleLine(seg.id, e)}
+                          disabled={isThisTranslating}
+                          className="p-1 rounded text-zinc-400 hover:text-blue-400 hover:bg-zinc-800 transition-colors disabled:opacity-40"
+                          title={`Re-translate this line into ${selectedLanguage.name}`}
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                        </button>
+
+                        {/* Edit text */}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleStartEdit(seg);
+                          }}
+                          className="p-1 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
+                          title="Edit text"
+                        >
+                          <Pencil className="w-3 h-3" />
+                        </button>
+
+                        {/* Delete line */}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteSegment(seg.id);
+                          }}
+                          className="p-1 rounded text-zinc-500 hover:text-red-400 hover:bg-zinc-800 transition-colors"
+                          title="Delete line"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Dialogue Text / Inline Edit */}
+                    {isEditing ? (
+                      <div className="space-y-1.5 mt-1" onClick={(e) => e.stopPropagation()}>
+                        <textarea
+                          value={editText}
+                          onChange={(e) => setEditText(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleSaveEdit();
+                            if (e.key === 'Escape') setEditingId(null);
+                          }}
+                          rows={2}
+                          className="w-full bg-[#1b1e28] border border-pink-500 rounded-lg p-2 text-xs text-white font-khmer focus:outline-none"
+                          autoFocus
+                        />
+                        <div className="flex justify-end gap-1.5">
+                          <button
+                            onClick={() => setEditingId(null)}
+                            className="px-2 py-0.5 rounded bg-zinc-800 text-[11px] text-zinc-300"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            onClick={handleSaveEdit}
+                            className="px-2.5 py-0.5 rounded bg-pink-600 text-[11px] font-bold text-white"
+                          >
+                            Save
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-1">
+                        {seg.original_text && seg.original_text.trim() !== seg.text.trim() && (
+                          <p className="text-[11px] text-zinc-400 font-sans select-text line-clamp-2 opacity-80">
+                            {seg.original_text}
+                          </p>
+                        )}
+                        <p
+                          onDoubleClick={() => handleStartEdit(seg)}
+                          className="text-xs text-zinc-100 font-khmer leading-relaxed select-text"
+                        >
+                          {seg.text}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {/* 3. Pinned Bottom Action Dock: Clean & Direct */}
+          <div className="p-3 border-t border-[#1f222a] bg-[#14161c] flex items-center justify-between gap-2 shrink-0">
+            {/* Language Selector */}
+            <div className="relative">
               <button
-                onClick={confirmAdd}
-                className="px-4 py-2 rounded-lg text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 transition-colors"
+                onClick={() => setShowLangDropdown(!showLangDropdown)}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#1a1c24] border border-[#272b36] hover:border-zinc-600 text-xs font-semibold text-white transition-colors"
               >
-                Add Segment
+                <span>{selectedLanguage.flag}</span>
+                <span>{selectedLanguage.name}</span>
+                <ChevronDown className="w-3.5 h-3.5 text-zinc-400" />
+              </button>
+
+              {showLangDropdown && (
+                <div className="absolute bottom-full left-0 mb-1.5 w-48 bg-[#1a1c24] border border-[#2d313d] rounded-xl shadow-2xl py-1 z-50">
+                  {SUPPORTED_LANGUAGES.map((lang) => (
+                    <button
+                      key={lang.id}
+                      onClick={() => {
+                        setSelectedLanguage(lang);
+                        setShowLangDropdown(false);
+                      }}
+                      className={`w-full px-3 py-1.5 text-left text-xs flex items-center justify-between hover:bg-[#252834] transition-colors ${
+                        selectedLanguage.id === lang.id ? 'text-pink-400 font-bold bg-[#222530]' : 'text-zinc-300'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span>{lang.flag}</span>
+                        <span>{lang.name}</span>
+                      </div>
+                      {selectedLanguage.id === lang.id && <Check className="w-3.5 h-3.5 text-pink-400" />}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Primary Action Button */}
+            <div className="flex items-center gap-2">
+              {segments.length > 0 && selectedLanguage.id !== 'auto' && (
+                <button
+                  onClick={handleTranslateAll}
+                  disabled={isTranslating}
+                  className={`relative overflow-hidden flex items-center gap-1.5 px-4 py-2 rounded-xl text-white text-xs font-bold shadow-md transition-all ${
+                    isTranslating
+                      ? 'bg-[#151928] border border-blue-500/60 ring-1 ring-blue-500/40 min-w-[200px]'
+                      : 'bg-blue-600 hover:bg-blue-500'
+                  }`}
+                  title="Translate all captions"
+                >
+                  {isTranslating && (
+                    <div
+                      className="absolute inset-0 bg-gradient-to-r from-blue-600 to-indigo-600 transition-all duration-300 ease-out opacity-85"
+                      style={{ width: `${Math.max(6, translationProgress?.percent || 0)}%` }}
+                    />
+                  )}
+                  <div className="relative z-10 flex items-center gap-1.5 w-full justify-center">
+                    {isTranslating ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Translating {translationProgress?.current || 0}/{translationProgress?.total || segments.length} ({translationProgress?.percent || 0}%)</span>
+                      </>
+                    ) : (
+                      <>
+                        <Languages className="w-3.5 h-3.5" />
+                        <span>Translate to {selectedLanguage.name.split(' ')[0]}</span>
+                      </>
+                    )}
+                  </div>
+                </button>
+              )}
+
+              {segments.length > 0 && (
+                <button
+                  onClick={handleFillMissingGaps}
+                  disabled={isFillingGaps || isTranscribing}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 hover:text-white border border-amber-500/40 text-xs font-bold shadow-md transition-all disabled:opacity-50"
+                  title="Scan and generate captions only for blank/missed gaps in video"
+                >
+                  {isFillingGaps ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Filling Gaps...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Fill Gaps</span>
+                    </>
+                  )}
+                </button>
+              )}
+
+              <button
+                onClick={() => {
+                  if (currentProject?.id) generateTranscript(selectedLanguage.id);
+                }}
+                disabled={isTranscribing}
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 text-white text-xs font-bold shadow-md transition-all disabled:opacity-50"
+              >
+                {isTranscribing ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Transcribing ({transcribePercent || 0}%)</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Generate Captions</span>
+                  </>
+                )}
               </button>
             </div>
           </div>
         </div>
       )}
-
-      {/* Table */}
-      <div className="flex-1 overflow-auto">
-        {segments.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-zinc-500 px-6 py-8">
-            <div className="text-3xl mb-3 opacity-30">📝</div>
-            <p className="text-sm font-medium text-zinc-400 mb-1">No subtitles yet</p>
-            <p className="text-xs text-center text-zinc-600 max-w-[260px] leading-relaxed">
-              {!currentProject?.video_filename 
-                ? 'Upload a video first, then click Transcribe in the timeline toolbar to generate subtitles automatically.'
-                : 'Click the Transcribe button in the timeline toolbar below, or use Add to create subtitles manually.'}
-            </p>
-            {!currentProject?.video_filename ? null : (
-              <button
-                onClick={handleAddText}
-                className="mt-3 flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white transition-colors"
-              >
-                <Plus className="w-3.5 h-3.5" /> Add manually
-              </button>
-            )}
-          </div>
-        ) : (
-          <table className="w-full text-sm">
-            <thead className="sticky top-0 bg-zinc-900/95 z-10">
-              <tr className="border-b border-zinc-800">
-                <th className="w-10 px-2 py-2.5">
-                  <input
-                    type="checkbox"
-                    checked={selectedIds.size === segments.length && segments.length > 0}
-                    onChange={toggleSelectAll}
-                    className="accent-khmer-500 w-3.5 h-3.5 cursor-pointer"
-                  />
-                </th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-                  Start
-                </th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-                  End
-                </th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-                  Khmer Text (Editable)
-                </th>
-                <th className="px-3 py-2.5 text-center text-[11px] font-semibold text-zinc-400 uppercase tracking-wider w-[120px]">
-                  Voice Profile
-                </th>
-                <th className="px-3 py-2.5 text-center text-[11px] font-semibold text-zinc-400 uppercase tracking-wider w-[150px]">
-                  AI Voice
-                </th>
-                <th className="px-3 py-2.5 text-center text-[11px] font-semibold text-zinc-400 uppercase tracking-wider w-[90px]">
-                  Speed
-                </th>
-                <th className="px-3 py-2.5 text-center text-[11px] font-semibold text-zinc-400 uppercase tracking-wider w-[80px]">
-                  Audio Status
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {segments.map((seg) => {
-                const isActive = seg.id === activeSegmentId;
-                const isEditing = seg.id === editingId;
-                const isSelected = selectedIds.has(seg.id);
-
-                return (
-                  <tr
-                    key={seg.id}
-                    ref={isActive ? activeRef : undefined}
-                    className={`border-b border-zinc-800/50 cursor-pointer transition-colors ${
-                      isActive
-                        ? 'bg-indigo-900/20 border-l-2 border-l-indigo-500'
-                        : isSelected
-                        ? 'bg-zinc-800/40'
-                        : 'hover:bg-zinc-800/30'
-                    }`}
-                    onClick={() => {
-                      if (!isEditing) {
-                        setActiveSegment(seg.id);
-                        seekTo(seg.start_time);
-                      }
-                    }}
-                  >
-                    {/* Checkbox */}
-                    <td className="px-2 py-2 text-center" onClick={(e) => e.stopPropagation()}>
-                      <input
-                        type="checkbox"
-                        checked={isSelected}
-                        onChange={() => toggleSelect(seg.id)}
-                        className="accent-khmer-500 w-3.5 h-3.5 cursor-pointer"
-                      />
-                    </td>
-
-                    {/* Start Time */}
-                    <td className="px-3 py-2">
-                      {isEditing ? (
-                        <input
-                          type="text"
-                          value={editStart}
-                          onChange={(e) => setEditStart(e.target.value)}
-                          onClick={(e) => e.stopPropagation()}
-                          className="w-20 px-1.5 py-1 bg-zinc-800 border border-zinc-600 rounded text-xs text-white font-mono focus:outline-none focus:border-khmer-500"
-                        />
-                      ) : (
-                        <span className="text-xs font-mono text-khmer-400">
-                          {formatTime(seg.start_time)}
-                        </span>
-                      )}
-                    </td>
-
-                    {/* End Time */}
-                    <td className="px-3 py-2">
-                      {isEditing ? (
-                        <input
-                          type="text"
-                          value={editEnd}
-                          onChange={(e) => setEditEnd(e.target.value)}
-                          onClick={(e) => e.stopPropagation()}
-                          className="w-20 px-1.5 py-1 bg-zinc-800 border border-zinc-600 rounded text-xs text-white font-mono focus:outline-none focus:border-khmer-500"
-                        />
-                      ) : (
-                        <span className="text-xs font-mono text-zinc-400">
-                          {formatTime(seg.end_time)}
-                        </span>
-                      )}
-                    </td>
-
-                    {/* Khmer Text */}
-                    <td className="px-3 py-2">
-                      {isEditing ? (
-                        <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-                          <input
-                            type="text"
-                            value={editText}
-                            onChange={(e) => setEditText(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') saveEdit();
-                              if (e.key === 'Escape') cancelEdit();
-                            }}
-                            className="flex-1 px-2 py-1 bg-zinc-800 border border-zinc-600 rounded text-sm text-white font-khmer focus:outline-none focus:border-khmer-500"
-                            autoFocus
-                          />
-                          <button
-                            onClick={saveEdit}
-                            className="p-1 bg-green-800/50 hover:bg-green-700/50 rounded"
-                          >
-                            <Check className="w-3.5 h-3.5 text-green-400" />
-                          </button>
-                          <button
-                            onClick={cancelEdit}
-                            className="p-1 bg-zinc-700 hover:bg-zinc-600 rounded"
-                          >
-                            <X className="w-3.5 h-3.5 text-zinc-400" />
-                          </button>
-                        </div>
-                      ) : (
-                        <span
-                          className="text-sm text-zinc-200 font-khmer leading-relaxed block"
-                          onDoubleClick={(e) => {
-                            e.stopPropagation();
-                            startEdit(seg);
-                          }}
-                        >
-                          {seg.text}
-                        </span>
-                      )}
-                    </td>
-
-                    {/* Voice Profile */}
-                    <td className="px-3 py-2 text-center" onClick={(e) => e.stopPropagation()}>
-                      <select
-                        value={seg.voice_profile || 'female'}
-                        onChange={(e) => handleVoiceChange(seg.id, e.target.value)}
-                        className={`px-2 py-1 rounded-md text-xs font-medium border cursor-pointer appearance-none text-center ${
-                          (seg.voice_profile || 'female') === 'female'
-                            ? 'bg-pink-900/30 text-pink-300 border-pink-800/50'
-                            : 'bg-blue-900/30 text-blue-300 border-blue-800/50'
-                        }`}
-                        style={{ minWidth: '80px' }}
-                      >
-                        <option value="female">Female</option>
-                        <option value="male">Male</option>
-                      </select>
-                    </td>
-
-                    {/* AI Voice */}
-                    <td className="px-3 py-2 text-center" onClick={(e) => e.stopPropagation()}>
-                      <select
-                        value={seg.voice_name || ''}
-                        onChange={(e) => handleVoiceNameChange(seg.id, e.target.value)}
-                        className="px-1.5 py-1 rounded-md text-xs font-medium border cursor-pointer appearance-none text-center bg-violet-900/20 text-violet-300 border-violet-800/40"
-                        style={{ minWidth: '130px' }}
-                      >
-                        {VOICE_OPTIONS
-                          .filter((v) => !v.gender || v.gender === ((seg.voice_profile || 'female') === 'female' ? 'F' : 'M'))
-                          .map((v) => (
-                          <option key={v.id} value={v.id}>
-                            {v.label}
-                          </option>
-                        ))}
-                      </select>
-                    </td>
-
-                    {/* Speed */}
-                    <td className="px-3 py-2 text-center" onClick={(e) => e.stopPropagation()}>
-                      <select
-                        value={seg.audio_speed || 1.0}
-                        onChange={(e) => handleSpeedChange(seg.id, parseFloat(e.target.value))}
-                        className="px-1.5 py-1 rounded-md text-xs font-medium border cursor-pointer appearance-none text-center bg-zinc-800/60 text-zinc-300 border-zinc-700/60"
-                        style={{ minWidth: '65px' }}
-                      >
-                        <option value={0.5}>0.5x</option>
-                        <option value={0.75}>0.75x</option>
-                        <option value={1.0}>1.0x</option>
-                        <option value={1.25}>1.25x</option>
-                        <option value={1.5}>1.5x</option>
-                        <option value={1.75}>1.75x</option>
-                        <option value={2.0}>2.0x</option>
-                      </select>
-                    </td>
-
-                    {/* Audio Status */}
-                    <td className="px-3 py-2 text-center">
-                      <button
-                        className={`p-1.5 rounded-md transition-colors mx-auto ${
-                          seg.audio_url
-                            ? 'hover:bg-emerald-900/30 bg-emerald-900/10'
-                            : 'hover:bg-zinc-700'
-                        }`}
-                        title={seg.audio_url ? 'AI audio generated - click to play' : 'No AI audio - click to play original'}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setActiveSegment(seg.id);
-                          seekTo(seg.start_time);
-                          videoRef.current?.play();
-                        }}
-                      >
-                        <Volume2 className={`w-4 h-4 ${seg.audio_url ? 'text-emerald-400' : 'text-zinc-500'}`} />
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
     </div>
   );
 }

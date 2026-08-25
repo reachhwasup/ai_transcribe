@@ -51,6 +51,13 @@ export async function generateTranscript(projectId: string, language = 'km'): Pr
   return data;
 }
 
+export interface TranscribeProgressEvent {
+  message: string;
+  percent: number;
+  currentChunk: number;
+  totalChunks: number;
+}
+
 // Streaming transcription via SSE
 export function generateTranscriptStream(
   projectId: string,
@@ -58,7 +65,7 @@ export function generateTranscriptStream(
   onSegment: (segment: Segment) => void,
   onDone: (total: number) => void,
   onError: (error: string) => void,
-  onProgress?: (message: string) => void,
+  onProgress?: (progress: TranscribeProgressEvent) => void,
 ): AbortController {
   const controller = new AbortController();
 
@@ -106,7 +113,12 @@ export function generateTranscriptStream(
                 updated_at: new Date().toISOString(),
               });
             } else if (evt.type === 'progress') {
-              onProgress?.(evt.message);
+              onProgress?.({
+                message: evt.message || '',
+                percent: evt.percent || 0,
+                currentChunk: evt.current_chunk || 0,
+                totalChunks: evt.total_chunks || 0,
+              });
             } else if (evt.type === 'done') {
               onDone(evt.total_segments);
             } else if (evt.type === 'error') {
@@ -137,6 +149,17 @@ export async function deleteSegment(projectId: string, segmentId: string): Promi
   await api.delete(`/projects/${projectId}/transcripts/${segmentId}`);
 }
 
+export async function deleteAllSegments(projectId: string): Promise<void> {
+  await api.delete(`/projects/${projectId}/transcripts/all`);
+}
+
+export async function rechunkSegments(projectId: string, wordsPerSegment: number): Promise<Segment[]> {
+  const { data } = await api.post(`/projects/${projectId}/transcripts/rechunk`, {
+    words_per_segment: wordsPerSegment,
+  });
+  return data;
+}
+
 export async function addSegment(projectId: string, segment: Partial<Segment>): Promise<Segment> {
   const { data } = await api.post(`/projects/${projectId}/transcripts/`, segment);
   return data;
@@ -156,12 +179,112 @@ export async function bulkUpdateVoice(
 }
 
 // Translate segments to target language
-export async function translateSegments(projectId: string, language: string): Promise<Array<{ id: string; start_time: number; end_time: number; text: string; speaker: string }>> {
-  const { data } = await api.post(`/projects/${projectId}/transcripts/translate`, { language });
+export interface TranslateProgressEvent {
+  current: number;
+  total: number;
+  percent: number;
+  segmentId?: string;
+}
+
+export function translateSegmentsStream(
+  projectId: string,
+  language: string = 'km',
+  segmentIds?: string[],
+  onProgress?: (progress: TranslateProgressEvent) => void,
+  onSegmentUpdated?: (segment: Segment) => void,
+  onDone?: (total: number) => void,
+  onError?: (error: string) => void,
+): AbortController {
+  const controller = new AbortController();
+
+  fetch(`/api/projects/${projectId}/transcripts/translate-stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ language, segment_ids: segmentIds || null }),
+    signal: controller.signal,
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        const text = await response.text();
+        onError?.(text || 'Translation failed');
+        return;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        onError?.('No response stream');
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const payload = line.slice(6);
+          try {
+            const evt = JSON.parse(payload);
+            if (evt.type === 'segment_updated') {
+              if (evt.segment) {
+                onSegmentUpdated?.(evt.segment);
+              }
+              onProgress?.({
+                current: evt.current,
+                total: evt.total,
+                percent: evt.percent,
+                segmentId: evt.segment?.id,
+              });
+            } else if (evt.type === 'progress') {
+              onProgress?.({
+                current: evt.current,
+                total: evt.total,
+                percent: evt.percent,
+                segmentId: evt.segment_id,
+              });
+            } else if (evt.type === 'done') {
+              onDone?.(evt.total);
+            } else if (evt.type === 'error') {
+              onError?.(evt.message);
+            }
+          } catch {
+            // skip malformed lines
+          }
+        }
+      }
+    })
+    .catch((err) => {
+      if (err.name !== 'AbortError') {
+        onError?.(err.message || 'Stream connection failed');
+      }
+    });
+
+  return controller;
+}
+
+export async function translateSegments(
+  projectId: string,
+  language: string,
+  segmentIds?: string[],
+): Promise<Array<{ id: string; start_time: number; end_time: number; text: string; speaker: string }>> {
+  const { data } = await api.post(`/projects/${projectId}/transcripts/translate`, {
+    language,
+    segment_ids: segmentIds || null,
+  });
   return data;
 }
 
-// Re-transcribe only selected segments
+export async function sanitizeProjectTimeline(projectId: string): Promise<Segment[]> {
+  const { data } = await api.post(`/projects/${projectId}/transcripts/sanitize-timeline`);
+  return data;
+}
 export async function retranscribeSelected(
   projectId: string,
   segmentIds: string[],
@@ -214,10 +337,11 @@ export async function generateNarration(
   projectId: string,
   language: string,
   style: string,
+  promptHint?: string,
 ): Promise<{ segments: NarrationSegment[]; style: string; language: string }> {
   const { data } = await api.post(
     `/projects/${projectId}/transcripts/generate-narration`,
-    { language, style },
+    { language, style, prompt_hint: promptHint || '' },
     // Long videos take Gemini a while to analyze — allow up to 15 minutes
     { timeout: 900000 },
   );
@@ -232,6 +356,68 @@ export async function applyNarration(
   const { data } = await api.post(
     `/projects/${projectId}/transcripts/apply-narration`,
     { segments, voice_profile: voiceProfile },
+    { timeout: 60000 },
+  );
+  return data;
+}
+
+export interface ViralTitleItem {
+  category: string;
+  category_label: string;
+  title: string;
+  description: string;
+}
+
+export interface ScriptBlockItem {
+  time_range: string;
+  start_time: number;
+  end_time: number;
+  block_name: string;
+  visual: string;
+  text_on_screen: string;
+  sound_effect?: string;
+  voiceover: string;
+  voiceover_tone?: string;
+}
+
+export interface SocialMediaScriptResult {
+  title?: string;
+  total_duration?: string;
+  tone?: string;
+  bgm_suggestion?: string;
+  hook: string;
+  synopsis: string;
+  call_to_action: string;
+  blocks?: ScriptBlockItem[];
+  titles?: string[];
+  description?: string;
+  hashtags: string[];
+  seo_tags?: string[];
+  full_post: string;
+  full_script_markdown?: string;
+}
+
+export async function suggestMovieTitles(
+  projectId: string,
+  originalTitle?: string,
+  language?: string,
+): Promise<{ original_title: string; titles: ViralTitleItem[] }> {
+  const { data } = await api.post(
+    `/projects/${projectId}/transcripts/suggest-titles`,
+    { original_title: originalTitle || '', language: language || 'km' },
+    { timeout: 60000 },
+  );
+  return data;
+}
+
+export async function generateSocialMediaScript(
+  projectId: string,
+  originalTitle?: string,
+  language?: string,
+): Promise<SocialMediaScriptResult> {
+  const { data } = await api.post(
+    `/projects/${projectId}/transcripts/generate-social-script`,
+    { original_title: originalTitle || '', language: language || 'km' },
     { timeout: 60000 },
   );
   return data;
@@ -263,14 +449,14 @@ export async function fetchPlatforms(projectId: string): Promise<Record<string, 
   return data;
 }
 
-// Video export for platform
+// Video export for platform with real-time SSE progress
 export async function exportVideoForPlatform(
   projectId: string,
   platform: string,
   startTime?: number,
   endTime?: number,
   includeSubtitles?: boolean,
-  onProgress?: (pct: number) => void,
+  onProgress?: (pct: number, message?: string) => void,
   includeVoice?: boolean,
   splitDuration?: number,
   subtitleLanguage?: string,
@@ -278,35 +464,105 @@ export async function exportVideoForPlatform(
   scaleMode?: string,
   subtitleStyle?: import('../types/subtitleStyle').SubtitleStyle,
   backgroundAudio?: string,
-): Promise<Blob> {
-  const { data } = await api.post(
-    `/projects/${projectId}/export/video`,
-    {
-      platform,
-      start_time: startTime ?? null,
-      end_time: endTime ?? null,
-      include_subtitles: includeSubtitles ?? false,
-      include_voice: includeVoice ?? false,
-      mute_original_audio: muteOriginalAudio ?? false,
-      background_audio: backgroundAudio || 'original',
-      split_duration: splitDuration ?? null,
-      subtitle_language: subtitleLanguage || null,
-      scale_mode: scaleMode || 'fit',
-      subtitle_size_pct: subtitleStyle?.sizePct ?? 4,
-      subtitle_position: subtitleStyle?.position || 'bottom',
-      subtitle_style: subtitleStyle ?? null,
-    },
-    {
-      responseType: 'blob',
-      timeout: 600000,
-      onDownloadProgress: (e) => {
-        if (onProgress && e.total) {
-          onProgress(Math.round((e.loaded * 100) / e.total));
-        }
+): Promise<{ blob: Blob; filename?: string }> {
+  const payload = {
+    platform,
+    start_time: startTime ?? null,
+    end_time: endTime ?? null,
+    include_subtitles: includeSubtitles ?? false,
+    include_voice: includeVoice ?? false,
+    mute_original_audio: muteOriginalAudio ?? false,
+    background_audio: backgroundAudio || 'original',
+    split_duration: splitDuration ?? null,
+    subtitle_language: subtitleLanguage || null,
+    scale_mode: scaleMode || 'fit',
+    subtitle_size_pct: subtitleStyle?.sizePct ?? 4,
+    subtitle_position: subtitleStyle?.position || 'bottom',
+    subtitle_style: subtitleStyle ?? null,
+  };
+
+  try {
+    const response = await fetch(`/api/projects/${projectId}/export/video-stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
       },
-    },
-  );
-  return data;
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(errText || 'Failed to start video rendering');
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('Unable to read video stream');
+    }
+
+    const decoder = new TextDecoder();
+    let downloadUrl = '';
+    let finalFilename = '';
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('data:')) {
+          try {
+            const data = JSON.parse(trimmed.slice(5).trim());
+            if (data.type === 'progress') {
+              onProgress?.(data.percent || 0, data.message);
+            } else if (data.type === 'done') {
+              onProgress?.(100, data.message || 'Video successfully rendered!');
+              downloadUrl = data.download_url;
+              finalFilename = data.filename;
+            } else if (data.type === 'error') {
+              throw new Error(data.message || 'Rendering failed');
+            }
+          } catch (err: any) {
+            if (err.message && !err.message.includes('JSON')) {
+              throw err;
+            }
+          }
+        }
+      }
+    }
+
+    if (!downloadUrl) {
+      throw new Error('Render finished without download URL');
+    }
+
+    const fileRes = await fetch(downloadUrl);
+    if (!fileRes.ok) {
+      throw new Error('Failed to download rendered video file');
+    }
+    const blob = await fileRes.blob();
+    return { blob, filename: finalFilename };
+  } catch (streamErr: any) {
+    console.warn('Streaming video export error, falling back to direct endpoint:', streamErr);
+    const { data } = await api.post(
+      `/projects/${projectId}/export/video`,
+      payload,
+      {
+        responseType: 'blob',
+        timeout: 600000,
+        onDownloadProgress: (e) => {
+          if (onProgress && e.total) {
+            onProgress(Math.round((e.loaded * 100) / e.total), 'Downloading video...');
+          }
+        },
+      },
+    );
+    return { blob: data };
+  }
 }
 
 // Video cut/trim (in-place, replaces project video)
@@ -393,6 +649,22 @@ export async function cropVideo(
 ): Promise<VideoToolResult> {
   const { data } = await api.post(
     `/projects/${projectId}/export/crop`,
+    { x, y, width, height },
+    { timeout: 600000 },
+  );
+  return data;
+}
+
+// Video blur region (in-place) — e.g. to hide a logo/watermark
+export async function blurVideoRegion(
+  projectId: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): Promise<VideoToolResult> {
+  const { data } = await api.post(
+    `/projects/${projectId}/export/blur-region`,
     { x, y, width, height },
     { timeout: 600000 },
   );
@@ -629,6 +901,212 @@ export async function updateVideoClip(
   const { data } = await api.patch(
     `/projects/${projectId}/export/clips/${clipId}`,
     { source_start, source_end },
+  );
+  return data;
+}
+
+export async function reorderVideoClips(
+  projectId: string,
+  clipIds: string[],
+): Promise<VideoClip[]> {
+  const { data } = await api.put(
+    `/projects/${projectId}/export/clips/reorder`,
+    { clip_ids: clipIds },
+  );
+  return data;
+}
+
+export async function addVideoClip(
+  projectId: string,
+  source_start: number,
+  source_end: number,
+  index?: number,
+): Promise<VideoClip[]> {
+  const { data } = await api.post(
+    `/projects/${projectId}/export/clips/add`,
+    { source_start, source_end, index },
+  );
+  return data;
+}
+
+export async function appendVideoFileToTimeline(
+  projectId: string,
+  file: File,
+): Promise<VideoClip[]> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const { data } = await api.post(
+    `/projects/${projectId}/export/clips/append-file`,
+    formData,
+    { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 600000 },
+  );
+  return data;
+}
+
+// --- Meatika AI Agent & Direct TTS ---
+
+export async function askAiAgent(
+  projectId: string,
+  action: string,
+  prompt: string = '',
+): Promise<{ action: string; content: string }> {
+  const { data } = await api.post(`/projects/${projectId}/transcripts/ai-agent`, {
+    action,
+    prompt,
+  });
+  return data;
+}
+
+export async function generateTtsPreview(
+  projectId: string,
+  options: {
+    text: string;
+    voice_profile?: string;
+    voice_name?: string;
+    speed?: number;
+    emotion?: string;
+    engine?: string;
+    reference_audio?: string;
+    sample_audio_url?: string;
+  },
+): Promise<{
+  audio_url: string;
+  duration: number;
+  text: string;
+  voice_name: string;
+  voice_profile: string;
+}> {
+  const { data } = await api.post(`/projects/${projectId}/transcripts/tts-preview`, options);
+  return data;
+}
+
+export async function generateTtsDirect(
+  projectId: string,
+  options: {
+    text: string;
+    voice_profile?: string;
+    voice_name?: string;
+    speed?: number;
+    start_time?: number;
+    speaker?: string;
+    audio_url?: string;
+    duration?: number;
+    emotion?: string;
+    engine?: string;
+    reference_audio?: string;
+    sample_audio_url?: string;
+  },
+): Promise<Segment> {
+  const { data } = await api.post(`/projects/${projectId}/transcripts/tts-direct`, options);
+  return data;
+}
+
+// Voice Profiles & Custom Voices API
+export interface VoiceProfileItem {
+  id: string;
+  name: string;
+  gender: 'female' | 'male' | 'child_boy' | 'child_girl' | 'grandpa' | 'grandma' | 'child' | 'elderly' | string;
+  voice_name: string;
+  engine: 'edge-tts' | 'voxcpm';
+  language: string;
+  pitch: string;
+  rate: string;
+  emotion: string;
+  description: string;
+  sample_audio_url?: string;
+  is_built_in: boolean;
+  created_at?: string;
+}
+
+export interface VoiceProfileCreate {
+  name: string;
+  gender: string;
+  voice_name: string;
+  engine: string;
+  language: string;
+  pitch?: string;
+  rate?: string;
+  emotion?: string;
+  description?: string;
+  sample_audio_url?: string;
+}
+
+export interface VoiceProfileUpdate {
+  name?: string;
+  gender?: string;
+  voice_name?: string;
+  engine?: string;
+  language?: string;
+  pitch?: string;
+  rate?: string;
+  emotion?: string;
+  description?: string;
+  sample_audio_url?: string;
+}
+
+export async function fetchVoiceProfiles(): Promise<VoiceProfileItem[]> {
+  const { data } = await api.get('/settings/voice-profiles');
+  return data;
+}
+
+export async function createVoiceProfile(profile: VoiceProfileCreate): Promise<VoiceProfileItem> {
+  const { data } = await api.post('/settings/voice-profiles', profile);
+  return data;
+}
+
+export async function updateVoiceProfile(profileId: string, updates: VoiceProfileUpdate): Promise<VoiceProfileItem> {
+  const { data } = await api.patch(`/settings/voice-profiles/${profileId}`, updates);
+  return data;
+}
+
+export async function deleteVoiceProfile(profileId: string): Promise<void> {
+  await api.delete(`/settings/voice-profiles/${profileId}`);
+}
+
+export async function generateVoiceSample(req: {
+  text?: string;
+  voice_name?: string;
+  voice_profile?: string;
+  engine?: string;
+  language?: string;
+  pitch?: string;
+  rate?: string;
+  emotion?: string;
+  sample_audio_url?: string;
+}): Promise<{ ok: boolean; audio_url: string; text: string }> {
+  const { data } = await api.post('/settings/voice-profiles/test-sample', req);
+  return data;
+}
+
+export async function uploadVoiceSampleAudio(file: File): Promise<{ ok: boolean; audio_url: string; filename: string }> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const { data } = await api.post('/settings/voice-profiles/upload-sample', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+  return data;
+}
+
+export async function shiftProjectTimestamps(
+  projectId: string,
+  offsetSeconds: number,
+  segmentIds?: string[]
+): Promise<Segment[]> {
+  const { data } = await api.post(`/projects/${projectId}/transcripts/shift-timestamps`, {
+    offset: offsetSeconds,
+    segment_ids: segmentIds,
+  });
+  return data;
+}
+
+export async function fillMissingCaptions(
+  projectId: string,
+  minGapSeconds: number = 1.5,
+): Promise<{ message: string; gaps_detected: number; captions_generated: number }> {
+  const { data } = await api.post(
+    `/projects/${projectId}/transcripts/fill-missing-captions`,
+    { min_gap: minGapSeconds },
+    { timeout: 600000 },
   );
   return data;
 }

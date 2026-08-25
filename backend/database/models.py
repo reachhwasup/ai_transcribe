@@ -18,6 +18,9 @@ class Project(Base):
     video_filename = Column(String(500), default="")
     video_path = Column(String(1000), default="")
     audio_path = Column(String(1000), default="")
+    # Lightweight 720p proxy for the editor preview player (see generate_preview).
+    preview_path = Column(String(1000), default="")
+    preview_status = Column(String(20), default="none")  # none, generating, ready, error
     duration = Column(Float, default=0.0)
     status = Column(String(50), default="created")  # created, uploading, transcribing, completed, error
     language = Column(String(10), default="km")  # km = Khmer

@@ -2,7 +2,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sess
 from sqlalchemy.orm import DeclarativeBase
 from backend.config import settings
 
-engine = create_async_engine(settings.database_url, echo=False)
+engine = create_async_engine(
+    settings.database_url,
+    echo=False,
+    connect_args={"timeout": 30} if "sqlite" in settings.database_url else {},
+)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -36,3 +40,12 @@ async def init_db():
             )
         except Exception:
             pass  # Column already exists
+        # Add preview proxy columns if missing
+        for stmt in (
+            "ALTER TABLE projects ADD COLUMN preview_path VARCHAR(1000) DEFAULT ''",
+            "ALTER TABLE projects ADD COLUMN preview_status VARCHAR(20) DEFAULT 'none'",
+        ):
+            try:
+                await conn.execute(__import__("sqlalchemy").text(stmt))
+            except Exception:
+                pass  # Column already exists

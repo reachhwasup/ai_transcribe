@@ -88,3 +88,40 @@ export function findClipAtTimelineTime(layout: ClipLayout[], timelineTime: numbe
   }
   return null;
 }
+
+/**
+ * Convert a source time range [sourceStart, sourceEnd] to timeline coordinates [timelineStart, timelineEnd].
+ * Returns isVisible: false if the range is completely outside any active clips (e.g. cut/deleted portion of video).
+ */
+export function sourceRangeToTimeline(
+  layout: ClipLayout[],
+  sourceStart: number,
+  sourceEnd: number
+): { timelineStart: number; timelineEnd: number; isVisible: boolean } {
+  if (layout.length === 0) {
+    return { timelineStart: sourceStart, timelineEnd: sourceEnd, isVisible: true };
+  }
+
+  let bestStart: number | null = null;
+  let bestEnd: number | null = null;
+
+  for (const l of layout) {
+    // Find overlap with this clip
+    const overlapStart = Math.max(sourceStart, l.clip.source_start);
+    const overlapEnd = Math.min(sourceEnd, l.clip.source_end);
+
+    if (overlapStart < overlapEnd) {
+      const mappedStart = l.timelineStart + (overlapStart - l.clip.source_start);
+      const mappedEnd = l.timelineStart + (overlapEnd - l.clip.source_start);
+
+      if (bestStart === null || mappedStart < bestStart) bestStart = mappedStart;
+      if (bestEnd === null || mappedEnd > bestEnd) bestEnd = mappedEnd;
+    }
+  }
+
+  if (bestStart !== null && bestEnd !== null) {
+    return { timelineStart: bestStart, timelineEnd: Math.max(bestStart + 0.05, bestEnd), isVisible: true };
+  }
+
+  return { timelineStart: 0, timelineEnd: 0, isVisible: false };
+}

@@ -10,3 +10,8 @@ dist/
 venv/
 .DS_Store
 *.tsbuildinfo
+*.db
+*.sqlite
+*.sqlite3
+test_*.mp3
+test_*.wav

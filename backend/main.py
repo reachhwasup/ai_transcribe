@@ -39,10 +39,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API routes
-app.include_router(projects.router, prefix="/api")
+# API routes — sub-routers with deeper paths must be registered first
 app.include_router(transcripts.router, prefix="/api")
 app.include_router(export.router, prefix="/api")
+app.include_router(projects.router, prefix="/api")
 app.include_router(settings_route.router, prefix="/api")
 
 # Serve uploaded video files

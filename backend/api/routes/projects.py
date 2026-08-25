@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import asyncio
 import shutil
 import uuid
 from pathlib import Path
@@ -11,16 +12,38 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from backend.config import settings
-from backend.database.db import get_db
+from backend.database.db import get_db, async_session
 from backend.database.models import Project, Segment, VideoClip
 from backend.api.schemas import (
     ProjectCreate, ProjectUpdate, ProjectResponse, ProjectListResponse,
 )
 from backend.services.audio_service import get_video_duration
+from backend.services.video_service import generate_preview
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 ALLOWED_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".flv"}
+
+
+async def _generate_preview_task(project_id: str, video_path: str):
+    """Background task: build the 720p preview proxy and record it on the project.
+    Skips writing back if the project's video changed while we were encoding."""
+    project_dir = os.path.dirname(video_path)
+    out_path = os.path.join(project_dir, "preview.mp4")
+    try:
+        await asyncio.to_thread(generate_preview, video_path, out_path)
+        status, path = "ready", out_path
+    except Exception as e:
+        print(f"[preview] generation failed for {project_id}: {e}")
+        status, path = "error", ""
+
+    async with async_session() as db:
+        proj = await db.get(Project, project_id)
+        # Only record the result if this is still the same source video.
+        if proj and proj.video_path == video_path:
+            proj.preview_path = path
+            proj.preview_status = status
+            await db.commit()
 
 
 @router.get("/", response_model=List[ProjectListResponse])
@@ -73,6 +96,16 @@ async def get_project(project_id: str, db: AsyncSession = Depends(get_db)):
     project = result.scalar_one_or_none()
     if not project:
         raise HTTPException(404, "Project not found")
+
+    # Lazily generate a preview proxy for projects that predate this feature
+    # (or whose previous attempt errored), so opening them speeds up next time.
+    if project.video_path and os.path.exists(project.video_path) and \
+            project.preview_status in ("none", "error"):
+        project.preview_status = "generating"
+        await db.commit()
+        await db.refresh(project)
+        asyncio.create_task(_generate_preview_task(project_id, project.video_path))
+
     return ProjectResponse.model_validate(project)
 
 
@@ -152,6 +185,8 @@ async def upload_video(
     project.video_path = file_path
     project.duration = duration
     project.status = "uploaded"
+    project.preview_path = ""
+    project.preview_status = "generating"
 
     # Remove old video clips and create initial one spanning the full video
     existing_clips = await db.execute(
@@ -171,6 +206,10 @@ async def upload_video(
 
     await db.commit()
     await db.refresh(project)
+
+    # Kick off preview-proxy generation in the background so the editor player
+    # can load a small file instead of the full-resolution source.
+    asyncio.create_task(_generate_preview_task(project_id, file_path))
 
     result = await db.execute(
         select(Project)

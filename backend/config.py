@@ -4,7 +4,7 @@ from pathlib import Path
 
 class Settings(BaseSettings):
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.1-flash-lite"
     speaker_voice: str = "female"
     tts_engine: str = "edge-tts"  # edge-tts | voxcpm
     voxcpm_model_path: str = "openbmb/VoxCPM2"

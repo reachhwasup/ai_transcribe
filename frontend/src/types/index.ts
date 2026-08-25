@@ -7,6 +7,7 @@ export interface Segment {
   text: string;
   original_text: string;
   speaker: string;
+  gender?: string;
   voice_profile: string;
   voice_name: string;
   emotion: string;
@@ -31,6 +32,7 @@ export interface Project {
   description: string;
   video_filename: string;
   video_path: string;
+  preview_status?: string; // none | generating | ready | error
   duration: number;
   status: string;
   language: string;
