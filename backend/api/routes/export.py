@@ -26,6 +26,7 @@ from backend.services.video_service import (
     rotate_video,
     crop_video,
     blur_region,
+    blur_regions,
     resize_video,
     change_speed,
     split_video,
@@ -73,12 +74,28 @@ async def get_clips(
             db.add(initial_clip)
             await db.commit()
             clips = [initial_clip]
-    elif project and project.duration and project.duration > 0:
+    elif clips:
+        actual_dur = project.duration if (project and project.duration and project.duration > 0) else 0.0
+        if project and project.video_path and os.path.exists(project.video_path):
+            try:
+                from backend.services.video_service import get_duration_ffprobe
+                probe_dur = get_duration_ffprobe(project.video_path)
+                if probe_dur > 0:
+                    actual_dur = probe_dur
+                    if project.duration != probe_dur:
+                        project.duration = probe_dur
+            except Exception:
+                pass
+
         modified = False
-        for c in clips:
-            if c.source_end > project.duration:
-                c.source_end = project.duration
+        for i, c in enumerate(clips):
+            if c.source_end <= c.source_start:
+                c.source_end = round(c.source_start + 5.0, 2)
                 modified = True
+            if actual_dur > 0 and c.source_end > actual_dur + 0.1:
+                c.source_end = round(actual_dur, 2)
+                modified = True
+
         if modified:
             await db.commit()
 
@@ -217,8 +234,8 @@ async def delete_clip(
 
 
 class UpdateClipRequest(BaseModel):
-    source_start: float
-    source_end: float
+    source_start: Optional[float] = None
+    source_end: Optional[float] = None
 
 
 @router.patch("/clips/{clip_id}", response_model=VideoClipResponse)
@@ -228,7 +245,7 @@ async def update_clip(
     body: UpdateClipRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Update a clip's source boundaries (for resize/expand)."""
+    """Update a clip's source boundaries."""
     result = await db.execute(
         select(VideoClip).where(VideoClip.id == clip_id, VideoClip.project_id == project_id)
     )
@@ -236,21 +253,21 @@ async def update_clip(
     if not clip:
         raise HTTPException(404, "Clip not found")
 
-    # Get project duration for validation
-    result = await db.execute(select(Project).where(Project.id == project_id))
-    project = result.scalar_one_or_none()
-    if not project:
-        raise HTTPException(404, "Project not found")
+    if body.source_start is not None and body.source_end is not None:
+        result_proj = await db.execute(select(Project).where(Project.id == project_id))
+        project = result_proj.scalar_one_or_none()
+        if not project:
+            raise HTTPException(404, "Project not found")
 
-    new_start = max(0.0, body.source_start)
-    new_end = min(body.source_end, project.duration or body.source_end)
-    if new_end - new_start < 0.1:
-        raise HTTPException(400, "Clip must be at least 0.1s long")
+        new_start = max(0.0, body.source_start)
+        new_end = min(body.source_end, project.duration or body.source_end)
+        if new_end - new_start < 0.1:
+            raise HTTPException(400, "Clip must be at least 0.1s long")
 
-    clip.source_start = new_start
-    clip.source_end = new_end
+        clip.source_start = new_start
+        clip.source_end = new_end
+
     await db.commit()
-
     return VideoClipResponse.model_validate(clip)
 
 
@@ -377,7 +394,7 @@ async def append_video_file_to_timeline(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
-    """Upload a new video file and append it as a clip to the project timeline."""
+    """Upload a new video file and append it seamlessly to the project master video and timeline."""
     proj_result = await db.execute(select(Project).where(Project.id == project_id))
     project = proj_result.scalar_one_or_none()
     if not project:
@@ -387,45 +404,116 @@ async def append_video_file_to_timeline(
     os.makedirs(project_dir, exist_ok=True)
 
     ext = os.path.splitext(file.filename or "video.mp4")[1].lower() or ".mp4"
-    safe_filename = f"clip_{uuid.uuid4()}{ext}"
-    file_path = os.path.join(project_dir, safe_filename)
+    temp_clip_path = os.path.join(project_dir, f"temp_clip_{uuid.uuid4()}{ext}")
 
     content = await file.read()
-    with open(file_path, "wb") as f:
+    with open(temp_clip_path, "wb") as f:
         f.write(content)
 
-    # Get duration
     try:
-        from backend.services.audio_service import get_video_duration
-        clip_duration = get_video_duration(file_path)
+        from backend.services.video_service import get_duration_ffprobe, concatenate_video_files
+        new_clip_dur = get_duration_ffprobe(temp_clip_path)
     except Exception:
-        clip_duration = 5.0
+        new_clip_dur = 5.0
 
-    if not project.video_path:
-        project.video_path = file_path
+    if not project.video_path or not os.path.exists(project.video_path):
+        master_path = os.path.join(project_dir, f"master_{uuid.uuid4()}{ext}")
+        shutil.move(temp_clip_path, master_path)
+        project.video_path = master_path
         project.video_filename = file.filename
-        project.duration = clip_duration
+        project.duration = new_clip_dur
         project.status = "uploaded"
 
-    result = await db.execute(
-        select(VideoClip)
-        .where(VideoClip.project_id == project_id)
-        .order_by(VideoClip.index)
-    )
-    clips = list(result.scalars().all())
-    next_idx = len(clips)
+        new_clip = VideoClip(
+            id=str(uuid.uuid4()),
+            project_id=project_id,
+            index=0,
+            source_start=0.0,
+            source_end=new_clip_dur,
+        )
+        db.add(new_clip)
+        await db.commit()
+    else:
+        old_duration = project.duration or get_duration_ffprobe(project.video_path)
+        combined_path = os.path.join(project_dir, f"master_{uuid.uuid4()}{ext}")
 
-    new_clip = VideoClip(
-        id=str(uuid.uuid4()),
-        project_id=project_id,
-        index=next_idx,
-        source_start=0.0,
-        source_end=clip_duration,
-    )
-    db.add(new_clip)
-    await db.commit()
+        total_dur = await asyncio.to_thread(
+            concatenate_video_files,
+            [project.video_path, temp_clip_path],
+            combined_path,
+        )
 
-    # Return all clips
+        # Cleanup old master video if it was generated
+        if os.path.exists(project.video_path) and "master_" in project.video_path:
+            try:
+                os.remove(project.video_path)
+            except OSError:
+                pass
+        if os.path.exists(temp_clip_path):
+            try:
+                os.remove(temp_clip_path)
+            except OSError:
+                pass
+
+        project.video_path = combined_path
+        project.duration = total_dur
+
+        clips_res = await db.execute(
+            select(VideoClip).where(VideoClip.project_id == project_id).order_by(VideoClip.index)
+        )
+        clips = list(clips_res.scalars().all())
+
+        if not clips:
+            db.add(VideoClip(
+                id=str(uuid.uuid4()),
+                project_id=project_id,
+                index=0,
+                source_start=0.0,
+                source_end=old_duration,
+            ))
+            next_idx = 1
+        else:
+            next_idx = len(clips)
+
+        appended_clip = VideoClip(
+            id=str(uuid.uuid4()),
+            project_id=project_id,
+            index=next_idx,
+            source_start=old_duration,
+            source_end=total_dur,
+        )
+        db.add(appended_clip)
+
+        # Sanitize existing segments so no segment overshoots old_duration or exceeds 15s
+        existing_segs_res = await db.execute(
+            select(Segment).where(Segment.project_id == project_id).order_by(Segment.start_time)
+        )
+        existing_segs = list(existing_segs_res.scalars().all())
+        for s in existing_segs:
+            if s.end_time > old_duration:
+                s.end_time = old_duration
+            if (s.end_time - s.start_time) > 15.0:
+                char_len = len((s.text or "").strip())
+                s.end_time = round(s.start_time + max(2.5, min(char_len * 0.2, 10.0)), 2)
+
+        # If project has transcripts, add a new segment for the appended clip so T1/A1 have an entry
+        if existing_segs:
+            new_clip_dur = total_dur - old_duration
+            db.add(Segment(
+                id=str(uuid.uuid4()),
+                project_id=project_id,
+                index=len(existing_segs),
+                start_time=round(old_duration + 0.2, 2),
+                end_time=round(min(old_duration + max(2.0, min(new_clip_dur, 5.0)), total_dur), 2),
+                text="[New Clip Dialogue]",
+                original_text="[New Clip Dialogue]",
+                speaker=existing_segs[-1].speaker if existing_segs else "",
+                voice_profile=existing_segs[-1].voice_profile if existing_segs else "female",
+            ))
+
+        await db.commit()
+
+    # Return all updated clips
     result = await db.execute(
         select(VideoClip)
         .where(VideoClip.project_id == project_id)
@@ -1586,13 +1674,17 @@ class VideoBlurRegionRequest(BaseModel):
     height: int
 
 
-@router.post("/blur-region")
-async def blur_region_endpoint(
+class VideoBlurRegionsRequest(BaseModel):
+    regions: List[VideoBlurRegionRequest]
+
+
+@router.post("/blur-regions")
+async def blur_regions_endpoint(
     project_id: str,
-    body: VideoBlurRegionRequest,
+    body: VideoBlurRegionsRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Blur a rectangular region of the video in-place."""
+    """Blur multiple rectangular regions of the video in-place simultaneously."""
     result = await db.execute(select(Project).where(Project.id == project_id))
     project = result.scalar_one_or_none()
     if not project:
@@ -1602,13 +1694,11 @@ async def blur_region_endpoint(
         raise HTTPException(400, "No video file found for this project")
 
     try:
+        regions_list = [r.dict() for r in body.regions]
         output_path = await asyncio.to_thread(
-            blur_region,
+            blur_regions,
             video_path=project.video_path,
-            x=body.x,
-            y=body.y,
-            width=body.width,
-            height=body.height,
+            regions=regions_list,
         )
     except (RuntimeError, ValueError) as e:
         raise HTTPException(500 if isinstance(e, RuntimeError) else 400, str(e))
@@ -2107,6 +2197,8 @@ async def generate_voice_segments_endpoint(
             rel_path = os.path.relpath(audio_path, ".")
             seg.audio_url = "/" + rel_path.replace("\\", "/")
             seg.audio_speed = seg_speed
+            if actual_duration > 0 and (seg.start_time + actual_duration) > seg.end_time:
+                seg.end_time = round(seg.start_time + actual_duration, 2)
             if effective_voice:
                 seg.voice_name = effective_voice
             if effective_emotion:
@@ -2229,12 +2321,17 @@ async def generate_voice_segments_stream(
                     rel_path = os.path.relpath(audio_path, ".")
                     audio_url = "/" + rel_path.replace("\\", "/")
 
+                    final_end = orig_end
+                    if actual_duration > 0 and (orig_start + actual_duration) > orig_end:
+                        final_end = round(orig_start + actual_duration, 2)
+
                     async with make_session() as sess:
                         res2 = await sess.execute(select(Segment).where(Segment.id == seg_id))
                         seg = res2.scalar_one_or_none()
                         if seg:
                             seg.audio_url = audio_url
                             seg.audio_speed = seg_speed
+                            seg.end_time = final_end
                             if effective_voice:
                                 seg.voice_name = effective_voice
                             if effective_emotion:
@@ -2250,7 +2347,7 @@ async def generate_voice_segments_stream(
                         'status': 'done',
                         'audio_url': audio_url,
                         'start_time': orig_start,
-                        'end_time': orig_end,
+                        'end_time': final_end,
                     }
                     yield f"data: {json.dumps(evt)}\n\n"
                 except Exception as e:

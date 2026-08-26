@@ -102,25 +102,31 @@ export function sourceRangeToTimeline(
     return { timelineStart: sourceStart, timelineEnd: sourceEnd, isVisible: true };
   }
 
-  let bestStart: number | null = null;
-  let bestEnd: number | null = null;
+  // Find the single best clip in layout that has the largest overlap with [sourceStart, sourceEnd]
+  let bestClip: ClipLayout | null = null;
+  let maxOverlap = 0;
 
   for (const l of layout) {
-    // Find overlap with this clip
     const overlapStart = Math.max(sourceStart, l.clip.source_start);
     const overlapEnd = Math.min(sourceEnd, l.clip.source_end);
+    const overlap = overlapEnd - overlapStart;
 
-    if (overlapStart < overlapEnd) {
-      const mappedStart = l.timelineStart + (overlapStart - l.clip.source_start);
-      const mappedEnd = l.timelineStart + (overlapEnd - l.clip.source_start);
-
-      if (bestStart === null || mappedStart < bestStart) bestStart = mappedStart;
-      if (bestEnd === null || mappedEnd > bestEnd) bestEnd = mappedEnd;
+    if (overlap > maxOverlap) {
+      maxOverlap = overlap;
+      bestClip = l;
     }
   }
 
-  if (bestStart !== null && bestEnd !== null) {
-    return { timelineStart: bestStart, timelineEnd: Math.max(bestStart + 0.05, bestEnd), isVisible: true };
+  if (bestClip && maxOverlap > 0) {
+    const overlapStart = Math.max(sourceStart, bestClip.clip.source_start);
+    const overlapEnd = Math.min(sourceEnd, bestClip.clip.source_end);
+    const mappedStart = bestClip.timelineStart + (overlapStart - bestClip.clip.source_start);
+    const mappedEnd = bestClip.timelineStart + (overlapEnd - bestClip.clip.source_start);
+    return {
+      timelineStart: mappedStart,
+      timelineEnd: Math.max(mappedStart + 0.05, mappedEnd),
+      isVisible: true,
+    };
   }
 
   return { timelineStart: 0, timelineEnd: 0, isVisible: false };

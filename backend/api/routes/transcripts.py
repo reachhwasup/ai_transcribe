@@ -15,6 +15,7 @@ from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from backend.config import settings
 from backend.database.db import get_db, async_session
 from backend.database.models import Project, Segment, VideoClip
 from backend.api.schemas import SegmentUpdate, SegmentResponse, TranscribeRequest, ProjectResponse
@@ -26,7 +27,7 @@ from backend.services.gemini_service import (
     generate_movie_titles,
     generate_social_media_script,
 )
-from backend.services.tts_service import assign_speaker_voices, generate_segment_audio
+from backend.services.tts_service import assign_speaker_voices, generate_segment_audio, _probe_duration
 
 
 router = APIRouter(prefix="/projects/{project_id}/transcripts", tags=["transcripts"])
@@ -91,16 +92,17 @@ async def _extract_clips_video(video_path: str, clips: list[VideoClip]) -> tuple
             output_path,
         ]
     else:
-        # Multiple clips: use complex filter to concat
+        # Multiple clips: use complex filter to concat (streams must be interleaved [v0][a0][v1][a1]... for concat=v=1:a=1)
         filter_parts = []
+        concat_inputs = []
         for i, c in enumerate(sorted_clips):
             filter_parts.append(
                 f"[0:v]trim=start={c.source_start}:end={c.source_end},setpts=PTS-STARTPTS[v{i}];"
                 f"[0:a]atrim=start={c.source_start}:end={c.source_end},asetpts=PTS-STARTPTS[a{i}];"
             )
-        concat_v = "".join(f"[v{i}]" for i in range(len(sorted_clips)))
-        concat_a = "".join(f"[a{i}]" for i in range(len(sorted_clips)))
-        filter_complex = "".join(filter_parts) + f"{concat_v}{concat_a}concat=n={len(sorted_clips)}:v=1:a=1[outv][outa]"
+            concat_inputs.append(f"[v{i}][a{i}]")
+
+        filter_complex = "".join(filter_parts) + "".join(concat_inputs) + f"concat=n={len(sorted_clips)}:v=1:a=1[outv][outa]"
         cmd = [
             ffmpeg, "-y",
             "-i", video_path,
@@ -117,7 +119,9 @@ async def _extract_clips_video(video_path: str, clips: list[VideoClip]) -> tuple
     if result.returncode != 0:
         # Cleanup on failure
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise RuntimeError(f"ffmpeg clip extraction failed: {result.stderr[-300:]}")
+        # Fallback to full source video if clipping fails
+        print(f"[clips] FFmpeg clip extraction failed ({result.stderr[-200:]}), falling back to source video")
+        return None, []
 
     return output_path, clip_ranges
 
@@ -1337,8 +1341,7 @@ async def apply_narration_segments(
         await db.delete(seg)
     await db.flush()
 
-    # Normalize timings so segments always fit the timeline: sort, sequential placement, non-overlapping
-    duration = project.duration or 0.0
+    # Normalize timings so segments sequence properly on the timeline
     narration_segments = sorted(narration_segments, key=lambda s: float(s.get("start_time", 0)))
     normalized = []
     current_cursor = 0.0
@@ -1350,28 +1353,21 @@ async def apply_narration_segments(
             continue
 
         words = len(text.split())
-        est_duration = max(1.8, words * 0.35)
+        est_duration = max(2.0, words * 0.35)
 
         if start < current_cursor:
             start = round(current_cursor, 2)
-        if end <= start or (end - start) < 0.5:
+        if end <= start or (end - start) < 0.8:
             end = round(start + est_duration, 2)
 
-        if duration > 0:
-            start = min(start, duration)
-            end = min(end, duration)
-            if start >= duration:
-                break
-
         normalized.append({**seg_data, "start_time": start, "end_time": end})
-        current_cursor = end + 0.05
+        current_cursor = end + 0.15
+
     narration_segments = normalized
     if not narration_segments:
-        raise HTTPException(400, "No narration segments fit within the video duration")
+        raise HTTPException(400, "No valid narration segments provided")
 
-    # Create new segments from narration. Dialogue segments (actor lines)
-    # keep the character as speaker and use a gender-matched voice; narration
-    # segments use the chosen narrator voice.
+    # Create new segments from narration
     voice_input = body.get("voice_profile", "female")
     new_segments = []
     for i, seg_data in enumerate(narration_segments):
@@ -1401,10 +1397,50 @@ async def apply_narration_segments(
             speaker=speaker,
             voice_profile=voice_profile,
             voice_name=voice_name,
-            emotion=str(seg_data.get("emotion") or "neutral") or "neutral",
+            emotion=str(seg_data.get("emotion") or "excited") or "excited",
         )
         db.add(seg)
         new_segments.append(seg)
+
+    # Synthesize TTS audio for all applied narration segments so audio is immediately available on timeline
+    ffmpeg_bin = shutil.which("ffmpeg")
+
+    async def _generate_audio_for_segment(segment: Segment):
+        try:
+            eng = "edge-tts" if ("Neural" in (segment.voice_name or "") or not segment.voice_name) else ""
+            disk_path = await generate_segment_audio(
+                text=segment.text,
+                voice_profile=segment.voice_profile,
+                voice_name=segment.voice_name,
+                language=project.language or "km",
+                emotion=segment.emotion or "excited",
+                engine=eng,
+            )
+            if disk_path and os.path.exists(disk_path):
+                rel_path = os.path.relpath(disk_path, settings.upload_dir).replace("\\", "/")
+                segment.audio_url = f"/uploads/{rel_path}"
+                if ffmpeg_bin:
+                    real_dur = _probe_duration(ffmpeg_bin, disk_path)
+                    if real_dur > 0:
+                        segment.end_time = round(segment.start_time + real_dur, 2)
+        except Exception as e:
+            print(f"[apply_narration] Audio generation error for segment {segment.id}: {e}")
+
+    await asyncio.gather(*[_generate_audio_for_segment(s) for s in new_segments])
+
+    # Preserve scene timestamps aligned with the video:
+    # Anchor each segment to its intended start_time, only adjusting if preceding segment overlaps
+    current_cursor = 0.0
+    for seg in new_segments:
+        speech_dur = max(1.5, seg.end_time - seg.start_time)
+        intended_start = seg.start_time
+        actual_start = max(intended_start, current_cursor)
+        seg.start_time = round(actual_start, 2)
+        seg.end_time = round(actual_start + speech_dur, 2)
+        current_cursor = seg.end_time + 0.1
+
+    if current_cursor > (project.duration or 0.0):
+        project.duration = round(current_cursor, 2)
 
     await db.commit()
     for seg in new_segments:
@@ -1593,6 +1629,10 @@ async def generate_social_script_endpoint(
 
     original_title = body.get("original_title", "").strip() or project.name or ""
     language = body.get("language", project.language or "km")
+    platform = body.get("platform", "tiktok")
+    tone = body.get("tone", "suspense")
+    duration_target = body.get("duration_target", "30-60s")
+    custom_notes = body.get("custom_notes", "")
 
     transcript_text = "\n".join([
         f"[{s.start_time:.1f}s - {s.end_time:.1f}s] {s.speaker}: {s.text}"
@@ -1605,6 +1645,10 @@ async def generate_social_script_endpoint(
         transcript_text=transcript_text,
         video_path=project.video_path or "",
         language=language,
+        platform=platform,
+        tone=tone,
+        duration_target=duration_target,
+        custom_notes=custom_notes,
     )
     return social_data
 

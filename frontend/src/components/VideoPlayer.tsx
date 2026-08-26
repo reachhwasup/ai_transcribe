@@ -25,9 +25,11 @@ import {
   Snowflake,
   Eraser,
   Loader2,
+  Plus,
+  Trash2,
 } from 'lucide-react';
-import { blurVideoRegion } from '../api/client';
-import { buildClipLayout, sourceToTimeline, timelineToSource, totalTimelineDuration, findClipAtTimelineTime } from '../utils/clipTimemap';
+import { blurVideoRegion, blurVideoRegions } from '../api/client';
+import { buildClipLayout, sourceToTimeline, timelineToSource, totalTimelineDuration, findClipAtTimelineTime, sourceRangeToTimeline } from '../utils/clipTimemap';
 import SubtitleOverlay from './SubtitleOverlay';
 
 interface Props {
@@ -70,24 +72,50 @@ export const FILTER_PRESETS: { id: string; name: string; filterStyle: string }[]
  * Uses half-open intervals [start_time, end_time) to prevent previous segments
  * (e.g. #289) from incorrectly claiming the boundary when clicking the next (#290).
  */
-export function findActiveSegmentAtTime(segments: any[] | undefined, time: number): any | null {
+export function findActiveSegmentAtTime(
+  segments: any[] | undefined,
+  time: number,
+  clipLayout?: any[]
+): any | null {
   if (!segments || segments.length === 0) return null;
   const filtered = segments.filter(
     (s) => s.speaker !== 'Freeze' && s.voice_profile !== 'freeze' && !(s.text && s.text.includes('Freeze Frame'))
   );
   if (filtered.length === 0) return null;
 
-  // 1. Strict half-open interval [start_time, end_time)
-  const strict = filtered.find((s) => time >= s.start_time && time < s.end_time);
-  if (strict) return strict;
+  for (const s of filtered) {
+    const range = clipLayout && clipLayout.length > 0
+      ? sourceRangeToTimeline(clipLayout, s.start_time, s.end_time)
+      : { timelineStart: s.start_time, timelineEnd: s.end_time, isVisible: true };
 
-  // 2. Exact match at start_time (or within 0.05s after start_time)
-  const startMatch = filtered.find((s) => Math.abs(time - s.start_time) < 0.05);
-  if (startMatch) return startMatch;
+    if (range.isVisible && time >= range.timelineStart && time < range.timelineEnd) {
+      return s;
+    }
+  }
 
-  // 3. Fallback: boundary check with small tolerance
-  const boundaryMatch = filtered.find((s) => time >= s.start_time - 0.02 && time <= s.end_time);
-  return boundaryMatch || null;
+  // Exact start match
+  for (const s of filtered) {
+    const range = clipLayout && clipLayout.length > 0
+      ? sourceRangeToTimeline(clipLayout, s.start_time, s.end_time)
+      : { timelineStart: s.start_time, timelineEnd: s.end_time, isVisible: true };
+
+    if (range.isVisible && Math.abs(time - range.timelineStart) < 0.05) {
+      return s;
+    }
+  }
+
+  // Boundary check
+  for (const s of filtered) {
+    const range = clipLayout && clipLayout.length > 0
+      ? sourceRangeToTimeline(clipLayout, s.start_time, s.end_time)
+      : { timelineStart: s.start_time, timelineEnd: s.end_time, isVisible: true };
+
+    if (range.isVisible && time >= range.timelineStart - 0.02 && time <= range.timelineEnd) {
+      return s;
+    }
+  }
+
+  return null;
 }
 
 export default function VideoPlayer({ videoRef }: Props) {
@@ -151,8 +179,25 @@ export default function VideoPlayer({ videoRef }: Props) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [selectedCaptionId, setSelectedCaptionId] = useState<string | null>(null);
 
-  // Blur Shape / Watermark Mask State
-  const [blurMask, setBlurMask] = useState<{
+  // Multiple Blur Shapes / Watermark Mask State (Isolated per project)
+  const defaultBlurShapes = [
+    {
+      id: 'blur-1',
+      name: 'Bottom Subtitles',
+      enabled: false,
+      x: 0,
+      y: 82,
+      width: 100,
+      height: 16,
+      blurRadius: 24,
+      opacity: 0.75,
+      borderRadius: 0,
+    },
+  ];
+
+  const [blurShapes, setBlurShapes] = useState<Array<{
+    id: string;
+    name: string;
     enabled: boolean;
     x: number;
     y: number;
@@ -161,90 +206,111 @@ export default function VideoPlayer({ videoRef }: Props) {
     blurRadius: number;
     opacity: number;
     borderRadius: number;
-  }>({
-    enabled: false,
-    x: 0,
-    y: 82,
-    width: 100,
-    height: 16,
-    blurRadius: 24,
-    opacity: 0.75,
-    borderRadius: 0,
-  });
-  const [isBurningBlur, setIsBurningBlur] = useState(false);
-  const blurCanvasRef = useRef<HTMLCanvasElement>(null);
-  const blurAnimFrameRef = useRef<number | null>(null);
+  }>>(defaultBlurShapes);
+  const [activeBlurShapeId, setActiveBlurShapeId] = useState<string>('blur-1');
 
-  // Drag state for blur shape repositioning
-  const blurDragRef = useRef<{ dragging: boolean; startX: number; startY: number; origX: number; origY: number } | null>(null);
-
-  // Continuously paint blurred video frames into the canvas overlay
+  // Load project-specific blur shapes when switching projects
   useEffect(() => {
-    if (!blurMask.enabled) {
-      if (blurAnimFrameRef.current) cancelAnimationFrame(blurAnimFrameRef.current);
-      blurAnimFrameRef.current = null;
-      return;
-    }
-    const video = videoRef.current;
-    const canvas = blurCanvasRef.current;
-    if (!video || !canvas) return;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    let rafId: number;
-    const paint = () => {
-      if (!video.paused || true) { // always repaint when enabled
-        const cw = canvas.width;
-        const ch = canvas.height;
-        // Source rectangle: the portion of the video corresponding to the mask
-        const sx = (blurMask.x / 100) * video.videoWidth;
-        const sy = (blurMask.y / 100) * video.videoHeight;
-        const sw = (blurMask.width / 100) * video.videoWidth;
-        const sh = (blurMask.height / 100) * video.videoHeight;
-        try {
-          ctx.save();
-          ctx.filter = `blur(${blurMask.blurRadius}px)`;
-          ctx.drawImage(video, sx, sy, sw, sh, 0, 0, cw, ch);
-          ctx.restore();
-          // Tint overlay
-          ctx.fillStyle = `rgba(0, 0, 0, ${blurMask.opacity * 0.6})`;
-          ctx.fillRect(0, 0, cw, ch);
-        } catch {
-          // video not ready yet
+    if (!currentProject?.id) return;
+    try {
+      const stored = localStorage.getItem(`meatika_blur_shapes_${currentProject.id}`);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setBlurShapes(parsed);
+          setActiveBlurShapeId(parsed[0].id || 'blur-1');
+          return;
         }
       }
-      rafId = requestAnimationFrame(paint);
-    };
+    } catch {}
+    setBlurShapes(defaultBlurShapes);
+    setActiveBlurShapeId('blur-1');
+  }, [currentProject?.id]);
 
-    rafId = requestAnimationFrame(paint);
-    blurAnimFrameRef.current = rafId;
-    return () => {
-      cancelAnimationFrame(rafId);
+  // Persist blur shapes per project
+  const saveBlurShapes = (shapes: typeof blurShapes) => {
+    setBlurShapes(shapes);
+    if (currentProject?.id) {
+      try {
+        localStorage.setItem(`meatika_blur_shapes_${currentProject.id}`, JSON.stringify(shapes));
+      } catch {}
+    }
+  };
+
+  const activeBlurShape = blurShapes.find((s) => s.id === activeBlurShapeId) || blurShapes[0] || null;
+
+  const updateActiveBlurShape = (updates: Partial<typeof blurShapes[0]>) => {
+    const updated = blurShapes.map((s) => (s.id === activeBlurShapeId ? { ...s, ...updates } : s));
+    saveBlurShapes(updated);
+  };
+
+  const handleAddBlurShape = () => {
+    const newId = `blur-${Date.now()}`;
+    const newShape = {
+      id: newId,
+      name: `Blur Box ${blurShapes.length + 1}`,
+      enabled: true,
+      x: 10,
+      y: 10,
+      width: 35,
+      height: 14,
+      blurRadius: 24,
+      opacity: 0.75,
+      borderRadius: 8,
     };
-  }, [blurMask, videoRef]);
+    const updated = [...blurShapes, newShape];
+    saveBlurShapes(updated);
+    setActiveBlurShapeId(newId);
+  };
+
+  const handleDeleteBlurShape = (id: string) => {
+    const filtered = blurShapes.filter((s) => s.id !== id);
+    const updated = filtered.length === 0 ? defaultBlurShapes : filtered;
+    saveBlurShapes(updated);
+    if (activeBlurShapeId === id) {
+      setActiveBlurShapeId(updated[0].id);
+    }
+  };
+
+  const [isBurningBlur, setIsBurningBlur] = useState(false);
+
+  // Drag state for active blur shape repositioning
+  const blurDragRef = useRef<{ id: string; startX: number; startY: number; origX: number; origY: number } | null>(null);
 
   const handleBurnPermanentBlur = async () => {
     if (!currentProject || isBurningBlur) return;
+    const enabledShapes = blurShapes.filter((s) => s.enabled);
+    if (enabledShapes.length === 0) {
+      alert('Please enable at least one blur shape first.');
+      return;
+    }
+
     setIsBurningBlur(true);
     try {
       const vid = videoRef.current;
       const w = vid?.videoWidth || 1280;
       const h = vid?.videoHeight || 720;
 
-      const pxX = Math.round((blurMask.x / 100) * w);
-      const pxY = Math.round((blurMask.y / 100) * h);
-      const pxW = Math.max(4, Math.round((blurMask.width / 100) * w));
-      const pxH = Math.max(4, Math.round((blurMask.height / 100) * h));
+      const regions = enabledShapes.map((s) => ({
+        x: Math.round((s.x / 100) * w),
+        y: Math.round((s.y / 100) * h),
+        width: Math.max(4, Math.round((s.width / 100) * w)),
+        height: Math.max(4, Math.round((s.height / 100) * h)),
+        x_pct: s.x,
+        y_pct: s.y,
+        width_pct: s.width,
+        height_pct: s.height,
+      }));
 
-      await blurVideoRegion(currentProject.id, pxX, pxY, pxW, pxH);
+      await blurVideoRegions(currentProject.id, regions);
       await loadProject(currentProject.id);
       if (videoRef.current) {
         videoRef.current.load();
       }
-      setBlurMask((prev) => ({ ...prev, enabled: false }));
+      const resetShapes = blurShapes.map((s) => ({ ...s, enabled: false }));
+      saveBlurShapes(resetShapes);
       setShowBlurDropdown(false);
-      alert('Permanent blur applied successfully to video!');
+      alert(`Permanent blur applied successfully to ${regions.length} region(s)!`);
     } catch (err: any) {
       console.error('Burn blur failed:', err);
       alert(`Blur failed: ${err?.response?.data?.detail || err.message || err}`);
@@ -342,6 +408,7 @@ export default function VideoPlayer({ videoRef }: Props) {
     : '';
 
   const clipLayout = useMemo(() => buildClipLayout(videoClips), [videoClips]);
+
   const duration = useMemo(() => {
     const tl = totalTimelineDuration(videoClips);
     return tl > 0 ? tl : (currentProject?.duration || videoDuration);
@@ -406,47 +473,28 @@ export default function VideoPlayer({ videoRef }: Props) {
       }
 
       // Multi-clip sequential playback:
+      const totalDur = totalTimelineDuration(videoClips);
       const currentTlTime = timelineTimeRef.current;
       const currentEntry = findClipAtTimelineTime(clipLayout, currentTlTime) || clipLayout[0];
       const currentIdx = clipLayout.indexOf(currentEntry);
-      const totalDur = totalTimelineDuration(videoClips);
-
-      // Verify srcTime is within reasonable range of current clip to avoid asynchronous seek lag triggers
-      if (srcTime < currentEntry.clip.source_start - 0.5 || srcTime > currentEntry.clip.source_end + 1.0) {
-        // Find if srcTime corresponds to ANY clip on the timeline (e.g. user clicked a segment in another clip)
-        const matchingEntry = clipLayout.find(
-          (entry) => srcTime >= entry.clip.source_start - 0.1 && srcTime <= entry.clip.source_end + 0.1
-        );
-        if (matchingEntry) {
-          const offsetInClip = Math.max(0, srcTime - matchingEntry.clip.source_start);
-          const newTl = Math.min(matchingEntry.timelineEnd, matchingEntry.timelineStart + offsetInClip);
-          timelineTimeRef.current = newTl;
-          setCurrentTime(newTl);
-          updateProgressBar(newTl);
-          const seg = findActiveSegmentAtTime(currentProject?.segments, newTl);
-          setActiveSegment(seg?.id || null);
-          return;
-        }
-
-        const expectedSrc = currentEntry.clip.source_start + Math.max(0, currentTlTime - currentEntry.timelineStart);
-        if (Math.abs(video.currentTime - expectedSrc) > 0.05) {
-          video.currentTime = expectedSrc;
-        }
-        return;
-      }
 
       // Check if video reached or exceeded the end of current clip's source range
       if (srcTime >= currentEntry.clip.source_end - 0.05) {
         if (currentIdx < clipLayout.length - 1) {
-          // Jump immediately to start of next clip
+          // Progress smoothly to next clip
           const nextEntry = clipLayout[currentIdx + 1];
           video.currentTime = nextEntry.clip.source_start;
           timelineTimeRef.current = nextEntry.timelineStart;
           setCurrentTime(nextEntry.timelineStart);
           updateProgressBar(nextEntry.timelineStart);
+          const seg = findActiveSegmentAtTime(currentProject?.segments, nextEntry.timelineStart);
+          setActiveSegment(seg?.id || null);
+          if (video.paused) {
+            video.play().catch(() => {});
+          }
           return;
-        } else if (currentTlTime >= totalDur - 0.15) {
-          // Reached end of all clips on timeline
+        } else {
+          // Reached the true end of the final clip on timeline
           video.pause();
           timelineTimeRef.current = totalDur;
           setCurrentTime(totalDur);
@@ -456,9 +504,14 @@ export default function VideoPlayer({ videoRef }: Props) {
         }
       }
 
-      // Inside the current clip: map smoothly to timeline
-      const offsetInClip = Math.max(0, srcTime - currentEntry.clip.source_start);
-      const newTlTime = Math.min(currentEntry.timelineEnd, currentEntry.timelineStart + offsetInClip);
+      // Check if srcTime belongs to another clip (e.g. natural video progression or user click)
+      const matchingEntry = clipLayout.find(
+        (entry) => srcTime >= entry.clip.source_start - 0.05 && srcTime < entry.clip.source_end
+      );
+
+      const activeEntry = matchingEntry || currentEntry;
+      const offsetInClip = Math.max(0, Math.min(activeEntry.clipDuration, srcTime - activeEntry.clip.source_start));
+      const newTlTime = Math.min(activeEntry.timelineEnd, activeEntry.timelineStart + offsetInClip);
 
       timelineTimeRef.current = newTlTime;
       setCurrentTime(newTlTime);
@@ -496,6 +549,23 @@ export default function VideoPlayer({ videoRef }: Props) {
     };
 
     const onEnded = () => {
+      const currentTlTime = timelineTimeRef.current;
+      const currentEntry = findClipAtTimelineTime(clipLayout, currentTlTime) || clipLayout[0];
+      const currentIdx = clipLayout.indexOf(currentEntry);
+
+      if (clipLayout.length > 1 && currentIdx < clipLayout.length - 1) {
+        // More clips remain on timeline! Jump to next clip and continue playing!
+        const nextEntry = clipLayout[currentIdx + 1];
+        video.currentTime = nextEntry.clip.source_start;
+        timelineTimeRef.current = nextEntry.timelineStart;
+        setCurrentTime(nextEntry.timelineStart);
+        updateProgressBar(nextEntry.timelineStart);
+        const seg = findActiveSegmentAtTime(currentProject?.segments, nextEntry.timelineStart);
+        setActiveSegment(seg?.id || null);
+        video.play().catch(() => {});
+        return;
+      }
+
       setIsPlaying(false);
       const totalDur = clipLayout.length > 0
         ? totalTimelineDuration(videoClips)
@@ -735,192 +805,287 @@ export default function VideoPlayer({ videoRef }: Props) {
                 setShowCanvasZoomDropdown(false);
                 setShowSpeedDropdown(false);
               }}
-              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] transition-colors ${
-                blurMask.enabled
+              className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] transition-colors ${
+                blurShapes.some((s) => s.enabled)
                   ? 'bg-pink-600 text-white shadow-md shadow-pink-950/40 font-semibold'
                   : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300'
               }`}
-              title="Blur text / subtitles on original video"
+              title="Blur multiple logos, watermarks, or subtitles on original video"
             >
               <Eraser className="w-3 h-3 text-pink-300" />
-              <span>Blur Shape</span>
+              <span>Blur Shapes ({blurShapes.filter((s) => s.enabled).length})</span>
             </button>
 
             {showBlurDropdown && (
-              <div className="absolute right-0 top-full mt-1 w-72 bg-zinc-900/98 border border-zinc-800 rounded-xl shadow-2xl p-3 z-50 backdrop-blur-md space-y-3">
-                {/* Toggle ON/OFF */}
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-1.5 font-semibold text-xs text-white">
-                    <Eraser className="w-3.5 h-3.5 text-pink-400" />
-                    <span>Video Blur Shape Mask</span>
+              <div className="absolute right-0 top-full mt-1 w-80 bg-zinc-900/98 border border-zinc-800 rounded-xl shadow-2xl p-3 z-50 backdrop-blur-md space-y-3">
+                {/* Header & Add Shape */}
+                <div className="flex items-center justify-between border-b border-zinc-800 pb-2">
+                  <div className="flex items-center gap-1.5 font-bold text-xs text-white">
+                    <Eraser className="w-4 h-4 text-pink-400" />
+                    <span>Blur Shapes & Masks</span>
                   </div>
                   <button
-                    onClick={() => setBlurMask({ ...blurMask, enabled: !blurMask.enabled })}
-                    className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all ${
-                      blurMask.enabled
-                        ? 'bg-pink-600 text-white shadow-md'
-                        : 'bg-zinc-800 text-zinc-400 hover:text-zinc-200'
-                    }`}
+                    onClick={handleAddBlurShape}
+                    className="flex items-center gap-1 px-2 py-1 rounded-lg bg-pink-600/20 hover:bg-pink-600/30 text-pink-300 border border-pink-500/30 text-[11px] font-bold transition-all active:scale-95"
+                    title="Add another blur shape"
                   >
-                    {blurMask.enabled ? 'ON' : 'OFF'}
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Add Shape</span>
                   </button>
                 </div>
 
-                {/* Presets */}
-                <div className="space-y-1">
-                  <span className="text-[10px] uppercase font-bold text-zinc-500 tracking-wider">Presets</span>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    <button
-                      onClick={() => setBlurMask({ ...blurMask, enabled: true, x: 0, y: 82, width: 100, height: 16, borderRadius: 0 })}
-                      className="px-2 py-1.5 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-200 text-[11px] text-left transition-colors flex items-center gap-1.5"
-                    >
-                      <span>🔤</span>
-                      <span className="truncate">Bottom Subtitles</span>
-                    </button>
-                    <button
-                      onClick={() => setBlurMask({ ...blurMask, enabled: true, x: 10, y: 84, width: 80, height: 12, borderRadius: 12 })}
-                      className="px-2 py-1.5 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-200 text-[11px] text-left transition-colors flex items-center gap-1.5"
-                    >
-                      <span>💬</span>
-                      <span className="truncate">Compact Box</span>
-                    </button>
-                    <button
-                      onClick={() => setBlurMask({ ...blurMask, enabled: true, x: 74, y: 4, width: 22, height: 10, borderRadius: 8 })}
-                      className="px-2 py-1.5 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-200 text-[11px] text-left transition-colors flex items-center gap-1.5"
-                    >
-                      <span>🏷️</span>
-                      <span className="truncate">Top-Right Logo</span>
-                    </button>
-                    <button
-                      onClick={() => setBlurMask({ ...blurMask, enabled: true, x: 4, y: 4, width: 22, height: 10, borderRadius: 8 })}
-                      className="px-2 py-1.5 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-200 text-[11px] text-left transition-colors flex items-center gap-1.5"
-                    >
-                      <span>🏷️</span>
-                      <span className="truncate">Top-Left Logo</span>
-                    </button>
-                  </div>
+                {/* Shape List / Tabs */}
+                <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
+                  {blurShapes.map((shape, idx) => {
+                    const isActive = shape.id === activeBlurShapeId;
+                    return (
+                      <div
+                        key={shape.id}
+                        onClick={() => setActiveBlurShapeId(shape.id)}
+                        className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs cursor-pointer transition-all border ${
+                          isActive
+                            ? 'bg-pink-950/40 border-pink-500/50 text-white font-semibold shadow-xs'
+                            : 'bg-zinc-800/60 hover:bg-zinc-800 border-zinc-700/50 text-zinc-300'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 truncate">
+                          <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: shape.enabled ? '#ec4899' : '#71717a' }} />
+                          <span className="truncate">{shape.name}</span>
+                        </div>
+
+                        <div className="flex items-center gap-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                          {/* Toggle ON/OFF */}
+                          <button
+                            onClick={() => {
+                              setBlurShapes((prev) =>
+                                prev.map((s) => (s.id === shape.id ? { ...s, enabled: !s.enabled } : s))
+                              );
+                            }}
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${
+                              shape.enabled
+                                ? 'bg-pink-600 text-white'
+                                : 'bg-zinc-700 text-zinc-400 hover:text-zinc-200'
+                            }`}
+                          >
+                            {shape.enabled ? 'ON' : 'OFF'}
+                          </button>
+
+                          {/* Delete Shape */}
+                          {blurShapes.length > 1 && (
+                            <button
+                              onClick={() => handleDeleteBlurShape(shape.id)}
+                              className="p-1 text-zinc-500 hover:text-red-400 transition-colors"
+                              title="Delete shape"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
 
-                {/* Blur Radius Slider */}
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between text-[11px]">
-                    <span className="text-zinc-400">Blur Strength</span>
-                    <span className="text-pink-400 font-mono font-bold">{blurMask.blurRadius}px</span>
-                  </div>
-                  <input
-                    type="range"
-                    min={4}
-                    max={50}
-                    value={blurMask.blurRadius}
-                    onChange={(e) => setBlurMask({ ...blurMask, blurRadius: Number(e.target.value) })}
-                    className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
-                  />
-                </div>
-
-                {/* Dark Tint Opacity Slider */}
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between text-[11px]">
-                    <span className="text-zinc-400">Tint Darkness</span>
-                    <span className="text-pink-400 font-mono font-bold">{Math.round(blurMask.opacity * 100)}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    value={blurMask.opacity}
-                    onChange={(e) => setBlurMask({ ...blurMask, opacity: Number(e.target.value) })}
-                    className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
-                  />
-                </div>
-
-                {/* Position X & Y Sliders */}
-                <div className="grid grid-cols-2 gap-2">
-                  <div className="space-y-1">
-                    <div className="flex items-center justify-between text-[10px]">
-                      <span className="text-zinc-400">Position X</span>
-                      <span className="text-pink-400 font-mono font-bold">{Math.round(blurMask.x)}%</span>
+                {/* Active Shape Settings */}
+                {activeBlurShape && (
+                  <div className="space-y-2.5 pt-2 border-t border-zinc-800">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-bold text-pink-400 uppercase tracking-wider">
+                        Edit: {activeBlurShape.name}
+                      </span>
+                      <span className="text-[10px] text-zinc-500">
+                        {activeBlurShape.enabled ? 'Active on Canvas' : 'Disabled'}
+                      </span>
                     </div>
-                    <input
-                      type="range"
-                      min={0}
-                      max={Math.max(0, 100 - blurMask.width)}
-                      value={blurMask.x}
-                      onChange={(e) => setBlurMask({ ...blurMask, x: Number(e.target.value) })}
-                      className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
-                    />
-                  </div>
 
-                  <div className="space-y-1">
-                    <div className="flex items-center justify-between text-[10px]">
-                      <span className="text-zinc-400">Position Y</span>
-                      <span className="text-pink-400 font-mono font-bold">{Math.round(blurMask.y)}%</span>
+                    {/* Presets */}
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        onClick={() =>
+                          updateActiveBlurShape({
+                            enabled: true,
+                            x: 0,
+                            y: 82,
+                            width: 100,
+                            height: 16,
+                            borderRadius: 0,
+                          })
+                        }
+                        className="px-2 py-1 rounded bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 text-[10px] text-left transition-colors truncate"
+                      >
+                        🔤 Bottom Subtitles
+                      </button>
+                      <button
+                        onClick={() =>
+                          updateActiveBlurShape({
+                            enabled: true,
+                            x: 10,
+                            y: 84,
+                            width: 80,
+                            height: 12,
+                            borderRadius: 12,
+                          })
+                        }
+                        className="px-2 py-1 rounded bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 text-[10px] text-left transition-colors truncate"
+                      >
+                        💬 Compact Box
+                      </button>
+                      <button
+                        onClick={() =>
+                          updateActiveBlurShape({
+                            enabled: true,
+                            x: 74,
+                            y: 4,
+                            width: 22,
+                            height: 10,
+                            borderRadius: 8,
+                          })
+                        }
+                        className="px-2 py-1 rounded bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 text-[10px] text-left transition-colors truncate"
+                      >
+                        🏷️ Top-Right Logo
+                      </button>
+                      <button
+                        onClick={() =>
+                          updateActiveBlurShape({
+                            enabled: true,
+                            x: 4,
+                            y: 4,
+                            width: 22,
+                            height: 10,
+                            borderRadius: 8,
+                          })
+                        }
+                        className="px-2 py-1 rounded bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 text-[10px] text-left transition-colors truncate"
+                      >
+                        🏷️ Top-Left Logo
+                      </button>
                     </div>
-                    <input
-                      type="range"
-                      min={0}
-                      max={Math.max(0, 100 - blurMask.height)}
-                      value={blurMask.y}
-                      onChange={(e) => setBlurMask({ ...blurMask, y: Number(e.target.value) })}
-                      className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
-                    />
-                  </div>
-                </div>
 
-                {/* Width & Height Sliders */}
-                <div className="grid grid-cols-2 gap-2">
-                  <div className="space-y-1">
-                    <div className="flex items-center justify-between text-[10px]">
-                      <span className="text-zinc-400">Width</span>
-                      <span className="text-pink-400 font-mono font-bold">{Math.round(blurMask.width)}%</span>
+                    {/* Blur Strength Slider */}
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-zinc-400">Blur Strength</span>
+                        <span className="text-pink-400 font-mono font-bold">{activeBlurShape.blurRadius}px</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={4}
+                        max={50}
+                        value={activeBlurShape.blurRadius}
+                        onChange={(e) => updateActiveBlurShape({ blurRadius: Number(e.target.value) })}
+                        className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
+                      />
                     </div>
-                    <input
-                      type="range"
-                      min={4}
-                      max={100}
-                      value={blurMask.width}
-                      onChange={(e) => setBlurMask({ ...blurMask, width: Number(e.target.value) })}
-                      className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
-                    />
-                  </div>
 
-                  <div className="space-y-1">
-                    <div className="flex items-center justify-between text-[10px]">
-                      <span className="text-zinc-400">Height</span>
-                      <span className="text-pink-400 font-mono font-bold">{Math.round(blurMask.height)}%</span>
+                    {/* Dark Tint Opacity */}
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-zinc-400">Tint Darkness</span>
+                        <span className="text-pink-400 font-mono font-bold">
+                          {Math.round(activeBlurShape.opacity * 100)}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={activeBlurShape.opacity}
+                        onChange={(e) => updateActiveBlurShape({ opacity: Number(e.target.value) })}
+                        className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
+                      />
                     </div>
-                    <input
-                      type="range"
-                      min={3}
-                      max={60}
-                      value={blurMask.height}
-                      onChange={(e) => setBlurMask({ ...blurMask, height: Number(e.target.value) })}
-                      className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
-                    />
-                  </div>
-                </div>
 
-                {/* Corner Roundness */}
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between text-[11px]">
-                    <span className="text-zinc-400">Corner Radius</span>
-                    <span className="text-pink-400 font-mono font-bold">{blurMask.borderRadius}px</span>
+                    {/* Position X & Y */}
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[10px]">
+                          <span className="text-zinc-400">X Position</span>
+                          <span className="text-pink-400 font-mono font-bold">{Math.round(activeBlurShape.x)}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={Math.max(0, 100 - activeBlurShape.width)}
+                          value={activeBlurShape.x}
+                          onChange={(e) => updateActiveBlurShape({ x: Number(e.target.value) })}
+                          className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
+                        />
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[10px]">
+                          <span className="text-zinc-400">Y Position</span>
+                          <span className="text-pink-400 font-mono font-bold">{Math.round(activeBlurShape.y)}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={Math.max(0, 100 - activeBlurShape.height)}
+                          value={activeBlurShape.y}
+                          onChange={(e) => updateActiveBlurShape({ y: Number(e.target.value) })}
+                          className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Width & Height */}
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[10px]">
+                          <span className="text-zinc-400">Width</span>
+                          <span className="text-pink-400 font-mono font-bold">{Math.round(activeBlurShape.width)}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={4}
+                          max={100}
+                          value={activeBlurShape.width}
+                          onChange={(e) => updateActiveBlurShape({ width: Number(e.target.value) })}
+                          className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
+                        />
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[10px]">
+                          <span className="text-zinc-400">Height</span>
+                          <span className="text-pink-400 font-mono font-bold">{Math.round(activeBlurShape.height)}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={3}
+                          max={60}
+                          value={activeBlurShape.height}
+                          onChange={(e) => updateActiveBlurShape({ height: Number(e.target.value) })}
+                          className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Corner Roundness */}
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-zinc-400">Corner Radius</span>
+                        <span className="text-pink-400 font-mono font-bold">{activeBlurShape.borderRadius}px</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={32}
+                        value={activeBlurShape.borderRadius}
+                        onChange={(e) => updateActiveBlurShape({ borderRadius: Number(e.target.value) })}
+                        className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
+                      />
+                    </div>
                   </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={32}
-                    value={blurMask.borderRadius}
-                    onChange={(e) => setBlurMask({ ...blurMask, borderRadius: Number(e.target.value) })}
-                    className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
-                  />
-                </div>
+                )}
 
                 {/* Permanent Blur Action Button */}
                 <div className="pt-2 border-t border-zinc-800">
                   <button
                     onClick={handleBurnPermanentBlur}
-                    disabled={isBurningBlur}
+                    disabled={isBurningBlur || !blurShapes.some((s) => s.enabled)}
                     className="w-full py-2 px-3 rounded-lg bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 text-white text-xs font-bold shadow-md shadow-pink-950/50 flex items-center justify-center gap-1.5 transition-all active:scale-95 disabled:opacity-50"
                   >
                     {isBurningBlur ? (
@@ -931,7 +1096,9 @@ export default function VideoPlayer({ videoRef }: Props) {
                     ) : (
                       <>
                         <Eraser className="w-3.5 h-3.5" />
-                        <span>Burn Blur Permanently to Video</span>
+                        <span>
+                          Burn All Blur Shapes ({blurShapes.filter((s) => s.enabled).length}) to Video
+                        </span>
                       </>
                     )}
                   </button>
@@ -1026,112 +1193,125 @@ export default function VideoPlayer({ videoRef }: Props) {
             );
           })()}
 
-          {/* Video Blur Shape Mask Overlay — canvas-based blur (works on <video> elements) */}
-          {blurMask.enabled && (
-            <div
-              className="absolute z-20 group/blur cursor-move"
-              style={{
-                left: `${blurMask.x}%`,
-                top: `${blurMask.y}%`,
-                width: `${blurMask.width}%`,
-                height: `${blurMask.height}%`,
-                borderRadius: `${blurMask.borderRadius}px`,
-                overflow: 'hidden',
-                boxShadow: '0 0 0 1px rgba(255,255,255,0.15), 0 4px 20px rgba(0,0,0,0.5)',
-                userSelect: 'none',
-              }}
-              onMouseDown={(e) => {
-                e.preventDefault();
-                const container = e.currentTarget.parentElement;
-                if (!container) return;
-                const rect = container.getBoundingClientRect();
-                blurDragRef.current = {
-                  dragging: true,
-                  startX: e.clientX,
-                  startY: e.clientY,
-                  origX: blurMask.x,
-                  origY: blurMask.y,
-                };
-                const onMove = (me: MouseEvent) => {
-                  if (!blurDragRef.current?.dragging) return;
-                  const dx = ((me.clientX - blurDragRef.current.startX) / rect.width) * 100;
-                  const dy = ((me.clientY - blurDragRef.current.startY) / rect.height) * 100;
-                  setBlurMask((prev) => ({
-                    ...prev,
-                    x: Math.max(0, Math.min(100 - prev.width, blurDragRef.current!.origX + dx)),
-                    y: Math.max(0, Math.min(100 - prev.height, blurDragRef.current!.origY + dy)),
-                  }));
-                };
-                const onUp = () => {
-                  blurDragRef.current = null;
-                  window.removeEventListener('mousemove', onMove);
-                  window.removeEventListener('mouseup', onUp);
-                };
-                window.addEventListener('mousemove', onMove);
-                window.addEventListener('mouseup', onUp);
-              }}
-            >
-              {/* Canvas renders blurred video frames directly */}
-              <canvas
-                ref={blurCanvasRef}
-                width={200}
-                height={80}
-                className="absolute inset-0 w-full h-full"
-                style={{ borderRadius: `${blurMask.borderRadius}px` }}
-              />
-              {/* Drag hint badge */}
-              <div className="absolute top-1 left-2 px-1.5 py-0.5 rounded bg-black/80 text-[9px] text-zinc-300 font-mono opacity-0 group-hover/blur:opacity-100 transition-opacity pointer-events-none flex items-center gap-1">
-                <Eraser className="w-2.5 h-2.5 text-pink-400" />
-                <span>Blur Shape · Drag to move</span>
-              </div>
+          {/* Video Blur Shape Masks Overlay (Multiple Shapes) */}
+          {blurShapes
+            .filter((s) => s.enabled)
+            .map((shape) => {
+              const isSelected = shape.id === activeBlurShapeId;
+              return (
+                <div
+                  key={shape.id}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setActiveBlurShapeId(shape.id);
+                  }}
+                  className={`absolute z-20 group/blur cursor-move transition-shadow ${
+                    isSelected
+                      ? 'ring-2 ring-pink-500 shadow-xl shadow-pink-500/20'
+                      : 'border border-dashed border-white/40 hover:border-pink-400/80'
+                  }`}
+                  style={{
+                    left: `${shape.x}%`,
+                    top: `${shape.y}%`,
+                    width: `${shape.width}%`,
+                    height: `${shape.height}%`,
+                    borderRadius: `${shape.borderRadius}px`,
+                    backdropFilter: `blur(${shape.blurRadius}px)`,
+                    WebkitBackdropFilter: `blur(${shape.blurRadius}px)`,
+                    backgroundColor: `rgba(0, 0, 0, ${shape.opacity * 0.7})`,
+                    userSelect: 'none',
+                  }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    setActiveBlurShapeId(shape.id);
+                    const container = e.currentTarget.parentElement;
+                    if (!container) return;
+                    const rect = container.getBoundingClientRect();
+                    blurDragRef.current = {
+                      id: shape.id,
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      origX: shape.x,
+                      origY: shape.y,
+                    };
+                    const onMove = (me: MouseEvent) => {
+                      if (!blurDragRef.current || blurDragRef.current.id !== shape.id) return;
+                      const dx = ((me.clientX - blurDragRef.current.startX) / rect.width) * 100;
+                      const dy = ((me.clientY - blurDragRef.current.startY) / rect.height) * 100;
+                      setBlurShapes((prev) =>
+                        prev.map((s) =>
+                          s.id === shape.id
+                            ? {
+                                ...s,
+                                x: Math.max(0, Math.min(100 - s.width, blurDragRef.current!.origX + dx)),
+                                y: Math.max(0, Math.min(100 - s.height, blurDragRef.current!.origY + dy)),
+                              }
+                            : s
+                        )
+                      );
+                    };
+                    const onUp = () => {
+                      blurDragRef.current = null;
+                      window.removeEventListener('mousemove', onMove);
+                      window.removeEventListener('mouseup', onUp);
+                    };
+                    window.addEventListener('mousemove', onMove);
+                    window.addEventListener('mouseup', onUp);
+                  }}
+                >
+                  {/* Drag hint badge */}
+                  <div className="absolute top-1 left-2 px-1.5 py-0.5 rounded bg-black/80 text-[9px] text-zinc-200 font-mono opacity-0 group-hover/blur:opacity-100 transition-opacity pointer-events-none flex items-center gap-1 shadow">
+                    <Eraser className="w-2.5 h-2.5 text-pink-400" />
+                    <span>{shape.name} · Drag to move</span>
+                  </div>
 
-              {/* Corner resize handle */}
-              <div
-                className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize flex items-center justify-center opacity-0 group-hover/blur:opacity-100 transition-opacity z-10"
-                onMouseDown={(e) => {
-                  e.stopPropagation();
-                  e.preventDefault();
-                  const container = e.currentTarget.parentElement?.parentElement;
-                  if (!container) return;
-                  const rect = container.getBoundingClientRect();
-                  const startX = e.clientX;
-                  const startY = e.clientY;
-                  const origW = blurMask.width;
-                  const origH = blurMask.height;
-                  const onResizeMove = (me: MouseEvent) => {
-                    const dw = ((me.clientX - startX) / rect.width) * 100;
-                    const dh = ((me.clientY - startY) / rect.height) * 100;
-                    setBlurMask((prev) => ({
-                      ...prev,
-                      width: Math.max(4, Math.min(100 - prev.x, origW + dw)),
-                      height: Math.max(3, Math.min(100 - prev.y, origH + dh)),
-                    }));
-                  };
-                  const onResizeUp = () => {
-                    window.removeEventListener('mousemove', onResizeMove);
-                    window.removeEventListener('mouseup', onResizeUp);
-                  };
-                  window.addEventListener('mousemove', onResizeMove);
-                  window.addEventListener('mouseup', onResizeUp);
-                }}
-              >
-                <div className="w-2.5 h-2.5 bg-pink-500 rounded-sm border border-white shadow-md" />
-              </div>
-            </div>
-          )}
+                  {/* Corner resize handle */}
+                  <div
+                    className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize flex items-center justify-center opacity-0 group-hover/blur:opacity-100 transition-opacity z-10"
+                    onMouseDown={(e) => {
+                      e.stopPropagation();
+                      e.preventDefault();
+                      setActiveBlurShapeId(shape.id);
+                      const container = e.currentTarget.parentElement?.parentElement;
+                      if (!container) return;
+                      const rect = container.getBoundingClientRect();
+                      const startX = e.clientX;
+                      const startY = e.clientY;
+                      const origW = shape.width;
+                      const origH = shape.height;
+                      const onResizeMove = (me: MouseEvent) => {
+                        const dw = ((me.clientX - startX) / rect.width) * 100;
+                        const dh = ((me.clientY - startY) / rect.height) * 100;
+                        setBlurShapes((prev) =>
+                          prev.map((s) =>
+                            s.id === shape.id
+                              ? {
+                                  ...s,
+                                  width: Math.max(4, Math.min(100 - s.x, origW + dw)),
+                                  height: Math.max(3, Math.min(100 - s.y, origH + dh)),
+                                }
+                              : s
+                          )
+                        );
+                      };
+                      const onResizeUp = () => {
+                        window.removeEventListener('mousemove', onResizeMove);
+                        window.removeEventListener('mouseup', onResizeUp);
+                      };
+                      window.addEventListener('mousemove', onResizeMove);
+                      window.addEventListener('mouseup', onResizeUp);
+                    }}
+                  >
+                    <div className="w-2.5 h-2.5 bg-pink-500 rounded-sm border border-white shadow-md" />
+                  </div>
+                </div>
+              );
+            })}
 
 
           {/* Styled Interactive Subtitle Overlay */}
           {isSubtitlesVisible && (() => {
-            let effectiveSourceTime = currentTime;
-            if (clipLayout.length > 0) {
-              const res = timelineToSource(clipLayout, currentTime);
-              if (res) effectiveSourceTime = res.sourceTime;
-            } else if (videoRef.current) {
-              effectiveSourceTime = videoRef.current.currentTime;
-            }
-
-            const seg = findActiveSegmentAtTime(currentProject?.segments, effectiveSourceTime);
+            const seg = findActiveSegmentAtTime(currentProject?.segments, currentTime, clipLayout);
             if (!seg?.text || seg.speaker === 'Freeze' || seg.voice_profile === 'freeze' || seg.text.includes('Freeze Frame')) return null;
             const isSel = !isPlaying && selectedCaptionId === seg.id;
             return (

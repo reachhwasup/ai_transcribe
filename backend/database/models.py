@@ -35,9 +35,9 @@ class Segment(Base):
     __tablename__ = "segments"
 
     id = Column(String, primary_key=True, default=generate_uuid)
-    project_id = Column(String, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(String, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
     index = Column(Integer, nullable=False)
-    start_time = Column(Float, nullable=False)  # seconds
+    start_time = Column(Float, nullable=False, index=True)  # seconds
     end_time = Column(Float, nullable=False)  # seconds
     text = Column(Text, default="")
     original_text = Column(Text, default="")  # original transcription before edits
@@ -57,8 +57,8 @@ class VideoClip(Base):
     __tablename__ = "video_clips"
 
     id = Column(String, primary_key=True, default=generate_uuid)
-    project_id = Column(String, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
-    index = Column(Integer, nullable=False, default=0)
+    project_id = Column(String, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    index = Column(Integer, nullable=False, default=0, index=True)
     source_start = Column(Float, nullable=False, default=0.0)
     source_end = Column(Float, nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))

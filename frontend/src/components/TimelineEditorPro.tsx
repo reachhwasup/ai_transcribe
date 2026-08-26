@@ -57,6 +57,8 @@ import {
   SkipForward,
   Maximize2,
   Wand2,
+  Zap,
+  Upload,
 } from 'lucide-react';
 
 interface Props {
@@ -498,17 +500,9 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     });
   }, []);
 
-  // AI audio playback: sync with video time
+  // AI audio playback: sync with timeline time
   useEffect(() => {
     const segs = [...(currentProject?.segments || [])].sort((a, b) => a.start_time - b.start_time);
-    // Convert timeline time to source time when clips exist
-    let sourceTime = currentTime;
-    if (clipLayout.length > 0) {
-      const result = timelineToSource(clipLayout, currentTime);
-      if (result) {
-        sourceTime = result.sourceTime;
-      }
-    }
 
     if (!isPlaying) {
       // When paused or stopped, pause all audios and clear initiation state
@@ -537,14 +531,23 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
         return;
       }
 
+      const range = clipLayout.length > 0
+        ? sourceRangeToTimeline(clipLayout, seg.start_time, seg.end_time)
+        : { timelineStart: seg.start_time, timelineEnd: seg.end_time, isVisible: true };
+
+      if (!range.isVisible) {
+        if (!audio.paused) audio.pause();
+        return;
+      }
+
       // Audio plays for its full natural spoken duration (never prematurely cut off by next segment)
       const rawClipDur = Number.isFinite(audio.duration) && audio.duration > 0
         ? audio.duration
-        : Math.max(0.5, seg.end_time - seg.start_time);
-      const clipDuration = rawClipDur;
+        : Math.max(0.5, range.timelineEnd - range.timelineStart);
+      const clipDuration = Math.max(rawClipDur, range.timelineEnd - range.timelineStart);
 
-      const offset = sourceTime - seg.start_time;
-      const isWithinWindow = offset >= -0.20 && offset < clipDuration;
+      const offset = currentTime - range.timelineStart;
+      const isWithinWindow = offset >= -0.25 && offset < (clipDuration + 0.35);
 
       if (isWithinWindow) {
         audio.volume = isMuted ? 0 : 1;
@@ -614,6 +617,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
   // Add / Append new video file to timeline
   const addVideoInputRef = useRef<HTMLInputElement>(null);
   const [isUploadingClip, setIsUploadingClip] = useState(false);
+  const [isTimelineDragging, setIsTimelineDragging] = useState(false);
 
   const handleAddVideoFile = useCallback(async (file: File) => {
     if (!currentProject) return;
@@ -622,12 +626,17 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     try {
       const updatedClips = await appendVideoFileToTimeline(currentProject.id, file);
       setVideoClips(updatedClips);
+      await loadProject(currentProject.id);
+      if (videoRef.current) {
+        videoRef.current.load();
+      }
     } catch (err: any) {
       console.error('Failed to append video file to timeline:', err);
+      alert(`Failed to append video: ${err?.response?.data?.detail || err.message || err}`);
     } finally {
       setIsUploadingClip(false);
     }
-  }, [currentProject, pushUndo, setVideoClips]);
+  }, [currentProject, pushUndo, setVideoClips, loadProject, videoRef]);
 
   const handleAddClipClick = () => {
     addVideoInputRef.current?.click();
@@ -783,30 +792,38 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     duration * pixelsPerSecond + (isFitZoom ? 0 : 300)
   );
 
-  // Assign each segment to a lane (track) so overlapping segments go to T2, T3, etc.
+  // Assign each segment to a lane (track) using rendered timeline coordinates so overlapping segments go to T2, T3, etc.
   const { laneMap, laneCount } = useMemo(() => {
-    const sorted = [...segments].sort((a, b) => a.start_time - b.start_time);
-    const lanes: { end: number }[] = []; // each lane tracks its latest end_time
+    const mapped = segments.map((seg) => {
+      const range = clipLayout.length > 0
+        ? sourceRangeToTimeline(clipLayout, seg.start_time, seg.end_time)
+        : { timelineStart: seg.start_time, timelineEnd: seg.end_time, isVisible: true };
+      return { seg, range };
+    }).filter((item) => item.range.isVisible);
+
+    mapped.sort((a, b) => a.range.timelineStart - b.range.timelineStart);
+
+    const lanes: { end: number }[] = []; // each lane tracks its latest timelineEnd
     const map = new Map<string, number>();
 
-    for (const seg of sorted) {
+    for (const item of mapped) {
       let assigned = false;
       for (let i = 0; i < lanes.length; i++) {
-        if (seg.start_time >= lanes[i].end) {
-          lanes[i].end = seg.end_time;
-          map.set(seg.id, i);
+        if (item.range.timelineStart >= lanes[i].end - 0.05) {
+          lanes[i].end = item.range.timelineEnd;
+          map.set(item.seg.id, i);
           assigned = true;
           break;
         }
       }
       if (!assigned) {
-        map.set(seg.id, lanes.length);
-        lanes.push({ end: seg.end_time });
+        map.set(item.seg.id, lanes.length);
+        lanes.push({ end: item.range.timelineEnd });
       }
     }
 
     return { laneMap: map, laneCount: Math.max(lanes.length, 1) };
-  }, [segments]);
+  }, [segments, clipLayout]);
 
   const toggleTrackMute = (lane: number) => {
     setMutedTracks((prev) => {
@@ -2725,8 +2742,28 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
         {/* Scrollable timeline */}
         <div
           ref={containerRef}
-          className="flex-1 overflow-auto relative select-none"
+          className={`flex-1 overflow-auto relative select-none transition-colors ${
+            isTimelineDragging ? 'bg-teal-950/20 ring-2 ring-inset ring-teal-500/50' : ''
+          }`}
           onClick={handleTimelineClick}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+            if (!isTimelineDragging) setIsTimelineDragging(true);
+          }}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+              setIsTimelineDragging(false);
+            }
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            setIsTimelineDragging(false);
+            const file = e.dataTransfer.files?.[0];
+            if (file) {
+              handleAddVideoFile(file);
+            }
+          }}
           onScroll={(e) => {
             if (trackLabelsRef.current) {
               trackLabelsRef.current.scrollTop = e.currentTarget.scrollTop;
@@ -2734,6 +2771,19 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
             setViewportScrollLeft(e.currentTarget.scrollLeft);
           }}
         >
+          {/* Drag & Drop Overlay Indicator */}
+          {isTimelineDragging && (
+            <div className="sticky left-0 top-0 w-full h-full min-h-[220px] z-50 pointer-events-none bg-teal-950/80 backdrop-blur-sm border-2 border-dashed border-teal-400 flex flex-col items-center justify-center gap-2 text-teal-200 animate-in fade-in">
+              <Upload className="w-9 h-9 text-teal-300 animate-bounce" />
+              <span className="text-sm font-bold text-white tracking-wide shadow-sm">
+                Drop video file to add to timeline
+              </span>
+              <span className="text-xs text-teal-300/80 font-mono">
+                Supports MP4, MOV, WebM, MKV, AVI, TS
+              </span>
+            </div>
+          )}
+
           <div className="relative" style={{ width: totalWidth, minHeight: '100%' }}>
             {/* Time ruler — click or drag to scrub */}
             <div
@@ -2908,46 +2958,42 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                         </div>
                       )}
 
-                      {/* Clean minimalist label overlay */}
-                      <div className="absolute top-0 left-0 right-0 z-10 px-2 py-0.5 bg-gradient-to-b from-black/80 to-transparent flex items-center justify-between pointer-events-none">
-                        <div className="flex items-center gap-1.5 truncate">
-                          {videoClips.length > 1 && (
-                            <span className="px-1.5 py-0.2 rounded bg-teal-900/90 border border-teal-500/60 text-[9px] font-black text-teal-200 tracking-wider">
-                              Clip {String.fromCharCode(65 + (clip.index ?? 0))}
-                            </span>
-                          )}
-                          <span className="text-[10px] text-teal-200 font-medium truncate">
-                            {currentProject?.video_filename || 'Video'}
-                          </span>
-                        </div>
-                        <span className="text-[9px] text-teal-300/70 font-mono whitespace-nowrap">
-                          {fmtTime(clipDuration)}
-                        </span>
-                      </div>
-
-                      {/* Thumbnail strip */}
-                      <div className="flex h-full overflow-hidden rounded-md">
+                      {/* One clean Thumbnail card + Sleek Clip Bar */}
+                      <div className="relative flex items-center h-full w-full overflow-hidden rounded-md bg-[#131b24] border border-teal-900/50">
                         {thumbsPerClip.length > 0 ? (
-                          thumbsPerClip.map((src, i) => (
+                          <div className="relative h-full aspect-video shrink-0 bg-black/40 overflow-hidden border-r border-teal-500/30">
                             <img
-                              key={i}
-                              src={src}
+                              src={thumbsPerClip[0]}
                               alt=""
-                              className="h-full object-cover shrink-0"
-                              style={{ width: `${100 / thumbsPerClip.length}%`, minWidth: 0 }}
+                              className="w-full h-full object-cover"
                               draggable={false}
                             />
-                          ))
+                            <div className="absolute inset-0 bg-gradient-to-r from-transparent via-transparent to-[#131b24]/80 pointer-events-none" />
+                          </div>
                         ) : (
-                          /* Gradient placeholder while thumbnails load */
-                          <div className="w-full h-full bg-gradient-to-r from-teal-900/40 via-teal-800/20 to-teal-900/40 flex items-center justify-center">
-                            <Film className="w-4 h-4 text-teal-400/30" />
+                          <div className="h-full aspect-video shrink-0 bg-teal-950/60 flex items-center justify-center border-r border-teal-500/30">
+                            <Film className="w-4 h-4 text-teal-400/50" />
                           </div>
                         )}
+
+                        {/* Clip Information & Status */}
+                        <div className="flex-1 min-w-0 px-2.5 flex items-center justify-between gap-2 pointer-events-none">
+                          <div className="flex items-center gap-1.5 truncate">
+                            <span className="px-1.5 py-0.5 rounded bg-teal-950 border border-teal-400/40 text-[9px] font-black text-teal-300 uppercase tracking-wider shrink-0 shadow-sm">
+                              Clip {String.fromCharCode(65 + (clip.index ?? 0))}
+                            </span>
+                            <span className="text-[11px] font-semibold text-zinc-200 truncate tracking-tight">
+                              {currentProject?.video_filename || 'Video'}
+                            </span>
+                          </div>
+                          <span className="text-[10px] text-teal-300/80 font-mono font-bold shrink-0 bg-black/40 px-1.5 py-0.5 rounded border border-white/5">
+                            {fmtTime(clipDuration)}
+                          </span>
+                        </div>
                       </div>
 
-                      {/* Bottom waveform decoration bar */}
-                      <div className="absolute bottom-0 left-0 right-0 h-2 bg-gradient-to-t from-teal-500/30 to-transparent" />
+                      {/* Bottom highlight bar */}
+                      <div className="absolute bottom-0 left-0 right-0 h-1.5 bg-gradient-to-r from-teal-500/40 via-teal-400/20 to-transparent pointer-events-none" />
 
                       {/* Delete button (on selection or hover) */}
                       <button
@@ -2966,35 +3012,46 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                   );
                 })
               ) : currentProject?.video_path ? (
-                <div className="absolute top-2 rounded-md overflow-hidden" style={{
-                  left: 0,
-                  width: timeToX(duration),
-                  height: VIDEO_TRACK_HEIGHT - 16,
-                  border: '2px solid #0d9488',
-                  background: 'var(--bg-base)',
-                }}>
-                  <div className="flex h-full overflow-hidden">
+                <div
+                  className="absolute top-2 rounded-md overflow-hidden"
+                  style={{
+                    left: 0,
+                    width: timeToX(duration),
+                    height: VIDEO_TRACK_HEIGHT - 16,
+                    border: '2px solid #0d9488',
+                    background: 'var(--bg-base)',
+                  }}
+                >
+                  <div className="relative flex items-center h-full w-full overflow-hidden rounded-md bg-[#131b24] border border-teal-900/50">
                     {thumbnails.length > 0 ? (
-                      thumbnails.map((src, i) => (
+                      <div className="relative h-full aspect-video shrink-0 bg-black/40 overflow-hidden border-r border-teal-500/30">
                         <img
-                          key={i}
-                          src={src}
+                          src={thumbnails[0]}
                           alt=""
-                          className="h-full object-cover shrink-0"
-                          style={{ width: `${100 / thumbnails.length}%`, minWidth: 0 }}
+                          className="w-full h-full object-cover"
                           draggable={false}
                         />
-                      ))
+                        <div className="absolute inset-0 bg-gradient-to-r from-transparent via-transparent to-[#131b24]/80 pointer-events-none" />
+                      </div>
                     ) : (
-                      <div className="w-full h-full bg-gradient-to-r from-teal-900/40 via-teal-800/20 to-teal-900/40 flex items-center justify-center">
-                        <Film className="w-4 h-4 text-teal-400/30" />
+                      <div className="h-full aspect-video shrink-0 bg-teal-950/60 flex items-center justify-center border-r border-teal-500/30">
+                        <Film className="w-4 h-4 text-teal-400/50" />
                       </div>
                     )}
-                  </div>
-                  <div className="absolute top-0 left-0 right-0 z-10 px-2 py-0.5 bg-gradient-to-b from-black/70 to-transparent">
-                    <span className="text-[10px] text-teal-200 font-medium">
-                      {currentProject?.video_filename || 'Video'}
-                    </span>
+
+                    <div className="flex-1 min-w-0 px-2.5 flex items-center justify-between gap-2 pointer-events-none">
+                      <div className="flex items-center gap-1.5 truncate">
+                        <span className="px-1.5 py-0.5 rounded bg-teal-950 border border-teal-400/40 text-[9px] font-black text-teal-300 uppercase tracking-wider shrink-0 shadow-sm">
+                          Clip A
+                        </span>
+                        <span className="text-[11px] font-semibold text-zinc-200 truncate tracking-tight">
+                          {currentProject?.video_filename || 'Video'}
+                        </span>
+                      </div>
+                      <span className="text-[10px] text-teal-300/80 font-mono font-bold shrink-0 bg-black/40 px-1.5 py-0.5 rounded border border-white/5">
+                        {fmtTime(duration)}
+                      </span>
+                    </div>
                   </div>
                 </div>
               ) : (
@@ -3333,7 +3390,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
               if (el) aiAudioRefs.current.set(seg.id, el);
               else aiAudioRefs.current.delete(seg.id);
             }}
-            src={seg.audio_url}
+            src={seg.audio_url.startsWith('http') || seg.audio_url.startsWith('/') ? seg.audio_url : '/' + seg.audio_url.replace(/^\.\//, '')}
             preload="auto"
             muted={isMuted}
           />

@@ -110,18 +110,18 @@ export default function Dashboard() {
       </header>
 
       {/* Main Content Dashboard */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-6 md:p-8 space-y-6">
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 md:p-8 space-y-6">
         {/* Top Hero / Search Bar */}
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-[#14161b] border border-[#21242c] rounded-2xl p-6 shadow-sm">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-[#14161b] border border-[#21242c] rounded-2xl p-5 sm:p-6 shadow-sm">
           <div>
-            <h2 className="text-xl font-bold text-white tracking-tight">My Video Projects</h2>
+            <h2 className="text-lg sm:text-xl font-bold text-white tracking-tight">My Video Projects</h2>
             <p className="text-xs text-zinc-400 mt-1">
               Create, transcribe, dub, and export videos with authentic Khmer neural voices.
             </p>
           </div>
 
           <div className="flex items-center gap-3">
-            <div className="relative w-full md:w-72">
+            <div className="relative w-full sm:w-72">
               <Search className="w-4 h-4 text-zinc-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
@@ -164,7 +164,7 @@ export default function Dashboard() {
             )}
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 sm:gap-5">
             {/* New Project Quick Card */}
             <div
               onClick={() => setShowCreate(true)}

@@ -14,10 +14,10 @@ from backend.database.models import ApiKey
 from sqlalchemy import select
 
 # Chunking settings for dense, ultra-fast, complete video dialogue coverage
-CHUNK_DURATION = 600    # 600 seconds (10 minutes) per macro-chunk
-CHUNK_OVERLAP = 3       # 3 second overlap between chunks to avoid boundary gaps
-CHUNK_THRESHOLD = 600   # Split videos exceeding 10 minutes into macro chunks
-MAX_PARALLEL_CHUNKS = 3  # Process up to 3 chunks simultaneously (key-rotated)
+CHUNK_DURATION = 150    # 150 seconds (2.5 minutes) per chunk for 100% complete dialogue capture
+CHUNK_OVERLAP = 5       # 5 second overlap between chunks to avoid boundary gaps
+CHUNK_THRESHOLD = 150   # Split videos exceeding 2.5 minutes into granular chunks
+MAX_PARALLEL_CHUNKS = 4  # Process up to 4 chunks simultaneously (key-rotated)
 
 # Gemini File API rejects uploads larger than 2 GiB. Compress anything that
 # gets close, so we stay safely under the hard limit.
@@ -144,15 +144,15 @@ async def _split_video_chunks(video_path: str, chunk_duration: float = CHUNK_DUR
     tmp_dir = tempfile.mkdtemp(prefix="gemini_chunks_")
     full_audio_path = os.path.join(tmp_dir, "full_audio.mp3")
 
-    # Step 1: Extract complete 16kHz mono audio once in 2-3 seconds
+    # Step 1: Extract high-fidelity 24kHz mono audio once in 2-3 seconds
     extract_cmd = [
         ffmpeg, "-y",
         "-i", video_path,
         "-vn",
         "-acodec", "libmp3lame",
-        "-ar", "16000",
+        "-ar", "24000",
         "-ac", "1",
-        "-b:a", "64k",
+        "-b:a", "128k",
         full_audio_path,
     ]
     res = await asyncio.to_thread(subprocess.run, extract_cmd, capture_output=True, text=True, timeout=120)
@@ -175,9 +175,9 @@ async def _split_video_chunks(video_path: str, chunk_duration: float = CHUNK_DUR
             "-t", str(extract_dur),
             "-vn",
             "-acodec", "libmp3lame",
-            "-ar", "16000",
+            "-ar", "24000",
             "-ac", "1",
-            "-b:a", "64k",
+            "-b:a", "128k",
             chunk_path,
         ]
         result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=60)
@@ -627,6 +627,13 @@ def sanitize_segments(segments: list) -> list:
         if end <= start + 0.2:
             end = start + 1.2
 
+        # Prevent runaway subtitle segment duration (e.g. spanning minutes across the timeline)
+        text_str = s.get("text", "") or s.get("original_text", "") or ""
+        char_len = len(text_str.strip())
+        max_dur = max(2.5, min(char_len * 0.2, 12.0))
+        if (end - start) > 15.0:
+            end = start + max_dur
+
         prev_start = start
         item = dict(s)
         item["start_time"] = round(start, 2)
@@ -858,20 +865,47 @@ def _build_narration_prompt(
             "temperature": 0.82,
         },
         "recap_viral": {
-            "headline": "a VIRAL MOVIE RECAP (សម្រាយរឿងបែបកក្រើក) — fast, punchy, high-tension, addictive recap style.",
+            "headline": "a VIRAL MOVIE RECAP (សម្រាយរឿងបែប Viral / ហ្វេសប៊ុក & យូធូប) — engaging, high-tension, addictive Cambodian movie recap style.",
             "voice": [
                 "Hook the audience immediately in the first 2 seconds describing the opening situation.",
-                "Use classic movie recap phrasing and nicknames ('មើលទៅបុរសម្នាក់នេះ', 'នារីកំសត់', 'មេបក្សកំណាច').",
+                "Use classic Cambodian movie recap phrasing and nicknames ('មើលទៅបុរសម្នាក់នេះ', 'នារីកំសត់', 'មេបក្សកំណាច', 'ក្មេងទំនើង').",
                 "Keep suspense at maximum intensity between beats ('មិននឹកស្មានដល់ថា...', 'ស្រាប់តែពេលនោះ...', 'តើមានអ្វីកើតឡើងបន្ត?').",
                 "Directly follow the physical actions, fights, and reveals on screen.",
+                "End with an engaging call-to-action asking viewers their thoughts in the comments.",
             ],
             "pacing": "Short, rapid segments, 2.5-4.0 seconds each, synchronized with scene cuts.",
             "dialogue": "light",
             "opening": "The first line must shock the viewer and describe the opening visual hook.",
             "temperature": 0.80,
         },
+        "recap_comedy": {
+            "headline": "a COMEDY & FUNNY COMMENTARY RECAP (សម្រាយរឿងបែបកំប្លែង & សើចសប្បាយ) — humorous, witty, sarcastic, and energetic.",
+            "voice": [
+                "Tease the characters' silly decisions, dramatic facial expressions, and exaggerated actions with good-humored Khmer slang.",
+                "Give hilarious, creative nicknames to characters ('អាមុខងាប់', 'លោកពូកំពូលកូរ', 'ស្រីស្អាតចិត្តដាច់', 'អ្នកក្លាហានអត់បាយ').",
+                "Add witty punchlines and comical reaction commentary ('ដល់កហើយលោកអើយ!', 'ចាញ់បោកគេទៀតហើយ!', 'ឃើញមុខស្លូតតែខូចកប់!').",
+                "Keep the storytelling fun, lively, and entertaining throughout every scene.",
+            ],
+            "pacing": "Punchy 2.2-3.8 second segments with playful pauses and energetic punchlines.",
+            "dialogue": "light",
+            "opening": "Open with a hilarious observation or playful jab at the main character's situation.",
+            "temperature": 0.85,
+        },
+        "recap_action": {
+            "headline": "an ACTION & MARTIAL ARTS BATTLE RECAP (សម្រាយរឿងបែបវាយប្រហារ & ក្បាច់គុន) — explosive, high-adrenaline, strike-by-strike combat calls.",
+            "voice": [
+                "High-octane cadence describing strikes, sword moves, martial arts clashes, escapes, and showdowns.",
+                "Use powerful martial arts and combat action verbs ('ទាត់មួយជើង...', 'គេចផុតយ៉ាងរហ័ស...', 'ដកដាវទេពវាយប្រហារ...', 'ការប្រយុទ្ធដ៏ស្វិតស្វាញ').",
+                "Match every strike, explosion, and camera movement closely with high tension.",
+                "Emphasize the stakes: life-or-death survival, clan revenge, and ultimate martial mastery.",
+            ],
+            "pacing": "Rapid-fire 2.0-3.5 second segments matching physical action on screen.",
+            "dialogue": "light",
+            "opening": "Open directly into the heat of the action or imminent danger in the first frame.",
+            "temperature": 0.78,
+        },
         "recap_cinema": {
-            "headline": "a CINEMATIC MOVIE RECAP (សម្រាយរឿងបែបភាពយន្ត) — dramatic, visually-grounded, scene-by-scene storytelling.",
+            "headline": "a CINEMATIC MOVIE RECAP (សម្រាយរឿងបែបភាពយន្ត & មនោសញ្ចេតនា) — dramatic, visually-grounded, scene-by-scene storytelling.",
             "voice": [
                 "Narrate the exact physical actions, confrontations, and drama occurring on screen with cinematic flair.",
                 "Describe character gestures, expressions, weapon moves, and discoveries as they unfold in each shot.",
@@ -883,52 +917,43 @@ def _build_narration_prompt(
             "opening": "Hook the viewer with a dramatic opening statement describing the initial scene.",
             "temperature": 0.75,
         },
-        "recap_action": {
-            "headline": "an ACTION & THRILLER RECAP (សម្រាយរឿងវាយប្រហារ & ក្បាច់គុន) — high adrenaline, fast-paced momentum.",
+        "recap_suspense": {
+            "headline": "a MYSTERY & SUSPENSE THRILLER RECAP (សម្រាយរឿងបែបអាថ៌កំបាំង & ស៊ើបអង្កេត) — dark secrets, psychological tension, and shocking plot twists.",
             "voice": [
-                "High-octane cadence describing strikes, martial arts moves, escapes, and showdowns.",
-                "Punchy action verbs ('ទាត់មួយជើង...', 'គេចផុតយ៉ាងលឿន...', 'ការប្រយុទ្ធដ៏ស្វិតស្វាញ').",
-                "Match every strike and camera movement closely.",
+                "Build deep intrigue around clues, hidden identities, betrayals, and unexpected motives.",
+                "Use whisper/suspenseful phrasing ('តើការពិតនៅពីក្រោយរឿងនេះជាអ្វី?', 'មានអាថ៌កំបាំងមួយដែលគ្មានអ្នកណាដឹង...', 'ស្រមោលអន្ធការបានលេចឡើង...').",
+                "Highlight every suspicious look, background detail, and plot twist discovery.",
+                "Deliver mind-blowing revelation beats at the climax.",
             ],
-            "pacing": "Rapid-fire 2.0-3.5 second segments matching physical action on screen.",
+            "pacing": "Measured 2.5-4.2 second segments with suspenseful pauses between revelations.",
             "dialogue": "light",
-            "opening": "Open directly into the heat of the action or imminent danger in the first frame.",
-            "temperature": 0.78,
+            "opening": "Open with an eerie, gripping question about the unsolved mystery seen on screen.",
+            "temperature": 0.76,
+        },
+        "documentary": {
+            "headline": "a FORMAL DOCUMENTARY / EDUCATIONAL VOICEOVER (ការអត្ថាធិប្បាយបែបផ្លូវការ) — refined, articulate, informative, and authoritative.",
+            "voice": [
+                "Polished, professional, and clear tone suited for documentaries, history, and scientific explainers.",
+                "Explain the context, background, and significance of what is visible on screen with precision.",
+                "Clear, measured cadence without artificial slang.",
+                "Cover the narrative in a structured, chronological manner.",
+            ],
+            "pacing": "Measured 3.2-4.8 second segments with natural academic clarity.",
+            "dialogue": "none",
+            "opening": "Open with an authoritative and captivating overview statement of the subject matter.",
+            "temperature": 0.40,
         },
         "summary": {
-            "headline": "a concise, factual SUMMARY — like a clean explainer or news breakdown.",
+            "headline": "a concise, factual SUMMARY (សង្ខេបសាច់រឿងខ្លីខ្លឹម) — clean, fast highlight reel of the main plot.",
             "voice": [
-                "Neutral, clear, informative — an objective narrator.",
-                "Report the key events plainly without artificial hype or cliffhangers.",
-                "Cover the essential plot points scene by scene.",
+                "Clear, objective storytelling focusing strictly on key plot milestones and outcome.",
+                "Cover the beginning premise, major turning points, and final conclusion concisely.",
+                "Keep every sentence crisp and easy to follow.",
             ],
-            "pacing": "Medium segments, 3.0-4.5 seconds.",
+            "pacing": "Concise 2.5-4.0 second segments.",
             "dialogue": "none",
-            "opening": "Open by stating plainly what the video is about.",
-            "temperature": 0.35,
-        },
-        "educational": {
-            "headline": "an engaging EDUCATIONAL / DOCUMENTARY narration — structured, authoritative, and fascinating.",
-            "voice": [
-                "Storyteller-educator tone with engaging phrasing.",
-                "Highlight key concepts, historical facts, or scientific insights shown on screen.",
-                "Clear, measured cadence suited for learning.",
-            ],
-            "pacing": "Medium segments, 3.5-5.0 seconds.",
-            "dialogue": "none",
-            "opening": "Open with a fascinating observation of the opening visual.",
-            "temperature": 0.45,
-        },
-        "story": {
-            "headline": "a STORYTELLING narration — turn the video into an immersive classic story.",
-            "voice": [
-                "Classic narrative arc: exposition, rising action, climax, and emotional payoff.",
-                "Warm storytelling voice describing the characters' journey.",
-            ],
-            "pacing": "Varied segments, 3.0-4.5 seconds.",
-            "dialogue": "light",
-            "opening": "Open with an evocative story premise.",
-            "temperature": 0.70,
+            "opening": "Open by stating plainly what the story or situation is about.",
+            "temperature": 0.50,
         },
     }
 
@@ -971,10 +996,11 @@ CRITICAL TIMELINE & FULL COVERAGE RULES (ហាមឈប់មុនចប់វ
     khmer_specific_guide = ""
     if language == "km":
         khmer_specific_guide = """
-KHMER MOVIE RECAP SPECIFIC RULES (ភាសាសម្រាយរឿងខ្មែរ):
-- Use natural Cambodian movie recap phrasing (e.g. នៅក្នុងឈុតឆាកនេះ, ភ្លាមនោះស្រាប់តែ, រឿងរ៉ាវកាន់តែតានតឹង, មិននឹកស្មានដល់ថា, ចុងក្រោយ).
+KHMER MOVIE RECAP SPECIFIC RULES (ភាសាសម្រាយរឿងខ្មែរអាជីព):
+- Use authentic, lively Cambodian movie recap vocabulary (e.g. នៅក្នុងឈុតឆាកនេះ, ភ្លាមនោះស្រាប់តែ, មិននឹកស្មានដល់ថា, គ្រោះកាចបានមកដល់, រឿងរ៉ាវកាន់តែតានតឹង, ចុងក្រោយ).
 - Standard continuous Khmer script with NO artificial spaces between syllables or words.
-- Use natural spoken pronouns (ខ្ញុំ, ឯង, គាត់, នាង, បង, អូន, ពុក, ម៉ែ, មេ) matching character hierarchy."""
+- Natural spoken pronouns matching character relationships (ខ្ញុំ, ឯង, គាត់, នាង, បង, អូន, ពុក, ម៉ែ, មេ, លោកពូ, អាប្រុស).
+- Set appropriate 'emotion' on every segment (excited, serious, angry, fearful, sad, happy, whisper, neutral) so the voiceover speaks with full human feeling."""
 
     prompt = f"""You are a master movie recap and video voiceover scriptwriter (អ្នកសម្រាយរឿងអាជីព).
 
@@ -1040,11 +1066,11 @@ async def generate_narration(
         keys = [settings.gemini_api_key]
 
     models_to_try = [
-        settings.gemini_model or "gemini-flash-latest",
-        "gemini-flash-latest",
-        "gemini-3.6-flash",
-        "gemini-3.7-flash",
-        "gemini-flash-lite-latest",
+        settings.gemini_model or "gemini-2.5-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
     ]
     seen = set()
     models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
@@ -1109,9 +1135,22 @@ async def generate_narration(
             text = re.sub(r"^```(?:json)?\n?", "", text)
             text = re.sub(r"\n?```$", "", text)
 
-        segments = _safe_json_loads(text)
+        raw_data = _safe_json_loads(text)
+        segments = []
+        if isinstance(raw_data, list):
+            segments = raw_data
+        elif isinstance(raw_data, dict):
+            for k in ["segments", "narration", "blocks", "scenes", "cues", "data", "script"]:
+                if isinstance(raw_data.get(k), list):
+                    segments = raw_data[k]
+                    break
+            else:
+                segments = [raw_data]
+
         cleaned = []
         for i, seg in enumerate(segments):
+            if not isinstance(seg, dict):
+                continue
             seg_text = str(seg.get("text", "")).strip()
             # Strip watermark URLs Gemini may have read off the video
             seg_text = re.sub(r"(?:https?://|www\.)\S+", "", seg_text).strip()
@@ -1318,37 +1357,42 @@ async def transcribe_video_streaming(video_path: str, language: str = "km", on_p
 
             clean_new = []
             for n_seg in new_segments:
-                n_start = n_seg.get("start_time", 0)
-                n_end = n_seg.get("end_time", 0)
-                n_text = n_seg.get("text", "").strip()
-                n_orig = n_seg.get("original_text", "").strip()
+                n_start = n_seg.get("start_time", 0.0)
+                n_end = n_seg.get("end_time", 0.0)
+                n_text = str(n_seg.get("text", "")).strip()
+                n_orig = str(n_seg.get("original_text", "")).strip()
                 if not n_text and not n_orig:
                     continue
 
                 is_dup = False
-                for ex_seg in reversed(existing_segments[-40:]):
-                    ex_start = ex_seg.get("start_time", 0)
-                    ex_end = ex_seg.get("end_time", 0)
-                    ex_text = ex_seg.get("text", "").strip()
-                    ex_orig = ex_seg.get("original_text", "").strip()
+                # Check only the most recent boundary segments (within boundary window)
+                for ex_seg in reversed(existing_segments[-20:]):
+                    ex_start = ex_seg.get("start_time", 0.0)
+                    ex_end = ex_seg.get("end_time", 0.0)
+                    ex_text = str(ex_seg.get("text", "")).strip()
+                    ex_orig = str(ex_seg.get("original_text", "")).strip()
 
-                    if abs(n_start - ex_start) > 60.0:
+                    # Only check segments within boundary overlap window (CHUNK_OVERLAP + 2.0s)
+                    if abs(n_start - ex_start) > (CHUNK_OVERLAP + 2.5):
                         continue
 
-                    # Exact text match within 30s
-                    if n_text and ex_text and n_text == ex_text and abs(n_start - ex_start) < 30.0:
-                        is_dup = True
-                        break
-                    # Exact original text match within 40s
-                    if n_orig and ex_orig and n_orig == ex_orig and abs(n_start - ex_start) < 40.0:
-                        is_dup = True
-                        break
-                    # Substring overlap
-                    if len(n_orig) > 15 and len(ex_orig) > 15 and (n_orig in ex_orig or ex_orig in n_orig) and abs(n_start - ex_start) < 25.0:
-                        is_dup = True
-                        break
-                    # Boundary collision
-                    if n_text == ex_text and n_start < ex_end - 0.2:
+                    # Calculate temporal overlap
+                    ov_start = max(n_start, ex_start)
+                    ov_end = min(n_end, ex_end)
+                    ov_len = max(0.0, ov_end - ov_start)
+                    min_dur = max(0.2, min(n_end - n_start, ex_end - ex_start))
+
+                    # True boundary duplicate: high temporal overlap (>50%) AND matching text
+                    if ov_len / min_dur > 0.4:
+                        if (n_text and ex_text and n_text == ex_text) or (n_orig and ex_orig and n_orig == ex_orig):
+                            is_dup = True
+                            break
+                        if len(n_orig) > 6 and len(ex_orig) > 6 and (n_orig in ex_orig or ex_orig in n_orig):
+                            is_dup = True
+                            break
+
+                    # Boundary timestamp collision (< 0.8s apart) with identical text
+                    if abs(n_start - ex_start) < 0.8 and ((n_text and ex_text and n_text == ex_text) or (n_orig and ex_orig and n_orig == ex_orig)):
                         is_dup = True
                         break
 
@@ -2012,96 +2056,310 @@ async def generate_social_media_script(
     transcript_text: str = "",
     video_path: str = "",
     language: str = "km",
+    platform: str = "tiktok",
+    tone: str = "suspense",
+    duration_target: str = "30-60s",
+    custom_notes: str = "",
 ) -> dict:
-    """Generate a complete social media caption, synopsis, CTA, and viral hashtags."""
+    """Generate a complete social media caption, synopsis, CTA, pinned comment, and viral hashtags."""
     keys = await _get_active_keys()
     if not keys:
         if not settings.gemini_api_key or settings.gemini_api_key == "your_gemini_api_key_here":
             raise RuntimeError("No active Gemini API keys configured. Please add an API key in Settings.")
         keys = [settings.gemini_api_key]
 
-    system_instruction = f"""You are a master viral short-form video director and scriptwriter for TikTok, YouTube Shorts, and Facebook Reels.
+    platform_guide = {
+        "tiktok": "TikTok & Douyin short-form (ultra-punchy 3-second hook, fast cut cues, trending sound cue, hashtag stack)",
+        "youtube_shorts": "YouTube Shorts (high retention curve, cliffhanger pacing, subscribe & comment CTA)",
+        "facebook_reels": "Facebook Reels (emotionally resonant Khmer storytelling, community shareability, debate starter)",
+        "instagram_reels": "Instagram Reels (aesthetic visual notes, engaging caption formatting, save & share CTA)",
+    }.get(platform, "Universal Short-Form (TikTok, Shorts, Reels)")
 
+    tone_guide = {
+        "suspense": "Fast-paced, high-tension, intense thriller/action suspense",
+        "humor": "Humorous, witty, sarcastic commentary with lively punchlines",
+        "dramatic": "Emotional, deeply dramatic, inspiring, and cinematic",
+        "twist": "Mysterious, mind-blowing plot twist and shocking revelation",
+        "fast_action": "High-octane, adrenaline-fueled, explosive martial arts/battle breakdown",
+    }.get(tone, "Fast-paced, cinematic, high-retention")
+
+    system_instruction = f"""You are a master short-form video director, creative copywriter, and scriptwriter specialized in {platform_guide}.
+
+Target Platform: {platform_guide}
+Target Tone: {tone_guide}
+Target Video Duration: {duration_target}
 Language: {language} (use natural conversational Khmer with standard continuous script and engaging emojis if language is 'km', or English if 'en').
+
+CRITICAL REQUIREMENT:
+You MUST generate between 4 to 8 sequential timeline scene blocks in the "blocks" array covering the entire duration from 0:00 to the end. Every block MUST have a non-empty, compelling voiceover script line in natural Khmer, visual direction, on-screen text, sound effect cue, and accurate start_time and end_time.
 
 Generate a complete, high-converting Short-Form Video Production Script package matching this exact JSON schema:
 {{
   "title": "Movie Title / Topic",
-  "total_duration": "~45-50 seconds",
-  "tone": "Fast-paced, intense, cinematic, high-energy",
-  "bgm_suggestion": "Heavy epic dark cinematic drumbeat / fast wuxia battle music",
-  "hook": "Opening viral hook line",
+  "total_duration": "{duration_target}",
+  "platform": "{platform}",
+  "tone": "{tone_guide}",
+  "bgm_suggestion": "Heavy epic dark cinematic drumbeat / fast battle music with BPM suggestion",
+  "hook": "Opening viral hook line (first 3-5 seconds)",
   "synopsis": "Engaging story summary with emojis and highlights",
   "call_to_action": "Engaging CTA for comments, likes, and follows",
+  "pinned_comment": "Curiosity/debate question to pin in comments to trigger viewer replies",
+  "editing_tips": [
+    "Tip 1: e.g. Add sudden zoom-in on the 2nd second beat",
+    "Tip 2: e.g. Lower BGM by -12dB during voiceover punchline",
+    "Tip 3: e.g. Flash red vignette on the shocking climax cut"
+  ],
   "blocks": [
     {{
-      "time_range": "[00:00 - 00:03]",
+      "time_range": "[00:00 - 00:05]",
       "start_time": 0.0,
-      "end_time": 3.0,
+      "end_time": 5.0,
       "block_name": "THE HOOK",
-      "visual": "Description of scene action",
-      "text_on_screen": "Punchy on-screen caption text with emojis",
-      "sound_effect": "e.g. Whoosh / Blade Clashing SFX / Bass Drop",
-      "voiceover": "Spoken voiceover script line",
-      "voiceover_tone": "Hyped/Intense/Dramatic"
+      "visual": "Opening dramatic shock frame / intense close-up",
+      "text_on_screen": "ចំណុចចាប់ផ្តើមដ៏រន្ធត់! 😱",
+      "sound_effect": "Dramatic bass drop / whoosh SFX",
+      "voiceover": "រឿងរ៉ាវដ៏រន្ធត់មួយបានកើតឡើង នៅពេលដែលបុរសម្នាក់នេះ...",
+      "voiceover_tone": "Hyped / Intense"
+    }},
+    {{
+      "time_range": "[00:05 - 00:18]",
+      "start_time": 5.0,
+      "end_time": 18.0,
+      "block_name": "THE BUILDUP",
+      "visual": "Fast cuts showing the dark secret and escalating conflict",
+      "text_on_screen": "ការពិតដែលលាក់កំបាំង... ⚔️",
+      "sound_effect": "Heartbeat tension / rising cinematic strings",
+      "voiceover": "គាត់មិនបានដឹងខ្លួនទេថា ការសម្រេចចិត្តមួយនេះនឹងផ្លាស់ប្តូរជីវិតរបស់គាត់ជារៀងរហូត...",
+      "voiceover_tone": "Suspenseful / Dramatic"
+    }},
+    {{
+      "time_range": "[00:18 - 00:35]",
+      "start_time": 18.0,
+      "end_time": 35.0,
+      "block_name": "THE TURNING POINT",
+      "visual": "Confrontation and shocking plot twist reveal",
+      "text_on_screen": "ការក្បត់ដែលគ្មានអ្នកណាដឹង! 💥",
+      "sound_effect": "Explosion / Glass Shatter / High tension riser",
+      "voiceover": "ស្រាប់តែស្រមោលខ្មៅមួយបានលេចឡើង ហើយការពិតទាំងអស់ក៏ត្រូវបានលាតត្រដាង!",
+      "voiceover_tone": "Shocking / Emotional"
+    }},
+    {{
+      "time_range": "[00:35 - 00:50]",
+      "start_time": 35.0,
+      "end_time": 50.0,
+      "block_name": "THE CLIMAX",
+      "visual": "High-stakes battle and decisive showdown",
+      "text_on_screen": "ការតស៊ូដល់ដង្ហើមចុងក្រោយ! 🔥",
+      "sound_effect": "Heavy impact boom / crescendo",
+      "voiceover": "គាត់ត្រូវប្រយុទ្ធដើម្បីរស់ និងការពារអ្នកដែលគាត់ស្រឡាញ់បំផុត!",
+      "voiceover_tone": "Heroic / High Energy"
+    }},
+    {{
+      "time_range": "[00:50 - 01:00]",
+      "start_time": 50.0,
+      "end_time": 60.0,
+      "block_name": "OUTRO & CTA",
+      "visual": "Lingering cliffhanger face shot with text overlay",
+      "text_on_screen": "តើអ្នកយល់យ៉ាងណាដែរ? ខមមិនមក! 👇",
+      "sound_effect": "Cinematic drum fade",
+      "voiceover": "តើគាត់អាចរួចផុតពីគ្រោះថ្នាក់នេះបានដែរឬទេ? ខមមិនប្រាប់ខាងក្រោម ហើយកុំភ្លេច Follow ផងណា!",
+      "voiceover_tone": "Engaging / Question"
     }}
   ],
-  "titles": [
-    "Viral High-CTR Title 1 🗡️",
-    "Viral High-CTR Title 2 ⚔️",
-    "Viral High-CTR Title 3 😱"
-  ],
   "description": "Formatted YouTube Shorts / TikTok description",
-  "hashtags": ["#Tag1", "#Tag2", "#Tag3", "#Tag4", "#Tag5"],
+  "hashtags": ["#Tag1", "#Tag2", "#Tag3", "#Tag4", "#Tag5", "#Tag6", "#Tag7", "#Tag8"],
   "seo_tags": ["keyword 1", "keyword 2", "keyword 3", "keyword 4"],
   "full_post": "Ready-to-copy social media caption combining hook, synopsis, CTA, and hashtags",
-  "full_script_markdown": "Full formatted production script document in markdown"
+  "full_script_markdown": "Full formatted production cue sheet table in markdown"
 }}
 
 Output ONLY the raw JSON object."""
 
-    user_content = f"Original Movie Title / Topic: {original_title or 'Movie Recap'}\n\n"
+    user_content = f"Original Movie Title / Topic: {original_title or 'Movie Recap'}\nTarget Duration: {duration_target}\nTone: {tone_guide}\n"
+    if custom_notes:
+        user_content += f"Additional Creator Directives: {custom_notes}\n"
     if transcript_text:
-        user_content += f"Subtitles / Dialogue Transcript Content:\n{transcript_text[:7000]}\n"
+        user_content += f"\nSubtitles / Dialogue Transcript Content:\n{transcript_text[:7500]}\n"
 
     models_to_try = [
         settings.gemini_model or "gemini-2.5-flash",
         "gemini-2.5-flash",
-        "gemini-flash-latest",
-        "gemini-3.6-flash",
-        "gemini-flash-lite-latest",
-        "gemini-3.7-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
     ]
     seen = set()
     models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
 
-    last_err = None
-    for api_key in keys:
-        for model_name in models_to_try:
-            try:
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel(
-                    model_name=model_name,
-                    system_instruction=system_instruction,
-                    generation_config=genai.GenerationConfig(
-                        temperature=0.75,
-                        response_mime_type="application/json",
-                    ),
-                )
-                response = await asyncio.to_thread(model.generate_content, user_content)
-                if response and response.text:
-                    text = response.text.strip()
-                    if text.startswith("```"):
-                        text = re.sub(r"^```(?:json)?\n?", "", text)
-                        text = re.sub(r"\n?```$", "", text)
-                    data = _safe_json_loads(text)
-                    if isinstance(data, dict) and "full_post" in data:
-                        return data
-            except Exception as e:
-                last_err = e
-                continue
+    media_path = None
+    tmp_dir = None
+    if video_path and os.path.exists(video_path):
+        media_path, tmp_dir = await _build_media_proxy_for_gemini(video_path)
 
-    if last_err:
-        raise RuntimeError(f"Social script generation failed: {last_err}")
-    return {}
+    last_err = None
+    try:
+        for api_key in keys:
+            for model_name in models_to_try:
+                try:
+                    genai.configure(api_key=api_key)
+                    uploaded_file = None
+                    if media_path and os.path.exists(media_path):
+                        try:
+                            uploaded_file = await asyncio.to_thread(genai.upload_file, media_path)
+                            poll_count = 0
+                            while uploaded_file.state.name == "PROCESSING":
+                                poll_count += 1
+                                if poll_count > 30:
+                                    break
+                                await asyncio.sleep(0.5)
+                                uploaded_file = await asyncio.to_thread(genai.get_file, uploaded_file.name)
+                        except Exception:
+                            uploaded_file = None
+
+                    model = genai.GenerativeModel(
+                        model_name=model_name,
+                        system_instruction=system_instruction,
+                        generation_config=genai.GenerationConfig(
+                            temperature=0.75,
+                            response_mime_type="application/json",
+                        ),
+                    )
+
+                    inputs = [uploaded_file, user_content] if uploaded_file else [user_content]
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(model.generate_content, inputs),
+                        timeout=50.0,
+                    )
+                    if response and response.text:
+                        text = response.text.strip()
+                        if text.startswith("```"):
+                            text = re.sub(r"^```(?:json)?\n?", "", text)
+                            text = re.sub(r"\n?```$", "", text)
+                        data = _safe_json_loads(text)
+                        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                            data = data[0]
+
+                    if isinstance(data, dict):
+                        # Normalize blocks array from alternate keys
+                        if not data.get("blocks") or not isinstance(data.get("blocks"), list) or len(data.get("blocks")) == 0:
+                            for alt_key in ["scenes", "script_blocks", "scene_blocks", "cues", "segments", "script"]:
+                                if isinstance(data.get(alt_key), list) and len(data.get(alt_key)) > 0:
+                                    data["blocks"] = data[alt_key]
+                                    break
+
+                        # If blocks missing or only 1 single block returned, construct full 4-stage structured blocks from hook + synopsis + CTA
+                        if not data.get("blocks") or not isinstance(data.get("blocks"), list) or len(data.get("blocks")) <= 1:
+                            data["blocks"] = [
+                                {
+                                    "time_range": "[00:00 - 00:05]",
+                                    "start_time": 0.0,
+                                    "end_time": 5.0,
+                                    "block_name": "THE HOOK",
+                                    "visual": "Fast dramatic cut to the most intense moment of the scene",
+                                    "text_on_screen": (data.get("hook") or "DO NOT MISS THIS! 🔥")[:45],
+                                    "sound_effect": "Dramatic bass drop / whoosh SFX",
+                                    "voiceover": data.get("hook") or f"រឿងរ៉ាវដ៏ភ្ញាក់ផ្អើលបំផុតដែលអ្នកមិនធ្លាប់ដឹងពី {original_title or 'Movie'}!",
+                                    "voiceover_tone": "Intense / Suspense"
+                                },
+                                {
+                                    "time_range": "[00:05 - 00:30]",
+                                    "start_time": 5.0,
+                                    "end_time": 30.0,
+                                    "block_name": "THE STORY",
+                                    "visual": "Montage of the main conflict, character tension, and action",
+                                    "text_on_screen": "ការពិតដ៏អាថ៌កំបាំង...",
+                                    "sound_effect": "Cinematic tension build-up",
+                                    "voiceover": data.get("synopsis") or "តួអង្គសំខាន់ត្រូវប្រឈមមុខនឹងឧបសគ្គដ៏ធំធេង...",
+                                    "voiceover_tone": "Dramatic"
+                                },
+                                {
+                                    "time_range": "[00:30 - 00:45]",
+                                    "start_time": 30.0,
+                                    "end_time": 45.0,
+                                    "block_name": "THE CLIMAX",
+                                    "visual": "High-stakes turning point and confrontation",
+                                    "text_on_screen": "ចំណុចកំពូលដែលគ្មានអ្នកណាស្មានដល់!",
+                                    "sound_effect": "Heartbeat tension / sharp crescendo",
+                                    "voiceover": "ពេលវេលាសម្រេចចិត្តបានមកដល់ តើអ្នកណានឹងជាអ្នកឈ្នះ?",
+                                    "voiceover_tone": "High-energy / Climax"
+                                },
+                                {
+                                    "time_range": "[00:45 - 00:55]",
+                                    "start_time": 45.0,
+                                    "end_time": 55.0,
+                                    "block_name": "CLOSING & CTA",
+                                    "visual": "Final lingering shot with suspense cliffhanger",
+                                    "text_on_screen": "ខមមិនយោបល់របស់អ្នក! 👇",
+                                    "sound_effect": "Fading cinematic drone",
+                                    "voiceover": data.get("call_to_action") or "តើអ្នកគិតយ៉ាងណាដែរ? កុំភ្លេចចុច Follow និងខមមិនខាងក្រោមណា!",
+                                    "voiceover_tone": "Engaging"
+                                }
+                            ]
+
+                        # Ensure each block inside blocks has standard keys and valid timestamps
+                        normalized_blocks = []
+                        for idx, blk in enumerate(data.get("blocks", [])):
+                            if not isinstance(blk, dict):
+                                continue
+                            start_t = float(blk.get("start_time", idx * 10))
+                            end_t = float(blk.get("end_time", (idx + 1) * 10))
+                            normalized_blocks.append({
+                                "time_range": blk.get("time_range") or f"[{start_t:.0f}s - {end_t:.0f}s]",
+                                "start_time": start_t,
+                                "end_time": end_t,
+                                "block_name": blk.get("block_name") or blk.get("name") or blk.get("title") or f"SCENE {idx+1}",
+                                "visual": blk.get("visual") or blk.get("shot") or blk.get("video") or "Camera shot / action",
+                                "text_on_screen": blk.get("text_on_screen") or blk.get("caption") or blk.get("overlay") or "",
+                                "sound_effect": blk.get("sound_effect") or blk.get("sfx") or "Cinematic SFX",
+                                "voiceover": blk.get("voiceover") or blk.get("narration") or blk.get("script") or blk.get("text") or "",
+                                "voiceover_tone": blk.get("voiceover_tone") or blk.get("tone") or "Intense"
+                            })
+                        data["blocks"] = normalized_blocks
+
+                        if not data.get("full_post"):
+                            parts = [p for p in [data.get("hook"), data.get("synopsis"), data.get("call_to_action"), " ".join(data.get("hashtags", []))] if p]
+                            data["full_post"] = "\n\n".join(parts)
+                except Exception as e:
+                    last_err = e
+                    continue
+    finally:
+        if tmp_dir and os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Fallback template if models fail
+    fallback_title = original_title or "Exciting Short-Form Video"
+    return {
+        "title": fallback_title,
+        "total_duration": duration_target,
+        "platform": platform,
+        "tone": tone_guide,
+        "bgm_suggestion": "Epic dark cinematic drumbeat / high-tempo trailer music",
+        "hook": f"The untold truth behind {fallback_title} that everyone missed! 🔥⚔️",
+        "synopsis": f"A deep dive into the most intense scene of {fallback_title}, revealing secret details and turning points.",
+        "call_to_action": "Follow and share your thoughts in the comments below! 🚀",
+        "pinned_comment": f"Did you expect this twist in {fallback_title}? Let's debate in the comments! 👇",
+        "editing_tips": [
+            "Start immediately with the high-action shot within the first 1.5 seconds.",
+            "Use sound effects (whoosh, hit) on every text overlay pop-in.",
+            "Maintain fast pacing with cuts every 2 to 3.5 seconds."
+        ],
+        "blocks": [
+            {
+                "time_range": "[00:00 - 00:03]",
+                "start_time": 0.0,
+                "end_time": 3.0,
+                "block_name": "THE HOOK",
+                "visual": "Close-up action / suspense climax scene",
+                "text_on_screen": "YOU WON'T BELIEVE THIS! 😱",
+                "sound_effect": "Dramatic bass drop / whoosh",
+                "voiceover": f"This is the moment that changed everything in {fallback_title}!",
+                "voiceover_tone": "Hyped / Intense"
+            }
+        ],
+        "description": f"{fallback_title} - Short-form recap and review.",
+        "hashtags": ["#fyp", "#viral", "#movierecap", "#trending", "#khmermovie", "#cinema"],
+        "seo_tags": [fallback_title, "movie recap", "viral short", "action scene"],
+        "full_post": f"The untold truth behind {fallback_title}! 🔥\n\nFollow and share your thoughts below!\n\n#fyp #viral #movierecap #trending #cinema",
+        "full_script_markdown": f"# {fallback_title} - Short-Form Cue Sheet\n\nPlatform: {platform} | Tone: {tone_guide}\n"
+    }
 

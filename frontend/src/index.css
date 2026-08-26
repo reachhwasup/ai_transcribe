@@ -38,16 +38,43 @@
   color-scheme: light;
 }
 
-body {
+html, body {
   font-family: 'Inter', 'Noto Sans Khmer', sans-serif;
   background-color: var(--bg-base);
   color: var(--text-primary);
   overflow: hidden;
   height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  scroll-behavior: smooth;
 }
 
 #root {
   height: 100vh;
+}
+
+/* GPU Accelerated video & visual canvases */
+video, canvas, [data-gpu="true"] {
+  transform: translateZ(0);
+  backface-visibility: hidden;
+  will-change: transform;
+}
+
+/* Global ultra-smooth scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(113, 113, 122, 0.35);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(113, 113, 122, 0.6);
 }
 
 /* Color picker styling */

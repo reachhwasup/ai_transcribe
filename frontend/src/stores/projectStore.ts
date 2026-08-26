@@ -13,6 +13,8 @@ interface ProjectStore {
   isPlaying: boolean;
   isLoading: boolean;
   videoClips: VideoClip[];
+  transcribingProjectId: string | null;
+  generatingVoiceProjectId: string | null;
   isTranscribing: boolean;
   transcribeProgress: string;
   transcribePercent: number;
@@ -89,6 +91,8 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
   isPlaying: false,
   isLoading: false,
   videoClips: [],
+  transcribingProjectId: null,
+  generatingVoiceProjectId: null,
   isTranscribing: false,
   transcribeProgress: '',
   transcribePercent: 0,
@@ -119,80 +123,80 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     const id = projectId || get().currentProject?.id;
     if (!id) return;
     try {
-      const status = await api.checkAudioSeparation(id);
-      if (status.separated && status.vocals_url && status.bgm_url) {
-        set({ audioSeparated: true, vocalsUrl: status.vocals_url, bgmUrl: status.bgm_url });
-      } else {
-        set({ audioSeparated: false, vocalsUrl: null, bgmUrl: null });
+      const res = await api.checkAudioSeparation(id);
+      if (get().currentProject?.id === id) {
+        set({
+          audioSeparated: res.separated,
+          vocalsUrl: res.vocals_url,
+          bgmUrl: res.bgm_url,
+        });
       }
     } catch {
       // ignore
     }
   },
 
-  setAspectRatio: (aspectRatio: string) => set({ aspectRatio }),
-  setCanvasZoom: (canvasZoom: string) => set({ canvasZoom }),
-  setSubtitlesVisible: (subtitlesVisible: boolean) => set({ subtitlesVisible }),
-  toggleSubtitlesVisible: () => set((state) => {
-    const next = !state.subtitlesVisible;
-    const hidden = new Set(state.hiddenTracks);
-    if (!next) {
-      hidden.add('T');
-      hidden.add('T1');
-    } else {
-      hidden.delete('T');
-      hidden.delete('T1');
+  setAspectRatio: (aspectRatio: string) => {
+    set({ aspectRatio });
+    const id = get().currentProject?.id;
+    if (id) {
+      localStorage.setItem(`aspect-ratio-${id}`, aspectRatio);
     }
-    return { subtitlesVisible: next, hiddenTracks: hidden };
-  }),
-  setVideoVisible: (videoVisible: boolean) => set({ videoVisible }),
-  toggleVideoVisible: () => set((state) => {
-    const next = !state.videoVisible;
-    const hidden = new Set(state.hiddenTracks);
-    if (!next) {
-      hidden.add('V');
-      hidden.add('V1');
-    } else {
-      hidden.delete('V');
-      hidden.delete('V1');
-    }
-    return { videoVisible: next, hiddenTracks: hidden };
-  }),
+  },
+  setCanvasZoom: (canvasZoom: string) => {
+    set({ canvasZoom });
+  },
+  setSubtitlesVisible: (subtitlesVisible: boolean) => {
+    set({ subtitlesVisible });
+  },
+  toggleSubtitlesVisible: () => {
+    set((state) => ({ subtitlesVisible: !state.subtitlesVisible }));
+  },
+  setVideoVisible: (videoVisible: boolean) => {
+    set({ videoVisible });
+  },
+  toggleVideoVisible: () => {
+    set((state) => ({ videoVisible: !state.videoVisible }));
+  },
   toggleTrackVisibility: (trackId: string) => {
-    const hidden = new Set(get().hiddenTracks);
-    if (hidden.has(trackId)) {
-      hidden.delete(trackId);
-    } else {
-      hidden.add(trackId);
-    }
-    const updates: Partial<ProjectStore> = { hiddenTracks: hidden };
-    if (trackId === 'V' || trackId === 'V1') {
-      updates.videoVisible = !hidden.has(trackId);
-    }
-    if (trackId === 'T' || trackId === 'T1') {
-      updates.subtitlesVisible = !hidden.has(trackId);
-    }
-    set(updates);
+    set((state) => {
+      const next = new Set(state.hiddenTracks);
+      if (next.has(trackId)) {
+        next.delete(trackId);
+      } else {
+        next.add(trackId);
+      }
+      return { hiddenTracks: next };
+    });
   },
 
   loadProjects: async () => {
-    set({ isLoading: true, error: null });
     try {
       const projects = await api.fetchProjects();
-      set({ projects, isLoading: false });
+      set({ projects });
     } catch (e: any) {
-      set({ error: e.message, isLoading: false });
+      set({ error: e.message });
     }
   },
 
   loadProject: async (id: string) => {
-    const isCached = get().currentProject?.id === id;
-    if (!isCached) {
-      set({ isLoading: true, error: null });
-    }
+    // If opening a different project, reset transcription / voice generation UI states if not transcribing this project
+    const isTranscribingThis = get().transcribingProjectId === id;
+    const isGeneratingVoiceThis = get().generatingVoiceProjectId === id;
+
+    set({
+      isLoading: true,
+      error: null,
+      isTranscribing: isTranscribingThis,
+      isGeneratingAudio: isGeneratingVoiceThis,
+      ...(isTranscribingThis ? {} : { transcribeProgress: '', transcribePercent: 0, transcribeChunkInfo: null }),
+      ...(isGeneratingVoiceThis ? {} : { audioGenProgress: 0, audioGenTotal: 0, activeGeneratingSegmentId: null }),
+    });
+
     try {
-      const [project, sep] = await Promise.all([
+      const [project, clips, sep] = await Promise.all([
         api.fetchProject(id),
+        api.getVideoClips(id).catch(() => []),
         api.checkAudioSeparation(id).catch(() => ({ separated: false, vocals_url: null, bgm_url: null })),
       ]);
 
@@ -207,14 +211,18 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       const vocalsUrl = audioSeparated ? sep.vocals_url : null;
       const bgmUrl = audioSeparated ? sep.bgm_url : null;
 
+      const effectiveClips = clips && clips.length > 0 ? clips : (project.video_clips || []);
+
       set({
         currentProject: project,
         isLoading: false,
-        videoClips: project.video_clips || [],
+        videoClips: effectiveClips,
         subtitleStyle,
         audioSeparated,
         vocalsUrl,
         bgmUrl,
+        isTranscribing: get().transcribingProjectId === id,
+        isGeneratingAudio: get().generatingVoiceProjectId === id,
       });
     } catch (e: any) {
       set({ error: e.message, isLoading: false });
@@ -246,23 +254,20 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     if (!currentProject) return;
     try {
       const updated = await api.updateProject(currentProject.id, { name });
-      set((state) => ({
-        currentProject: state.currentProject ? { ...state.currentProject, name: updated.name } : null,
-        projects: state.projects.map((p) => (p.id === currentProject.id ? { ...p, name: updated.name } : p)),
-      }));
+      set({ currentProject: updated });
+      await get().loadProjects();
     } catch (e: any) {
-      console.error('Failed to update project name:', e);
+      set({ error: e.message });
     }
   },
 
   deleteProject: async (id: string) => {
     try {
       await api.deleteProject(id);
-      const current = get().currentProject;
-      if (current?.id === id) {
-        set({ currentProject: null });
-      }
-      await get().loadProjects();
+      set((state) => ({
+        projects: state.projects.filter((p) => p.id !== id),
+        currentProject: state.currentProject?.id === id ? null : state.currentProject,
+      }));
     } catch (e: any) {
       set({ error: e.message });
     }
@@ -285,8 +290,11 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
   generateTranscript: (language?: string) => {
     const project = get().currentProject;
     if (!project) return;
+    const targetProjectId = project.id;
     const targetLang = language || project.language || 'km';
+
     set({
+      transcribingProjectId: targetProjectId,
       isTranscribing: true,
       error: null,
       transcribeProgress: 'Initializing AI Speech Recognition...',
@@ -294,18 +302,18 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       transcribeChunkInfo: null,
     });
 
-    // Clear existing segments in state
+    // Clear existing segments in state for target project
     set({
       currentProject: { ...project, segments: [], status: 'transcribing' },
     });
 
     _transcribeAbort = api.generateTranscriptStream(
-      project.id,
+      targetProjectId,
       targetLang,
-      // onSegment: add each segment as it arrives
+      // onSegment: add each segment as it arrives, ONLY if user is still on this project
       (segment) => {
         const curr = get().currentProject;
-        if (!curr) return;
+        if (!curr || curr.id !== targetProjectId) return;
         const updated = [...curr.segments, segment].sort(
           (a, b) => a.start_time - b.start_time
         );
@@ -315,36 +323,52 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       },
       // onDone
       (total) => {
-        const curr = get().currentProject;
-        if (curr) {
+        const isCurrent = get().currentProject?.id === targetProjectId;
+        if (get().transcribingProjectId === targetProjectId) {
           set({
-            currentProject: { ...curr, status: 'completed' },
-            isTranscribing: false,
-            transcribeProgress: '',
-            transcribePercent: 100,
-            transcribeChunkInfo: null,
+            transcribingProjectId: null,
+            ...(isCurrent
+              ? {
+                  currentProject: { ...get().currentProject!, status: 'completed' },
+                  isTranscribing: false,
+                  transcribeProgress: '',
+                  transcribePercent: 100,
+                  transcribeChunkInfo: null,
+                }
+              : {}),
           });
         }
         _transcribeAbort = null;
       },
       // onError
       (errMsg) => {
-        set({
-          error: errMsg,
-          isTranscribing: false,
-          transcribeProgress: '',
-          transcribePercent: 0,
-          transcribeChunkInfo: null,
-        });
+        const isCurrent = get().currentProject?.id === targetProjectId;
+        if (get().transcribingProjectId === targetProjectId) {
+          set({
+            transcribingProjectId: null,
+            ...(isCurrent
+              ? {
+                  error: errMsg,
+                  isTranscribing: false,
+                  transcribeProgress: '',
+                  transcribePercent: 0,
+                  transcribeChunkInfo: null,
+                }
+              : {}),
+          });
+        }
         _transcribeAbort = null;
       },
       // onProgress
       (prog) => {
-        set({
-          transcribeProgress: prog.message || '',
-          transcribePercent: prog.percent || (prog.currentChunk && prog.totalChunks ? Math.round((prog.currentChunk / prog.totalChunks) * 100) : 10),
-          transcribeChunkInfo: prog.totalChunks > 0 ? { current: prog.currentChunk, total: prog.totalChunks } : null,
-        });
+        if (get().currentProject?.id === targetProjectId) {
+          set({
+            isTranscribing: true,
+            transcribeProgress: prog.message || '',
+            transcribePercent: prog.percent || (prog.currentChunk && prog.totalChunks ? Math.round((prog.currentChunk / prog.totalChunks) * 100) : 10),
+            transcribeChunkInfo: prog.totalChunks > 0 ? { current: prog.currentChunk, total: prog.totalChunks } : null,
+          });
+        }
       },
     );
   },
@@ -354,61 +378,94 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       _transcribeAbort.abort();
       _transcribeAbort = null;
     }
-    set({ isTranscribing: false, transcribeProgress: '', transcribePercent: 0, transcribeChunkInfo: null });
+    set({
+      transcribingProjectId: null,
+      isTranscribing: false,
+      transcribeProgress: '',
+      transcribePercent: 0,
+      transcribeChunkInfo: null,
+    });
   },
 
   updateSegment: async (segmentId: string, updates: Partial<Segment>) => {
     const project = get().currentProject;
     if (!project) return;
+    const prevSegments = project.segments;
+    // Optimistic instant UI update
+    set({
+      currentProject: {
+        ...project,
+        segments: project.segments.map((s) =>
+          s.id === segmentId ? { ...s, ...updates } : s
+        ),
+      },
+    });
     try {
       const updated = await api.updateSegment(project.id, segmentId, updates);
-      set({
-        currentProject: {
-          ...project,
-          segments: project.segments.map((s) =>
-            s.id === segmentId ? updated : s
-          ),
-        },
-      });
+      const current = get().currentProject;
+      if (current) {
+        set({
+          currentProject: {
+            ...current,
+            segments: current.segments.map((s) =>
+              s.id === segmentId ? updated : s
+            ),
+          },
+        });
+      }
     } catch (e: any) {
-      set({ error: e.message });
+      // Rollback on failure
+      const current = get().currentProject;
+      if (current) {
+        set({ currentProject: { ...current, segments: prevSegments }, error: e.message });
+      }
     }
   },
 
   deleteSegment: async (segmentId: string) => {
     const project = get().currentProject;
     if (!project) return;
+    const prevSegments = project.segments;
+    // Optimistic deletion
+    set({
+      currentProject: {
+        ...project,
+        segments: project.segments.filter((s) => s.id !== segmentId),
+      },
+      selectedSegmentIds: new Set([...get().selectedSegmentIds].filter((id) => id !== segmentId)),
+      activeSegmentId: get().activeSegmentId === segmentId ? null : get().activeSegmentId,
+    });
     try {
       await api.deleteSegment(project.id, segmentId);
-      set({
-        currentProject: {
-          ...project,
-          segments: project.segments.filter((s) => s.id !== segmentId),
-        },
-        selectedSegmentIds: new Set([...get().selectedSegmentIds].filter(id => id !== segmentId)),
-        activeSegmentId: get().activeSegmentId === segmentId ? null : get().activeSegmentId,
-      });
     } catch (e: any) {
-      set({ error: e.message });
+      const current = get().currentProject;
+      if (current) {
+        set({ currentProject: { ...current, segments: prevSegments }, error: e.message });
+      }
     }
   },
 
   deleteMultipleSegments: async (segmentIds: string[]) => {
     const project = get().currentProject;
     if (!project || segmentIds.length === 0) return;
+    const prevSegments = project.segments;
+    const idsSet = new Set(segmentIds);
+    // Optimistic deletion
+    set({
+      currentProject: {
+        ...project,
+        segments: project.segments.filter((s) => !idsSet.has(s.id)),
+      },
+      selectedSegmentIds: new Set([...get().selectedSegmentIds].filter((id) => !idsSet.has(id))),
+      activeSegmentId: idsSet.has(get().activeSegmentId || '') ? null : get().activeSegmentId,
+    });
     try {
-      await Promise.all(segmentIds.map(id => api.deleteSegment(project.id, id)));
-      const idsSet = new Set(segmentIds);
-      set({
-        currentProject: {
-          ...project,
-          segments: project.segments.filter((s) => !idsSet.has(s.id)),
-        },
-        selectedSegmentIds: new Set([...get().selectedSegmentIds].filter(id => !idsSet.has(id))),
-        activeSegmentId: idsSet.has(get().activeSegmentId || '') ? null : get().activeSegmentId,
-      });
+      await Promise.all(segmentIds.map((id) => api.deleteSegment(project.id, id)));
     } catch (e: any) {
-      set({ error: e.message });
+      const current = get().currentProject;
+      if (current) {
+        set({ currentProject: { ...current, segments: prevSegments }, error: e.message });
+      }
     }
   },
 
@@ -494,11 +551,19 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
   ) => {
     const project = get().currentProject;
     if (!project) return;
+    const targetProjectId = project.id;
 
-    set({ isGeneratingAudio: true, audioGenProgress: 0, audioGenTotal: 0, activeGeneratingSegmentId: null, error: null });
+    set({
+      generatingVoiceProjectId: targetProjectId,
+      isGeneratingAudio: true,
+      audioGenProgress: 0,
+      audioGenTotal: 0,
+      activeGeneratingSegmentId: null,
+      error: null,
+    });
 
     try {
-      const resp = await fetch(`/api/projects/${project.id}/export/generate-voice-segments-stream`, {
+      const resp = await fetch(`/api/projects/${targetProjectId}/export/generate-voice-segments-stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -530,35 +595,38 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
           if (!line.startsWith('data: ')) continue;
           try {
             const evt = JSON.parse(line.slice(6));
+            const isCurrent = get().currentProject?.id === targetProjectId;
             if (evt.type === 'start') {
-              set({ audioGenTotal: evt.total, audioGenProgress: 0 });
+              if (isCurrent) set({ audioGenTotal: evt.total, audioGenProgress: 0 });
             } else if (evt.type === 'segment_start') {
-              set({ activeGeneratingSegmentId: evt.segment_id });
+              if (isCurrent) set({ activeGeneratingSegmentId: evt.segment_id });
             } else if (evt.type === 'progress') {
-              set({ audioGenProgress: evt.completed, audioGenTotal: evt.total });
-              // Update segment audio_url in store
-              if (evt.status === 'done' && evt.audio_url) {
-                const cur = get().currentProject;
-                if (cur) {
-                  set({
-                    currentProject: {
-                      ...cur,
-                      segments: cur.segments.map((s) =>
-                        s.id === evt.segment_id
-                          ? {
-                              ...s,
-                              audio_url: evt.audio_url,
-                              ...(evt.start_time != null ? { start_time: evt.start_time } : {}),
-                              ...(evt.end_time != null ? { end_time: evt.end_time } : {}),
-                            }
-                          : s
-                      ),
-                    },
-                  });
+              if (isCurrent) {
+                set({ audioGenProgress: evt.completed, audioGenTotal: evt.total });
+                // Update segment audio_url in store
+                if (evt.status === 'done' && evt.audio_url) {
+                  const cur = get().currentProject;
+                  if (cur && cur.id === targetProjectId) {
+                    set({
+                      currentProject: {
+                        ...cur,
+                        segments: cur.segments.map((s) =>
+                          s.id === evt.segment_id
+                            ? {
+                                ...s,
+                                audio_url: evt.audio_url,
+                                ...(evt.start_time != null ? { start_time: evt.start_time } : {}),
+                                ...(evt.end_time != null ? { end_time: evt.end_time } : {}),
+                              }
+                            : s
+                        ),
+                      },
+                    });
+                  }
                 }
               }
             } else if (evt.type === 'done') {
-              set({ activeGeneratingSegmentId: null, isGeneratingAudio: false });
+              if (isCurrent) set({ activeGeneratingSegmentId: null, isGeneratingAudio: false });
             } else if (evt.type === 'error') {
               throw new Error(evt.message);
             }
@@ -568,10 +636,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         }
       }
     } catch (e: any) {
-      set({ error: e.message });
+      if (get().currentProject?.id === targetProjectId) {
+        set({ error: e.message });
+      }
       throw e;
     } finally {
-      set({ isGeneratingAudio: false, activeGeneratingSegmentId: null });
+      if (get().generatingVoiceProjectId === targetProjectId) {
+        set({
+          generatingVoiceProjectId: null,
+          ...(get().currentProject?.id === targetProjectId ? { isGeneratingAudio: false, activeGeneratingSegmentId: null } : {}),
+        });
+      }
     }
   },
 

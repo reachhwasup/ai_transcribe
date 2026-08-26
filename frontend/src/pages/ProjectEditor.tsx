@@ -15,6 +15,7 @@ import MeatikaTTSPanel from '../components/MeatikaTTSPanel';
 import AIAssistantPanel from '../components/AIAssistantPanel';
 import CaptionPropertiesPanel from '../components/CaptionPropertiesPanel';
 import DubbingStudioHub from '../components/DubbingStudioHub';
+import ProjectTabBar from '../components/ProjectTabBar';
 
 import {
   LayoutGrid,
@@ -26,11 +27,13 @@ import {
   Trash2,
   GripVertical,
   GripHorizontal,
+  Film,
+  PanelLeftClose,
+  PanelLeftOpen,
   Loader2,
   Smile,
   User,
   Settings,
-  Film,
 } from 'lucide-react';
 import { useThemeStore } from '../stores/themeStore';
 
@@ -74,10 +77,16 @@ export default function ProjectEditor() {
   const [centerTab, setCenterTab] = useState<MeatikaCenterTab>('captions');
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Panel sizing
-  const [leftPanelWidth, setLeftPanelWidth] = useState(() => Number(localStorage.getItem('editor-left-panel-width')) || 380);
-  const [timelineHeight, setTimelineHeight] = useState(() => Number(localStorage.getItem('editor-timeline-height')) || 280);
+  // Panel sizing & responsiveness
+  const [isLeftPanelOpen, setIsLeftPanelOpen] = useState<boolean>(
+    () => localStorage.getItem('editor-left-panel-open') !== 'false'
+  );
+  const [leftPanelWidth, setLeftPanelWidth] = useState(() => Number(localStorage.getItem('editor-left-panel-width')) || 360);
+  const [timelineHeight, setTimelineHeight] = useState(() => Number(localStorage.getItem('editor-timeline-height')) || 260);
 
+  useEffect(() => {
+    localStorage.setItem('editor-left-panel-open', String(isLeftPanelOpen));
+  }, [isLeftPanelOpen]);
   useEffect(() => {
     localStorage.setItem('editor-left-panel-width', String(leftPanelWidth));
   }, [leftPanelWidth]);
@@ -335,14 +344,14 @@ export default function ProjectEditor() {
         </div>
       )}
 
-      {/* Top Header Bar — Exact Meatika Design */}
+      {/* Top Header Bar — Multi-Tab Video Project Workspace */}
       <header className="h-12 border-b border-[#1c1e24] bg-[#121316] px-4 flex items-center justify-between shrink-0 z-30">
-        {/* Left: Meatika 2x2 App Grid Icon */}
-        <div className="flex items-center gap-3">
+        {/* Left: Meatika Menu & Panel Toggle */}
+        <div className="flex items-center gap-1.5 shrink-0">
           <button
             onClick={() => navigate('/')}
-            className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-[#1f2127] transition-colors"
-            title="Meatika Menu"
+            className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-[#1f2127] transition-colors flex items-center gap-2"
+            title="Back to Dashboard"
           >
             <div className="grid grid-cols-2 gap-0.5 w-4 h-4">
               <div className="w-1.5 h-1.5 rounded-sm bg-zinc-300" />
@@ -351,19 +360,36 @@ export default function ProjectEditor() {
               <div className="w-1.5 h-1.5 rounded-sm bg-zinc-300" />
             </div>
           </button>
-        </div>
-
-        {/* Right Actions: Export Video & Avatar */}
-        <div className="flex items-center gap-2.5">
 
           <button
+            onClick={() => setIsLeftPanelOpen(!isLeftPanelOpen)}
+            className={`p-1.5 rounded-lg transition-colors ${
+              isLeftPanelOpen
+                ? 'text-purple-400 bg-purple-950/40 border border-purple-500/30'
+                : 'text-zinc-400 hover:text-white hover:bg-[#1f2127]'
+            }`}
+            title={isLeftPanelOpen ? 'Collapse Left Tool Panel' : 'Expand Left Tool Panel'}
+          >
+            {isLeftPanelOpen ? (
+              <PanelLeftClose className="w-4 h-4" />
+            ) : (
+              <PanelLeftOpen className="w-4 h-4" />
+            )}
+          </button>
+        </div>
+
+        {/* Center: Multi-Project Tabs */}
+        <ProjectTabBar />
+
+        {/* Right Actions: Export Video & Avatar */}
+        <div className="flex items-center gap-2 shrink-0">
+          <button
             onClick={() => setShowExportModal(true)}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#e5e5e9] hover:bg-white text-black font-semibold text-xs shadow-sm active:scale-95 transition-all"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gradient-to-r from-white to-zinc-200 hover:from-white hover:to-white text-black font-bold text-xs shadow-sm active:scale-95 transition-all"
           >
             <Smile className="w-3.5 h-3.5 text-black" />
-            <span>Export Video</span>
+            <span className="hidden sm:inline">Export Video</span>
           </button>
-
 
           {/* Settings Button */}
           <button
@@ -378,10 +404,12 @@ export default function ProjectEditor() {
 
       {/* Main Workspace Body */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Left Tool Panel (TTS & AI only, matching Meatika) */}
+        {/* Left Tool Panel (TTS & AI, collapsible) */}
         <div
-          className="shrink-0 border-r border-[#1c1e24] bg-[#121316] flex flex-col overflow-hidden"
-          style={{ width: leftPanelWidth }}
+          className={`shrink-0 border-r border-[#1c1e24] bg-[#121316] flex flex-col overflow-hidden transition-all duration-150 ${
+            isLeftPanelOpen ? '' : 'hidden'
+          }`}
+          style={{ width: isLeftPanelOpen ? leftPanelWidth : 0 }}
         >
           {/* Top Horizontal Tool Tabs (TTS | AI) */}
           <div className="h-10 border-b border-[#1c1e24] bg-[#121316] flex items-center px-3 gap-1 shrink-0">
@@ -394,7 +422,7 @@ export default function ProjectEditor() {
                 <button
                   key={tab.id}
                   onClick={() => setLeftTab(tab.id as MeatikaLeftTab)}
-                  className={`px-2.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition-all ${
+                  className={`px-2.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition-all cursor-pointer ${
                     isActive
                       ? 'bg-[#22242b] text-white shadow-sm ring-1 ring-white/10'
                       : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#17191e]'
@@ -407,25 +435,31 @@ export default function ProjectEditor() {
           </div>
 
           {/* Active Tool Content */}
-          <div className="flex-1 overflow-hidden">
-            {leftTab === 'tts' && <MeatikaTTSPanel />}
-            {leftTab === 'ai' && <AIAssistantPanel />}
+          <div className="flex-1 overflow-hidden relative">
+            <div className={`h-full w-full ${leftTab === 'tts' ? 'block' : 'hidden'}`}>
+              <MeatikaTTSPanel />
+            </div>
+            <div className={`h-full w-full ${leftTab === 'ai' ? 'block' : 'hidden'}`}>
+              <AIAssistantPanel />
+            </div>
           </div>
         </div>
 
         {/* Left Panel Resize Handle */}
-        <div
-          className="w-1 shrink-0 bg-[#1c1e24] hover:bg-white/40 cursor-col-resize transition-colors relative group"
-          onMouseDown={(e) => handleResizeStart(e, 'leftPanel')}
-        >
-          <div className="absolute inset-y-0 -left-1 -right-1" />
-          <div className="absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity">
-            <GripVertical className="w-3 h-3 text-white" />
+        {isLeftPanelOpen && (
+          <div
+            className="w-1 shrink-0 bg-[#1c1e24] hover:bg-white/40 cursor-col-resize transition-colors relative group"
+            onMouseDown={(e) => handleResizeStart(e, 'leftPanel')}
+          >
+            <div className="absolute inset-y-0 -left-1 -right-1" />
+            <div className="absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity">
+              <GripVertical className="w-3 h-3 text-white" />
+            </div>
           </div>
-        </div>
+        )}
 
         {/* Center Production Hub (MY ASSETS, LIBRARY, CAPTIONS, DUBBING) */}
-        <div className="flex-1 flex flex-col border-r border-[#1c1e24] min-w-[320px] overflow-hidden bg-[#121316]">
+        <div className="flex-1 flex flex-col border-r border-[#1c1e24] min-w-0 overflow-hidden bg-[#121316]">
           {/* Top Tabs */}
           <div className="h-10 border-b border-[#1c1e24] bg-[#121316] flex items-center px-4 gap-2 shrink-0">
             {([
@@ -539,7 +573,7 @@ export default function ProjectEditor() {
         </div>
 
         {/* Right Top: Video Canvas Viewport */}
-        <div className="w-[45%] shrink-0 flex flex-col overflow-hidden bg-black">
+        <div className="w-[42%] min-w-[340px] max-w-[55%] shrink-0 flex flex-col overflow-hidden bg-black">
           <VideoPlayer videoRef={videoRef} />
         </div>
       </div>

@@ -559,6 +559,15 @@ async def generate_segment_audio(
 
     export_dir = os.path.join(settings.upload_dir, "tts")
     os.makedirs(export_dir, exist_ok=True)
+
+    import hashlib
+    cache_key = hashlib.sha256(f"{clean_text}_{voice}_{tts_rate}_{tts_pitch}_{detected_emotion}_{apply_fx}".encode("utf-8")).hexdigest()
+    cache_file = os.path.join(export_dir, f"cache_{cache_key}.mp3")
+    if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
+        target_path = os.path.join(export_dir, f"{uuid.uuid4()}.mp3")
+        shutil.copyfile(cache_file, target_path)
+        return target_path
+
     output_path = os.path.join(export_dir, f"{uuid.uuid4()}.mp3")
 
     communicate = None
@@ -588,10 +597,19 @@ async def generate_segment_audio(
                 res = await asyncio.to_thread(subprocess.run, fx_cmd, capture_output=True, text=True, timeout=30)
                 if res.returncode == 0 and os.path.exists(filtered_path) and os.path.getsize(filtered_path) > 0:
                     _cleanup_files([output_path])
+                    try:
+                        shutil.copyfile(filtered_path, cache_file)
+                    except OSError:
+                        pass
                     return filtered_path
             except Exception:
                 pass
 
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        try:
+            shutil.copyfile(output_path, cache_file)
+        except OSError:
+            pass
     return output_path
 
 

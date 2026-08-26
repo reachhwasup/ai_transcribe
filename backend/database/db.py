@@ -1,3 +1,4 @@
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from backend.config import settings
@@ -5,8 +6,20 @@ from backend.config import settings
 engine = create_async_engine(
     settings.database_url,
     echo=False,
-    connect_args={"timeout": 30} if "sqlite" in settings.database_url else {},
+    connect_args={"timeout": 60} if "sqlite" in settings.database_url else {},
 )
+
+if "sqlite" in settings.database_url:
+    @event.listens_for(engine.sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.close()
+
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -22,30 +35,20 @@ async def get_db():
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Add voice_profile column if missing (migration for existing DBs)
-        try:
-            await conn.execute(
-                __import__("sqlalchemy").text(
-                    "ALTER TABLE segments ADD COLUMN voice_profile VARCHAR(10) DEFAULT 'female'"
-                )
-            )
-        except Exception:
-            pass  # Column already exists
-        # Add emotion column if missing
-        try:
-            await conn.execute(
-                __import__("sqlalchemy").text(
-                    "ALTER TABLE segments ADD COLUMN emotion VARCHAR(50) DEFAULT 'neutral'"
-                )
-            )
-        except Exception:
-            pass  # Column already exists
-        # Add preview proxy columns if missing
-        for stmt in (
+
+        # Migrations & Performance Indexes
+        migration_statements = [
+            "ALTER TABLE segments ADD COLUMN voice_profile VARCHAR(10) DEFAULT 'female'",
+            "ALTER TABLE segments ADD COLUMN emotion VARCHAR(50) DEFAULT 'neutral'",
             "ALTER TABLE projects ADD COLUMN preview_path VARCHAR(1000) DEFAULT ''",
             "ALTER TABLE projects ADD COLUMN preview_status VARCHAR(20) DEFAULT 'none'",
-        ):
+            "ALTER TABLE video_clips ADD COLUMN transition_type VARCHAR(50) DEFAULT 'none'",
+            "ALTER TABLE video_clips ADD COLUMN transition_duration FLOAT DEFAULT 0.5",
+            "CREATE INDEX IF NOT EXISTS ix_segments_project_time ON segments (project_id, start_time)",
+            "CREATE INDEX IF NOT EXISTS ix_video_clips_project_index ON video_clips (project_id, index)",
+        ]
+        for stmt in migration_statements:
             try:
-                await conn.execute(__import__("sqlalchemy").text(stmt))
+                await conn.execute(text(stmt))
             except Exception:
-                pass  # Column already exists
+                pass  # Already exists or applied

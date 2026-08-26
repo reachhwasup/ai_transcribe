@@ -356,7 +356,7 @@ export async function applyNarration(
   const { data } = await api.post(
     `/projects/${projectId}/transcripts/apply-narration`,
     { segments, voice_profile: voiceProfile },
-    { timeout: 60000 },
+    { timeout: 300000 },
   );
   return data;
 }
@@ -383,11 +383,14 @@ export interface ScriptBlockItem {
 export interface SocialMediaScriptResult {
   title?: string;
   total_duration?: string;
+  platform?: string;
   tone?: string;
   bgm_suggestion?: string;
   hook: string;
   synopsis: string;
   call_to_action: string;
+  pinned_comment?: string;
+  editing_tips?: string[];
   blocks?: ScriptBlockItem[];
   titles?: string[];
   description?: string;
@@ -397,28 +400,41 @@ export interface SocialMediaScriptResult {
   full_script_markdown?: string;
 }
 
-export async function suggestMovieTitles(
-  projectId: string,
-  originalTitle?: string,
-  language?: string,
-): Promise<{ original_title: string; titles: ViralTitleItem[] }> {
-  const { data } = await api.post(
-    `/projects/${projectId}/transcripts/suggest-titles`,
-    { original_title: originalTitle || '', language: language || 'km' },
-    { timeout: 60000 },
-  );
-  return data;
+export interface GenerateSocialScriptOptions {
+  originalTitle?: string;
+  language?: string;
+  platform?: string;
+  tone?: string;
+  durationTarget?: string;
+  customNotes?: string;
 }
 
 export async function generateSocialMediaScript(
   projectId: string,
-  originalTitle?: string,
-  language?: string,
+  optionsOrTitle?: string | GenerateSocialScriptOptions,
+  legacyLanguage?: string,
 ): Promise<SocialMediaScriptResult> {
+  const payload = typeof optionsOrTitle === 'object' && optionsOrTitle !== null
+    ? {
+        original_title: optionsOrTitle.originalTitle || '',
+        language: optionsOrTitle.language || 'km',
+        platform: optionsOrTitle.platform || 'tiktok',
+        tone: optionsOrTitle.tone || 'suspense',
+        duration_target: optionsOrTitle.durationTarget || '30-60s',
+        custom_notes: optionsOrTitle.customNotes || '',
+      }
+    : {
+        original_title: optionsOrTitle || '',
+        language: legacyLanguage || 'km',
+        platform: 'tiktok',
+        tone: 'suspense',
+        duration_target: '30-60s',
+      };
+
   const { data } = await api.post(
     `/projects/${projectId}/transcripts/generate-social-script`,
-    { original_title: originalTitle || '', language: language || 'km' },
-    { timeout: 60000 },
+    payload,
+    { timeout: 600000 },
   );
   return data;
 }
@@ -680,7 +696,19 @@ export async function cropVideo(
   return data;
 }
 
-// Video blur region (in-place) — e.g. to hide a logo/watermark
+// Video blur regions (in-place) — e.g. to hide multiple logos/watermarks/subtitles
+export async function blurVideoRegions(
+  projectId: string,
+  regions: Array<{ x: number; y: number; width: number; height: number }>,
+): Promise<VideoToolResult> {
+  const { data } = await api.post(
+    `/projects/${projectId}/export/blur-regions`,
+    { regions },
+    { timeout: 600000 },
+  );
+  return data;
+}
+
 export async function blurVideoRegion(
   projectId: string,
   x: number,
@@ -688,12 +716,7 @@ export async function blurVideoRegion(
   width: number,
   height: number,
 ): Promise<VideoToolResult> {
-  const { data } = await api.post(
-    `/projects/${projectId}/export/blur-region`,
-    { x, y, width, height },
-    { timeout: 600000 },
-  );
-  return data;
+  return blurVideoRegions(projectId, [{ x, y, width, height }]);
 }
 
 // Video resize (in-place)

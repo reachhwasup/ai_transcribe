@@ -4,6 +4,7 @@ import json
 import uuid
 import subprocess
 import shutil
+import threading
 from pathlib import Path
 from backend.config import settings
 
@@ -875,7 +876,128 @@ def extract_clips_to_temp(
     finally:
         for pf in part_files:
             if os.path.exists(pf):
-                os.remove(pf)
+                try:
+                    os.remove(pf)
+                except OSError:
+                    pass
+
+
+def concatenate_video_files(
+    video_paths: list[str],
+    output_path: str,
+) -> float:
+    """
+    Concatenate multiple arbitrary video files into a single master video file.
+    Normalizes resolution, framerate, and audio sample rates so videos of different
+    formats/resolutions stitch together seamlessly without synchronization errors.
+    Returns total duration in seconds.
+    """
+    valid_paths = [p for p in video_paths if os.path.exists(p)]
+    if not valid_paths:
+        raise FileNotFoundError("No valid video files provided for concatenation")
+    if len(valid_paths) == 1:
+        shutil.copyfile(valid_paths[0], output_path)
+        return get_duration_ffprobe(output_path)
+
+    ffmpeg = _get_ffmpeg()
+    ffprobe = _get_ffprobe()
+
+    # Determine master resolution from first video
+    w, h = 1920, 1080
+    try:
+        probe_cmd = [
+            ffprobe, "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            valid_paths[0],
+        ]
+        res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+        if res.returncode == 0:
+            p_data = json.loads(res.stdout)
+            streams = p_data.get("streams", [])
+            if streams and "width" in streams[0] and "height" in streams[0]:
+                w = int(streams[0]["width"])
+                h = int(streams[0]["height"])
+    except Exception:
+        pass
+
+    # Ensure even dimensions
+    if w % 2 != 0:
+        w -= 1
+    if h % 2 != 0:
+        h -= 1
+
+    # Check audio stream presence for each input
+    inputs = []
+    filter_parts = []
+    for i, p in enumerate(valid_paths):
+        inputs.extend(["-i", p])
+        filter_parts.append(
+            f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{i}];"
+        )
+
+        has_audio = False
+        try:
+            probe_a = [
+                ffprobe, "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=index",
+                "-of", "csv=p=0",
+                p,
+            ]
+            res_a = subprocess.run(probe_a, capture_output=True, text=True, timeout=5)
+            has_audio = bool(res_a.stdout.strip())
+        except Exception:
+            has_audio = True
+
+        if has_audio:
+            filter_parts.append(
+                f"[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo[a{i}];"
+            )
+        else:
+            filter_parts.append(
+                f"anullsrc=channel_layout=stereo:sample_rate=44100,atrim=end=7200[a{i}];"
+            )
+
+    concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(valid_paths)))
+    filter_complex = "".join(filter_parts) + f"{concat_inputs}concat=n={len(valid_paths)}:v=1:a=1[outv][outa]"
+
+    import sys
+    is_macos = sys.platform == "darwin"
+    if is_macos:
+        v_codec = ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-pix_fmt", "yuv420p"]
+    else:
+        v_codec = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "20"]
+
+    cmd = [
+        ffmpeg, "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", "[outv]", "-map", "[outa]",
+        *v_codec,
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        cmd_fb = [
+            ffmpeg, "-y",
+            *inputs,
+            "-filter_complex", filter_complex,
+            "-map", "[outv]", "-map", "[outa]",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "22",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+        res_fb = subprocess.run(cmd_fb, capture_output=True, text=True, timeout=600)
+        if res_fb.returncode != 0:
+            raise RuntimeError(f"Video concatenation failed: {res_fb.stderr[-400:]}")
+
+    return get_duration_ffprobe(output_path)
 
 
 def separate_audio(
@@ -905,10 +1027,12 @@ def separate_audio(
     vocals_path = os.path.join(project_dir, "vocals.wav")
     bgm_path = os.path.join(project_dir, "bgm.wav")
 
-    # Extract full audio from video first
+    # Extract full audio from video first (throttled to 2 threads so UI stays smooth)
     full_path = os.path.join(project_dir, "full_audio.wav")
     cmd_full = [
-        ffmpeg, "-y", "-i", video_path,
+        ffmpeg, "-y",
+        "-threads", "2",
+        "-i", video_path,
         "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
         full_path,
     ]
@@ -933,63 +1057,143 @@ def separate_audio(
     return {"vocals": vocals_path, "bgm": bgm_path}
 
 
+# Lazy-loaded in-process Demucs model cache with GPU / Apple Silicon MPS acceleration
+_demucs_model_cache = None
+_demucs_model_lock = threading.Lock()
+
+
+def _get_demucs_model():
+    """Lazy load and cache the Demucs model on GPU/MPS/CPU with thread limits."""
+    global _demucs_model_cache
+    if _demucs_model_cache is None:
+        with _demucs_model_lock:
+            if _demucs_model_cache is None:
+                import torch
+                from demucs.pretrained import get_model
+                # Cap PyTorch threads so macOS UI, window server, and browser stay 100% responsive
+                torch.set_num_threads(2)
+                if hasattr(torch, "set_num_interop_threads"):
+                    try:
+                        torch.set_num_interop_threads(2)
+                    except RuntimeError:
+                        pass
+                if torch.cuda.is_available():
+                    device = "cuda"
+                elif torch.backends.mps.is_available():
+                    device = "mps"
+                else:
+                    device = "cpu"
+                print(f"[Demucs] Loading htdemucs neural model on {device} (2-thread limited)...")
+                model = get_model("htdemucs")
+                model.to(device)
+                model.eval()
+                _demucs_model_cache = (model, device)
+                print(f"[Demucs] Model loaded and ready on {device}.")
+    return _demucs_model_cache
+
+
 def _separate_with_demucs(
     audio_path: str, vocals_path: str, bgm_path: str, project_dir: str
 ) -> bool:
     """
-    Use Meta's Demucs (htdemucs) for high-quality vocal/BGM separation.
-    Returns True if successful, False if demucs is not available.
+    Use Meta's Demucs (htdemucs) with hardware acceleration (Apple Silicon MPS / CUDA).
+    Runs in-process to avoid Python startup overhead and uses GPU tensor operations with CPU/RAM caps.
     """
-    import sys
-    import glob
-    python = sys.executable
+    # 1. Fast in-process GPU / MPS neural separation with memory safeguards
+    try:
+        import torch
+        import gc
+        from demucs.apply import apply_model
+        from demucs.audio import save_audio, AudioFile
 
-    # Check demucs is importable
-    check = subprocess.run(
-        [python, "-c", "import demucs"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if check.returncode != 0:
-        return False
+        # Ensure CPU thread throttling
+        torch.set_num_threads(2)
 
-    # Run demucs with two-stems mode (vocals vs no_vocals)
-    demucs_out = os.path.join(project_dir, "_demucs_tmp")
-    os.makedirs(demucs_out, exist_ok=True)
+        model, device = _get_demucs_model()
+        print(f"[Demucs] Starting smooth background separation on {device}: {audio_path}")
 
-    cmd = [
-        python, "-m", "demucs",
-        "--two-stems", "vocals",
-        "-n", "htdemucs",
-        "--shifts", "0",
-        "--overlap", "0.25",
-        "--jobs", "2",
-        "--out", demucs_out,
-        audio_path,
-    ]
-    print(f"Running demucs: {' '.join(cmd)}")
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    if r.returncode != 0:
-        # Cleanup and signal failure
-        shutil.rmtree(demucs_out, ignore_errors=True)
-        raise RuntimeError(f"Demucs failed: {r.stderr[-500:]}")
+        audio_file = AudioFile(audio_path)
+        wav = audio_file.read(streams=0, samplerate=model.samplerate, channels=model.audio_channels)
 
-    # Demucs outputs to: <out>/<model>/<stem_name>/vocals.wav and no_vocals.wav
-    v_matches = glob.glob(os.path.join(demucs_out, "**", "vocals.wav"), recursive=True)
-    b_matches = glob.glob(os.path.join(demucs_out, "**", "no_vocals.wav"), recursive=True)
+        with torch.inference_mode():
+            ref = wav.mean(0)
+            wav_norm = (wav - ref.mean()) / max(ref.std().item(), 1e-4)
+            sources = apply_model(
+                model,
+                wav_norm[None].to(device),
+                device=device,
+                shifts=0,
+                split=True,
+                overlap=0.10,
+                progress=False,
+            )[0]
+            sources = sources * ref.std() + ref.mean()
 
-    if not v_matches or not b_matches:
-        shutil.rmtree(demucs_out, ignore_errors=True)
-        raise RuntimeError("Demucs output files not found")
+            vocal_idx = model.sources.index("vocals")
+            vocals = sources[vocal_idx]
 
-    # Move results to project directory
-    shutil.move(v_matches[0], vocals_path)
-    shutil.move(b_matches[0], bgm_path)
+            # BGM is the sum of drums + bass + other (clean instrumental background)
+            bgm = sum(sources[i] for i in range(len(model.sources)) if i != vocal_idx)
 
-    # Cleanup demucs temp directory
-    shutil.rmtree(demucs_out, ignore_errors=True)
+            # Save to disk directly
+            save_audio(vocals.cpu(), vocals_path, samplerate=model.samplerate)
+            save_audio(bgm.cpu(), bgm_path, samplerate=model.samplerate)
 
-    print("Demucs separation completed successfully")
-    return True
+        # Release GPU Unified Memory and tensor buffers immediately
+        del wav, wav_norm, sources, vocals, bgm
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        if os.path.exists(vocals_path) and os.path.exists(bgm_path):
+            print(f"[Demucs] In-process neural separation completed smoothly on {device}!")
+            return True
+    except Exception as e:
+        print(f"[Demucs] In-process separation failed: {e}. Trying CLI fallback...")
+
+    # 2. CLI fallback with explicit device flag (-d mps / -d cuda)
+    try:
+        import sys
+        import glob
+        python = sys.executable
+
+        import torch
+        device_flag = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+
+        demucs_out = os.path.join(project_dir, "_demucs_tmp")
+        os.makedirs(demucs_out, exist_ok=True)
+
+        cmd = [
+            python, "-m", "demucs",
+            "--two-stems", "vocals",
+            "-n", "htdemucs",
+            "-d", device_flag,
+            "--shifts", "0",
+            "--overlap", "0.10",
+            "--out", demucs_out,
+            audio_path,
+        ]
+        print(f"Running fallback demucs CLI: {' '.join(cmd)}")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+        if r.returncode != 0:
+            shutil.rmtree(demucs_out, ignore_errors=True)
+            return False
+
+        v_matches = glob.glob(os.path.join(demucs_out, "**", "vocals.wav"), recursive=True)
+        b_matches = glob.glob(os.path.join(demucs_out, "**", "no_vocals.wav"), recursive=True)
+
+        if v_matches and b_matches:
+            shutil.move(v_matches[0], vocals_path)
+            shutil.move(b_matches[0], bgm_path)
+            shutil.rmtree(demucs_out, ignore_errors=True)
+            print("Demucs CLI fallback completed successfully")
+            return True
+    except Exception as e:
+        print(f"Demucs CLI failed: {e}")
+
+    return False
 
 
 def _separate_with_ffmpeg(
@@ -1170,20 +1374,18 @@ def crop_video(
     return output_path
 
 
-def blur_region(
+def blur_regions(
     video_path: str,
-    x: int,
-    y: int,
-    width: int,
-    height: int,
+    regions: list[dict],
 ) -> str:
     """
-    Blur a rectangular region of the video (e.g. to hide a logo/watermark/subtitles)
-    while leaving the rest of the frame untouched. Returns path to the
-    output video.
+    Blur multiple rectangular regions of the video simultaneously (e.g. watermark + subtitles)
+    while leaving the rest of the frame untouched. Returns path to output video.
     """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
+    if not regions:
+        return video_path
 
     ffmpeg = _get_ffmpeg()
     ffprobe = _get_ffprobe()
@@ -1198,7 +1400,7 @@ def blur_region(
             "-of", "json",
             video_path,
         ]
-        res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+        res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=15)
         if res.returncode == 0:
             p_data = json.loads(res.stdout)
             streams = p_data.get("streams", [])
@@ -1208,17 +1410,44 @@ def blur_region(
     except Exception as ex:
         print(f"Warning: Could not probe video dimensions for blur: {ex}")
 
-    # Clamp coordinates within frame boundaries
-    x = max(0, min(int(x), vid_w - 2))
-    y = max(0, min(int(y), vid_h - 2))
-    width = max(2, min(int(width), vid_w - x))
-    height = max(2, min(int(height), vid_h - y))
+    valid_regions = []
+    for r in regions:
+        if "x_pct" in r and "width_pct" in r:
+            rx = int(round((float(r["x_pct"]) / 100.0) * vid_w))
+            ry = int(round((float(r.get("y_pct", 0)) / 100.0) * vid_h))
+            rw = int(round((float(r["width_pct"]) / 100.0) * vid_w))
+            rh = int(round((float(r.get("height_pct", 10)) / 100.0) * vid_h))
+        else:
+            rx = int(r.get("x", 0))
+            ry = int(r.get("y", 0))
+            rw = int(r.get("width", 100))
+            rh = int(r.get("height", 50))
 
-    # Ensure width and height are even integers for x264/yuv420p compliance
-    if width % 2 != 0:
-        width = max(2, width - 1)
-    if height % 2 != 0:
-        height = max(2, height - 1)
+        rx = max(0, min(rx, vid_w - 4))
+        ry = max(0, min(ry, vid_h - 4))
+        rw = max(4, min(rw, vid_w - rx))
+        rh = max(4, min(rh, vid_h - ry))
+
+        if rx % 2 != 0: rx -= 1
+        if ry % 2 != 0: ry -= 1
+        if rw % 2 != 0: rw += 1
+        if rh % 2 != 0: rh += 1
+
+        rx = max(0, min(rx, vid_w - 4))
+        ry = max(0, min(ry, vid_h - 4))
+        rw = max(4, min(rw, vid_w - rx))
+        rh = max(4, min(rh, vid_h - ry))
+
+        blur_size_x = max(6, min(32, rw // 2))
+        blur_size_y = max(6, min(32, rh // 2))
+
+        valid_regions.append({
+            "x": rx, "y": ry, "width": rw, "height": rh,
+            "blur_x": blur_size_x, "blur_y": blur_size_y
+        })
+
+    if not valid_regions:
+        return video_path
 
     export_dir = os.path.join(settings.upload_dir, "exports")
     os.makedirs(export_dir, exist_ok=True)
@@ -1227,29 +1456,28 @@ def blur_region(
     output_filename = f"{uuid.uuid4()}_blur{ext}"
     output_path = os.path.join(export_dir, output_filename)
 
-    # Crop out the marked region, blur it (two passes for strong blur),
-    # then composite it back at the exact same coordinates.
-    filter_complex = (
-        f"split[base][fg];"
-        f"[fg]crop={width}:{height}:{x}:{y},boxblur=20:4,boxblur=20:4[blurred];"
-        f"[base][blurred]overlay={x}:{y},format=yuv420p[outv]"
-    )
+    n = len(valid_regions)
+    split_tags = "".join(f"[c{i}]" for i in range(n))
+    filters = [f"[0:v]split={n+1}[base]{split_tags}"]
+    for i, r in enumerate(valid_regions):
+        filters.append(f"[c{i}]crop={r['width']}:{r['height']}:{r['x']}:{r['y']},avgblur=sizeX={r['blur_x']}:sizeY={r['blur_y']}[b{i}]")
 
-    import sys
-    is_macos = sys.platform == "darwin"
+    current_input = "[base]"
+    for i, r in enumerate(valid_regions):
+        is_last = (i == n - 1)
+        next_tag = "[outv]" if is_last else f"[tmp{i}]"
+        fmt = ",format=yuv420p" if is_last else ""
+        filters.append(f"{current_input}[b{i}]overlay={r['x']}:{r['y']}{fmt}{next_tag}")
+        current_input = next_tag
 
-    # Prefer VideoToolbox hardware acceleration on macOS for fast rendering
-    if is_macos:
-        v_codec = ["-c:v", "h264_videotoolbox", "-b:v", "6M", "-pix_fmt", "yuv420p"]
-    else:
-        v_codec = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "18"]
+    filter_complex = ";".join(filters)
 
     cmd = [
         ffmpeg, "-y",
         "-i", video_path,
         "-filter_complex", filter_complex,
         "-map", "[outv]", "-map", "0:a?",
-        *v_codec,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "18",
         "-c:a", "copy",
         "-movflags", "+faststart",
         output_path,
@@ -1257,7 +1485,6 @@ def blur_region(
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
-        # Fallback to libx264 software encoder with aac audio
         cmd_fb = [
             ffmpeg, "-y",
             "-i", video_path,
@@ -1268,11 +1495,22 @@ def blur_region(
             "-movflags", "+faststart",
             output_path,
         ]
-        result = subprocess.run(cmd_fb, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg blur failed: {result.stderr[-500:]}")
+        result_fb = subprocess.run(cmd_fb, capture_output=True, text=True, timeout=600)
+        if result_fb.returncode != 0:
+            raise RuntimeError(f"FFmpeg multi-blur failed: {result_fb.stderr[-300:]}")
 
     return output_path
+
+
+def blur_region(
+    video_path: str,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+) -> str:
+    """Blur a single rectangular region of the video."""
+    return blur_regions(video_path, [{"x": x, "y": y, "width": width, "height": height}])
 
 
 def resize_video(

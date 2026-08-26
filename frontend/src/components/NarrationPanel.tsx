@@ -5,10 +5,8 @@ import {
   generateNarration,
   applyNarration,
   generateTtsPreview,
-  suggestMovieTitles,
   generateSocialMediaScript,
   type NarrationSegment,
-  type ViralTitleItem,
   type SocialMediaScriptResult,
   type ScriptBlockItem,
 } from '../api/client';
@@ -200,11 +198,22 @@ const GLOBAL_VOICES = [
   { id: 'male', name: 'Male Voice', gender: 'male', avatar: '👨', desc: 'Standard Male Voiceover' },
 ];
 
-export function NarrationPanel() {
+interface NarrationPanelProps {
+  initialTab?: 'narration' | 'social';
+  hideInnerTabs?: boolean;
+}
+
+export function NarrationPanel({ initialTab = 'narration', hideInnerTabs = true }: NarrationPanelProps = {}) {
   const { currentProject, loadProject, updateProjectName } = useProjectStore();
 
-  // Top sub-tab state: 'narration' | 'titles' | 'social'
-  const [activeTab, setActiveTab] = useState<'narration' | 'titles' | 'social'>('narration');
+  // Top sub-tab state: 'narration' | 'social'
+  const [activeTab, setActiveTab] = useState<'narration' | 'social'>(initialTab);
+
+  useEffect(() => {
+    if (initialTab) {
+      setActiveTab(initialTab);
+    }
+  }, [initialTab]);
 
   // Narration Form State
   const [style, setStyle] = useState('recap_tiktok');
@@ -227,30 +236,49 @@ export function NarrationPanel() {
   // Audio Preview states
   const [playingIdx, setPlayingIdx] = useState<number | null>(null);
   const [audioLoadingIdx, setAudioLoadingIdx] = useState<number | null>(null);
+  const [auditioningVoiceId, setAuditioningVoiceId] = useState<string | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  // Viral Titles State
-  const [movieTitleInput, setMovieTitleInput] = useState(currentProject?.name || '');
-  const [isGeneratingTitles, setIsGeneratingTitles] = useState(false);
-  const [suggestedTitles, setSuggestedTitles] = useState<ViralTitleItem[]>([]);
-  const [copiedTitleIdx, setCopiedTitleIdx] = useState<number | null>(null);
-  const [appliedTitleIdx, setAppliedTitleIdx] = useState<number | null>(null);
-
   // Social Media Script State
+  const [topicInput, setTopicInput] = useState(currentProject?.name || '');
+  const [socialPlatform, setSocialPlatform] = useState<'tiktok' | 'youtube_shorts' | 'facebook_reels' | 'instagram_reels'>('tiktok');
+  const [socialTone, setSocialTone] = useState<'suspense' | 'fast_action' | 'dramatic' | 'humor' | 'twist'>('suspense');
+  const [socialDuration, setSocialDuration] = useState<'15-30s' | '30-60s' | '60-90s'>('30-60s');
+  const [socialCustomNotes, setSocialCustomNotes] = useState('');
+  const [showSocialNotes, setShowSocialNotes] = useState(false);
   const [isGeneratingSocial, setIsGeneratingSocial] = useState(false);
   const [isApplyingSocialBlocks, setIsApplyingSocialBlocks] = useState(false);
   const [socialScript, setSocialScript] = useState<SocialMediaScriptResult | null>(null);
   const [copiedFullPost, setCopiedFullPost] = useState(false);
   const [copiedHook, setCopiedHook] = useState(false);
   const [copiedHashtags, setCopiedHashtags] = useState(false);
+  const [copiedPinnedComment, setCopiedPinnedComment] = useState(false);
+  const [copiedCueSheet, setCopiedCueSheet] = useState(false);
   const [copiedChip, setCopiedChip] = useState<string | null>(null);
+  const [playingBlockIdx, setPlayingBlockIdx] = useState<number | null>(null);
+  const [blockAudioLoadingIdx, setBlockAudioLoadingIdx] = useState<number | null>(null);
+  const socialResultRef = useRef<HTMLDivElement | null>(null);
 
-  const hasVideo = !!currentProject?.video_path;
+  const hasVideo = !!currentProject?.video_path || !!currentProject?.video_filename || !!(currentProject?.segments && currentProject.segments.length > 0) || !!currentProject?.id;
 
-  // Sync title input with project
+  // Restore cached social script from localStorage on project switch
+  useEffect(() => {
+    if (currentProject?.id) {
+      try {
+        const cached = localStorage.getItem(`social_script_${currentProject.id}`);
+        if (cached) {
+          setSocialScript(JSON.parse(cached));
+        }
+      } catch (e) {
+        console.error('Failed to load cached social script:', e);
+      }
+    }
+  }, [currentProject?.id]);
+
+  // Sync topic input with project
   useEffect(() => {
     if (currentProject?.name) {
-      setMovieTitleInput(currentProject.name);
+      setTopicInput(currentProject.name);
     }
   }, [currentProject?.name]);
 
@@ -352,6 +380,22 @@ export function NarrationPanel() {
     }
   };
 
+  const handleOpenSocialInEditor = () => {
+    if (!socialScript?.blocks || socialScript.blocks.length === 0) return;
+    const segments: NarrationSegment[] = socialScript.blocks.map((b, idx) => ({
+      index: idx,
+      start_time: Number(b.start_time) || idx * 8,
+      end_time: Number(b.end_time) || (idx + 1) * 8,
+      text: b.voiceover || b.text_on_screen || '',
+      type: 'narration',
+      speaker: 'Narrator',
+      gender: voice.includes('Piseth') || voice === 'male' ? 'male' : 'female',
+      emotion: 'excited',
+    }));
+    setNarrationSegments(segments);
+    setShowPreview(true);
+  };
+
   const handlePlayLineSample = async (seg: NarrationSegment, idx: number) => {
     if (playingIdx === idx) {
       if (previewAudioRef.current) {
@@ -392,6 +436,48 @@ export function NarrationPanel() {
     }
   };
 
+  const handleAuditionVoice = async (voiceId: string) => {
+    if (!currentProject) return;
+    if (auditioningVoiceId === voiceId) {
+      if (previewAudioRef.current) {
+        previewAudioRef.current.pause();
+        previewAudioRef.current = null;
+      }
+      setAuditioningVoiceId(null);
+      return;
+    }
+
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      previewAudioRef.current = null;
+    }
+
+    const sampleText = voiceId.includes('Sreymom')
+      ? 'ជម្រាបសួរ! ខ្ញុំជាស្រីមុំ អ្នកអត្ថាធិប្បាយរឿងភាពយន្តរបស់អ្នក។'
+      : 'ជម្រាបសួរ! ខ្ញុំជាពិសិដ្ឋ អ្នកសម្រាយសាច់រឿងភាពយន្តលំដាប់កំពូល។';
+    const profile = voiceId.includes('Sreymom') ? 'female' : 'male';
+    try {
+      setAuditioningVoiceId(voiceId);
+      const res = await generateTtsPreview(currentProject.id, {
+        text: sampleText,
+        voice_name: voiceId,
+        voice_profile: profile,
+        emotion: 'excited',
+        speed: 1.0,
+      });
+      const audio_url = res.audio_url || (res as any)?.data?.audio_url;
+      if (audio_url) {
+        const audio = new Audio(audio_url);
+        previewAudioRef.current = audio;
+        audio.onended = () => setAuditioningVoiceId(null);
+        audio.onerror = () => setAuditioningVoiceId(null);
+        await audio.play();
+      }
+    } catch {
+      setAuditioningVoiceId(null);
+    }
+  };
+
   const handleEditStart = (idx: number) => {
     setEditingIdx(idx);
     setEditText(narrationSegments[idx].text);
@@ -409,55 +495,44 @@ export function NarrationPanel() {
     setNarrationSegments((prev) => prev.filter((_, i) => i !== idx));
   };
 
-  // Title Generator Handler
-  const handleSuggestTitles = async () => {
-    if (!currentProject) return;
-    setIsGeneratingTitles(true);
-    setError(null);
-    setToast({ kind: 'busy', msg: 'Generating viral movie recap titles...' });
-    try {
-      const data = await suggestMovieTitles(currentProject.id, movieTitleInput, language);
-      setSuggestedTitles(data.titles || []);
-      setToast({ kind: 'done', msg: `Generated ${data.titles?.length || 0} viral title suggestions!` });
-    } catch (e: any) {
-      const msg = e?.response?.data?.detail || e.message || 'Failed to generate title suggestions';
-      setError(msg);
-      setToast({ kind: 'error', msg });
-    } finally {
-      setIsGeneratingTitles(false);
-    }
-  };
-
-  const handleCopyTitle = (text: string, idx: number) => {
-    navigator.clipboard.writeText(text);
-    setCopiedTitleIdx(idx);
-    setTimeout(() => setCopiedTitleIdx(null), 2500);
-  };
-
-  const handleApplyTitleAsProjectName = async (title: string, idx: number) => {
-    if (!currentProject) return;
-    try {
-      if (updateProjectName) {
-        await updateProjectName(title);
-      }
-      setAppliedTitleIdx(idx);
-      setToast({ kind: 'done', msg: 'Project name updated!' });
-      setTimeout(() => setAppliedTitleIdx(null), 2500);
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
   // Social Media Script Handler
   const handleGenerateSocial = async () => {
     if (!currentProject) return;
     setIsGeneratingSocial(true);
     setError(null);
-    setToast({ kind: 'busy', msg: 'Composing short-form video production script & viral package...' });
+    setToast({ kind: 'busy', msg: `Composing ${socialPlatform} short-form script & package...` });
     try {
-      const data = await generateSocialMediaScript(currentProject.id, movieTitleInput, language);
+      const data = await generateSocialMediaScript(currentProject.id, {
+        originalTitle: topicInput,
+        language,
+        platform: socialPlatform,
+        tone: socialTone,
+        durationTarget: socialDuration,
+        customNotes: socialCustomNotes,
+      });
       setSocialScript(data);
-      setToast({ kind: 'done', msg: 'Short-form production script & social package ready!' });
+      try {
+        localStorage.setItem(`social_script_${currentProject.id}`, JSON.stringify(data));
+      } catch (e) {}
+
+      // Convert blocks to narration segments so the interactive preview player & timeline mapper has full data
+      if (data.blocks && data.blocks.length > 0) {
+        const segments: NarrationSegment[] = data.blocks.map((b, idx) => ({
+          index: idx,
+          start_time: Number(b.start_time) || idx * 8,
+          end_time: Number(b.end_time) || (idx + 1) * 8,
+          text: b.voiceover || b.text_on_screen || '',
+          type: 'narration',
+          speaker: 'Narrator',
+          gender: voice.includes('Piseth') || voice === 'male' ? 'male' : 'female',
+          emotion: 'excited',
+        }));
+        setNarrationSegments(segments);
+      }
+
+      setToast(null);
+      // Automatically open the full interactive script editor & audio preview modal!
+      setShowPreview(true);
     } catch (e: any) {
       const msg = e?.response?.data?.detail || e.message || 'Failed to generate social media script';
       setError(msg);
@@ -486,6 +561,69 @@ export function NarrationPanel() {
     navigator.clipboard.writeText(socialScript.hashtags.join(' '));
     setCopiedHashtags(true);
     setTimeout(() => setCopiedHashtags(false), 2500);
+  };
+
+  const handleCopyPinnedComment = () => {
+    if (!socialScript?.pinned_comment) return;
+    navigator.clipboard.writeText(socialScript.pinned_comment);
+    setCopiedPinnedComment(true);
+    setTimeout(() => setCopiedPinnedComment(false), 2500);
+  };
+
+  const handleCopyCueSheet = () => {
+    if (!socialScript) return;
+    let cueSheet = socialScript.full_script_markdown || '';
+    if (!cueSheet && socialScript.blocks) {
+      cueSheet = `# ${socialScript.title || 'Short-Form Video Production Cue Sheet'}\n\n`;
+      cueSheet += `**Platform**: ${socialScript.platform || socialPlatform} | **Duration**: ${socialScript.total_duration || socialDuration} | **Tone**: ${socialScript.tone || socialTone}\n\n`;
+      cueSheet += `| Time Range | Scene / Shot | On-Screen Text | Voiceover Line | SFX |\n`;
+      cueSheet += `|---|---|---|---|---|\n`;
+      for (const b of socialScript.blocks) {
+        cueSheet += `| ${b.time_range} | ${b.visual || '-'} | ${b.text_on_screen || '-'} | ${b.voiceover || '-'} | ${b.sound_effect || '-'} |\n`;
+      }
+    }
+    navigator.clipboard.writeText(cueSheet);
+    setCopiedCueSheet(true);
+    setTimeout(() => setCopiedCueSheet(false), 2500);
+  };
+
+  const handlePlayBlockVoiceover = async (text: string, idx: number) => {
+    if (playingBlockIdx === idx) {
+      if (previewAudioRef.current) {
+        previewAudioRef.current.pause();
+        previewAudioRef.current = null;
+      }
+      setPlayingBlockIdx(null);
+      return;
+    }
+
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      previewAudioRef.current = null;
+    }
+
+    if (!currentProject?.id) return;
+    setBlockAudioLoadingIdx(idx);
+    try {
+      const { audio_url } = await generateTtsPreview(currentProject.id, {
+        text,
+        voice_name: voice,
+        voice_profile: voice.includes('Piseth') || voice === 'male' ? 'male' : 'female',
+        emotion: 'excited',
+      });
+      if (audio_url) {
+        const audio = new Audio(audio_url);
+        previewAudioRef.current = audio;
+        audio.onended = () => setPlayingBlockIdx(null);
+        audio.onerror = () => setPlayingBlockIdx(null);
+        await audio.play();
+        setPlayingBlockIdx(idx);
+      }
+    } catch (e: any) {
+      setToast({ kind: 'error', msg: 'Failed to generate voice preview' });
+    } finally {
+      setBlockAudioLoadingIdx(null);
+    }
   };
 
   const handleCopyChip = (tag: string) => {
@@ -517,157 +655,258 @@ export function NarrationPanel() {
   const voiceList = language === 'km' ? KHMER_VOICES : GLOBAL_VOICES;
 
   return (
-    <div className="flex flex-col h-full overflow-y-auto p-4 space-y-4 bg-[#121316] text-[#e1e3e6] select-none font-sans">
+    <div className="flex flex-col h-full overflow-y-auto overflow-x-hidden scroll-smooth scrollbar-thin scrollbar-thumb-zinc-700/50 hover:scrollbar-thumb-zinc-600/70 scrollbar-track-transparent p-4 space-y-4 bg-[#121316] text-[#e1e3e6] select-none font-sans [contain:content]">
       <NarrationToast toast={toast} onClose={() => setToast(null)} />
 
-      {/* Top Main Navigation Tabs (Inspired by Dai-Recap AI) */}
-      <div className="flex items-center p-1 bg-[#181a24] rounded-2xl border border-[#272b3a] shadow-md shadow-black/40">
-        <button
-          onClick={() => setActiveTab('narration')}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-bold transition-all ${
-            activeTab === 'narration'
-              ? 'bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-md shadow-purple-950/40'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          <Mic className="w-3.5 h-3.5" />
-          <span>AI Recap Narration</span>
-        </button>
+      {/* Top Main Navigation Tabs (Only shown if hideInnerTabs is false) */}
+      {!hideInnerTabs && (
+        <div className="flex items-center p-1 bg-[#181a24] rounded-2xl border border-[#272b3a] shadow-md shadow-black/40">
+          <button
+            onClick={() => setActiveTab('narration')}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-bold transition-all ${
+              activeTab === 'narration'
+                ? 'bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-md shadow-purple-950/40'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <Mic className="w-3.5 h-3.5" />
+            <span>AI Recap Narration</span>
+          </button>
 
-        <button
-          onClick={() => setActiveTab('titles')}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-bold transition-all ${
-            activeTab === 'titles'
-              ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-md shadow-blue-950/40'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          <Sparkles className="w-3.5 h-3.5" />
-          <span>Viral Titles</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('social')}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-bold transition-all ${
-            activeTab === 'social'
-              ? 'bg-gradient-to-r from-purple-600 to-pink-600 text-white shadow-md shadow-pink-950/40'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          <Share2 className="w-3.5 h-3.5" />
-          <span>Shorts & Social Script</span>
-        </button>
-      </div>
+          <button
+            onClick={() => setActiveTab('social')}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-bold transition-all ${
+              activeTab === 'social'
+                ? 'bg-gradient-to-r from-purple-600 to-pink-600 text-white shadow-md shadow-pink-950/40'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <Share2 className="w-3.5 h-3.5" />
+            <span>Shorts & Social Script</span>
+          </button>
+        </div>
+      )}
 
       {/* TAB 1: AI RECAP NARRATION */}
       {activeTab === 'narration' && (
         <div className="space-y-4 animate-in fade-in duration-200">
           {/* Header Banner */}
-          <div className="p-3.5 rounded-2xl bg-gradient-to-r from-[#181d2c] to-[#161720] border border-[#272f42] flex items-center justify-between shadow-lg shadow-black/20">
-            <div className="flex items-center gap-3">
-              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 via-purple-600 to-pink-500 flex items-center justify-center text-white shadow-md shadow-purple-950/40">
-                <Mic className="w-4 h-4" />
-              </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <h3 className="text-xs font-bold text-white tracking-wide">Movie Recap Narration Studio</h3>
-                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-bold uppercase">
-                    AI Scriptwriter
-                  </span>
+          <div className="p-4 rounded-2xl bg-gradient-to-br from-[#161a29] via-[#1b172a] to-[#12141c] border border-[#2b3145] shadow-xl shadow-black/30 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-indigo-500 via-purple-600 to-pink-500 flex items-center justify-center text-white shadow-lg shadow-purple-950/50 shrink-0">
+                  <Mic className="w-5 h-5" />
                 </div>
-                <p className="text-[10px] text-zinc-400">Generate viral Khmer movie recap commentary with synchronized audio</p>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-sm font-bold text-white tracking-wide">AI Movie Recap Studio</h3>
+                    <span className="text-[9px] px-2 py-0.5 rounded-full bg-gradient-to-r from-indigo-500/20 to-purple-500/20 text-indigo-300 border border-indigo-500/30 font-bold uppercase tracking-wider">
+                      PRO RECAPPERS
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-zinc-400">
+                    Generate viral Khmer narrative commentary with synchronized voiceover
+                  </p>
+                </div>
               </div>
+
+              {currentProject?.duration ? (
+                <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-black/40 border border-zinc-800 text-[11px] font-mono text-zinc-400">
+                  <Clock className="w-3 h-3 text-indigo-400" />
+                  <span>{formatTime(currentProject.duration)}</span>
+                </div>
+              ) : null}
             </div>
           </div>
 
           {/* Recap Style Selector */}
           <div className="space-y-2">
-            <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
-              <Clapperboard className="w-3.5 h-3.5 text-amber-400" />
-              Recap Presentation Style
-            </label>
-            <div className="grid grid-cols-1 gap-2">
+            <div className="flex items-center justify-between">
+              <label className="text-[11px] font-bold text-zinc-300 uppercase tracking-wider flex items-center gap-1.5">
+                <Clapperboard className="w-3.5 h-3.5 text-amber-400" />
+                Presentation Style
+              </label>
+              <span className="text-[10px] text-zinc-500">Choose storytelling tone</span>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {RECAP_STYLES.map((s) => {
                 const isSel = style === s.id;
                 return (
                   <button
                     key={s.id}
+                    type="button"
                     onClick={() => setStyle(s.id)}
-                    className={`p-3 rounded-xl border text-left transition-all ${
+                    className={`p-3 rounded-2xl border text-left transition-all cursor-pointer relative overflow-hidden group ${
                       isSel
-                        ? `bg-gradient-to-r ${s.color} text-white shadow-md shadow-black/30 ring-1 ring-white/10`
-                        : 'bg-[#171922] border-[#262a35] hover:border-[#3a4050] text-zinc-300'
+                        ? `bg-gradient-to-br ${s.color} text-white shadow-lg shadow-black/40 ring-1 ring-white/20`
+                        : 'bg-[#151722] border-[#242838] hover:border-[#3a415a] hover:bg-[#1a1d2c] text-zinc-300'
                     }`}
                   >
-                    <div className="flex items-center justify-between mb-1">
+                    <div className="flex items-center justify-between mb-1.5">
                       <div className="flex items-center gap-2">
-                        {s.icon}
-                        <span className="font-bold text-xs text-white">{s.label}</span>
+                        <div
+                          className={`w-6 h-6 rounded-lg flex items-center justify-center ${
+                            isSel ? 'bg-white/20 text-white' : 'bg-[#1e2230] text-zinc-400'
+                          }`}
+                        >
+                          {s.icon}
+                        </div>
+                        <span className="font-bold text-xs text-white">{s.label.split('(')[0]}</span>
                       </div>
-                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-black/40 text-zinc-300 font-khmer border border-white/5">
+                      <span className="text-[9px] px-2 py-0.5 rounded-full bg-black/40 text-zinc-300 font-semibold border border-white/5">
                         {s.tag}
                       </span>
                     </div>
-                    <p className="text-[10px] text-zinc-400 leading-relaxed pl-6">{s.desc}</p>
+                    <p className="text-[10px] text-zinc-400 leading-relaxed line-clamp-2">{s.desc}</p>
+
+                    {isSel && (
+                      <div className="absolute top-2 right-2 w-2 h-2 rounded-full bg-pink-500 shadow-[0_0_8px_rgba(236,72,153,0.8)]" />
+                    )}
                   </button>
                 );
               })}
             </div>
           </div>
 
-          {/* Target Language & Voice Selection */}
-          <div className="grid grid-cols-2 gap-3 pt-1 border-t border-[#1e212b]">
-            {/* Language */}
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">Language</label>
-              <select
-                value={language}
-                onChange={(e) => setLanguage(e.target.value)}
-                className="w-full bg-[#181a22] border border-[#282d3b] rounded-xl px-3 py-2 text-xs text-white focus:border-blue-500 focus:outline-none"
-              >
-                {LANGUAGES.map((l) => (
-                  <option key={l.id} value={l.id}>
-                    {l.label}
-                  </option>
-                ))}
-              </select>
+          {/* Lead Narrator Voice Selection with Live Audition */}
+          <div className="space-y-2 pt-1 border-t border-[#1e212f]">
+            <div className="flex items-center justify-between">
+              <label className="text-[11px] font-bold text-zinc-300 uppercase tracking-wider flex items-center gap-1.5">
+                <Volume2 className="w-3.5 h-3.5 text-purple-400" />
+                Lead Narrator Voice
+              </label>
+              <span className="text-[10px] text-zinc-500">Audition voice before generating</span>
             </div>
 
-            {/* Narrator Voice */}
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">Lead Narrator</label>
-              <div className="flex gap-1.5">
-                {voiceList.map((v) => (
-                  <button
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              {voiceList.map((v) => {
+                const isSel = voice === v.id;
+                const isAuditioning = auditioningVoiceId === v.id;
+                return (
+                  <div
                     key={v.id}
                     onClick={() => setVoice(v.id)}
-                    className={`flex-1 py-1.5 px-2 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all ${
-                      voice === v.id
-                        ? 'bg-blue-600 border-blue-400 text-white shadow-md shadow-blue-900/30'
-                        : 'bg-[#181a22] border-[#282d3b] text-zinc-400 hover:text-zinc-200'
+                    className={`p-3 rounded-2xl border transition-all cursor-pointer flex flex-col justify-between gap-2.5 ${
+                      isSel
+                        ? 'bg-gradient-to-br from-[#201d36] to-[#161825] border-purple-500/60 shadow-lg shadow-purple-950/30 ring-1 ring-purple-500/40'
+                        : 'bg-[#151722] border-[#242838] hover:border-zinc-700 hover:bg-[#1a1d2c]'
                     }`}
-                    title={v.desc}
                   >
-                    <span>{v.avatar}</span>
-                    <span className="truncate">{v.name.split(' ')[0]}</span>
-                  </button>
-                ))}
-              </div>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-purple-600/30 to-pink-600/30 border border-purple-500/30 flex items-center justify-center text-lg shadow-inner">
+                          {v.avatar}
+                        </div>
+                        <div>
+                          <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                            <span>{v.name}</span>
+                            {isSel && (
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.8)]" />
+                            )}
+                          </div>
+                          <span className="text-[10px] text-zinc-400 font-medium">
+                            {v.gender === 'male' ? 'Deep & Cinematic Male' : 'Expressive Female'}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Live Audition Button */}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleAuditionVoice(v.id);
+                        }}
+                        className={`px-2.5 py-1 rounded-xl text-[10px] font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                          isAuditioning
+                            ? 'bg-pink-600 text-white shadow-md shadow-pink-950/50 animate-pulse'
+                            : 'bg-[#222638] hover:bg-[#2e344c] text-purple-300 hover:text-white border border-purple-500/20'
+                        }`}
+                        title="Audition Sample"
+                      >
+                        {isAuditioning ? (
+                          <>
+                            <Pause className="w-3 h-3" />
+                            <span>Playing</span>
+                          </>
+                        ) : (
+                          <>
+                            <Play className="w-3 h-3" />
+                            <span>Sample</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+
+                    <p className="text-[10px] text-zinc-400 leading-relaxed line-clamp-1">{v.desc}</p>
+                  </div>
+                );
+              })}
             </div>
           </div>
 
-          {/* Custom Director's Hint (Optional) */}
+          {/* Language Selection */}
           <div className="space-y-1.5 pt-1">
-            <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
-              <Sliders className="w-3 h-3 text-purple-400" />
-              Creative Director Prompt (Optional)
+            <label className="text-[11px] font-bold text-zinc-300 uppercase tracking-wider block">
+              Language Output
             </label>
+            <select
+              value={language}
+              onChange={(e) => setLanguage(e.target.value)}
+              className="w-full bg-[#151722] border border-[#262b3d] rounded-xl px-3.5 py-2 text-xs text-white focus:border-purple-500 focus:outline-none cursor-pointer"
+            >
+              {LANGUAGES.map((l) => (
+                <option key={l.id} value={l.id}>
+                  {l.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Creative Director Prompt & Quick Idea Chips */}
+          <div className="space-y-2 pt-1 border-t border-[#1e212f]">
+            <div className="flex items-center justify-between">
+              <label className="text-[11px] font-bold text-zinc-300 uppercase tracking-wider flex items-center gap-1.5">
+                <Sliders className="w-3.5 h-3.5 text-purple-400" />
+                Director Prompt & Tone Customization
+              </label>
+              {promptHint && (
+                <button
+                  type="button"
+                  onClick={() => setPromptHint('')}
+                  className="text-[10px] text-zinc-500 hover:text-zinc-300"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+
+            {/* Quick Prompt Chips */}
+            <div className="flex flex-wrap gap-1.5">
+              {[
+                { label: '⚔️ Hype Martial Arts Battles', text: 'Highlight intense martial arts fights, special sword skills, and weapon clashes.' },
+                { label: '🕵️ Dark Villain Master Plan', text: 'Build suspense around the main villain secret plan, betrayal, and hidden identity.' },
+                { label: '🎭 Emotional Character Revenge', text: 'Emphasize deep character sorrow, family sacrifice, romantic tragedy, and revenge.' },
+                { label: '🔥 Fast-Paced Viral Pacing', text: 'Fast-paced storytelling with punchy comedic reactions and shocking cliffhangers.' },
+              ].map((chip, idx) => (
+                <button
+                  key={idx}
+                  type="button"
+                  onClick={() => setPromptHint((prev) => (prev ? `${prev} ${chip.text}` : chip.text))}
+                  className="text-[10px] px-2.5 py-1 rounded-xl bg-[#171926] hover:bg-[#23273c] border border-[#272c40] hover:border-purple-500/40 text-zinc-300 hover:text-white transition-all cursor-pointer"
+                >
+                  {chip.label}
+                </button>
+              ))}
+            </div>
+
             <textarea
               value={promptHint}
               onChange={(e) => setPromptHint(e.target.value)}
               placeholder="e.g. Focus heavily on the main villain's secret plan, make the battle climax intense, highlight character revenge..."
               rows={2}
-              className="w-full bg-[#181a22] border border-[#282d3b] rounded-xl p-2.5 text-xs text-white placeholder-zinc-500 focus:border-purple-500 focus:outline-none resize-none leading-relaxed"
+              className="w-full bg-[#13151f] border border-[#262b3d] rounded-2xl p-3 text-xs text-white placeholder-zinc-500 focus:border-purple-500 focus:outline-none resize-none leading-relaxed shadow-inner"
             />
           </div>
 
@@ -675,7 +914,7 @@ export function NarrationPanel() {
           <button
             onClick={handleGenerate}
             disabled={isGenerating || !hasVideo}
-            className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white text-xs font-bold transition-all shadow-lg shadow-indigo-950/40 active:scale-98 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="w-full flex items-center justify-center gap-2.5 py-3.5 rounded-2xl bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white text-xs font-bold transition-all shadow-xl shadow-indigo-950/50 active:scale-98 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
           >
             {isGenerating ? (
               <>
@@ -692,114 +931,91 @@ export function NarrationPanel() {
 
           {/* Error Message */}
           {error && (
-            <div className="flex items-start gap-2 p-3 rounded-xl bg-red-950/40 border border-red-800/60 text-red-300 text-xs animate-in fade-in">
+            <div className="flex items-start gap-2 p-3.5 rounded-2xl bg-red-950/40 border border-red-800/60 text-red-300 text-xs animate-in fade-in">
               <AlertCircle className="w-4 h-4 shrink-0 text-red-400 mt-0.5" />
               <span>{error}</span>
             </div>
           )}
 
-          {/* Preview Trigger Button (When segments are available) */}
-          {narrationSegments.length > 0 && !showPreview && (
-            <button
-              onClick={() => setShowPreview(true)}
-              className="w-full flex items-center justify-between p-3 rounded-xl border border-indigo-500/40 bg-indigo-950/30 hover:bg-indigo-900/40 text-indigo-200 text-xs font-bold transition-all"
-            >
-              <div className="flex items-center gap-2">
-                <Play className="w-3.5 h-3.5 text-indigo-400" />
-                <span>Open Script Editor ({narrationSegments.length} segments ready)</span>
-              </div>
-              <ChevronRight className="w-4 h-4 text-indigo-400" />
-            </button>
-          )}
-        </div>
-      )}
+          {/* Generated Script Master Station */}
+          {narrationSegments.length > 0 && (
+            <div className="p-4 rounded-2xl bg-[#151722] border border-[#2a2f42] space-y-3.5 animate-in fade-in duration-200 shadow-xl">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="w-7 h-7 rounded-xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold">
+                    <CheckCircle2 className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h4 className="text-xs font-bold text-white">Recap Production Script Ready</h4>
+                    <p className="text-[10px] text-zinc-400">
+                      {narrationSegments.length} timeline scenes · Lead Voice: {voiceList.find((v) => v.id === voice)?.name || 'Piseth'}
+                    </p>
+                  </div>
+                </div>
 
-      {/* TAB 2: VIRAL TITLE SUGGESTIONS */}
-      {activeTab === 'titles' && (
-        <div className="space-y-4 animate-in fade-in duration-200">
-          <div className="p-3.5 rounded-2xl bg-gradient-to-r from-[#172033] to-[#151724] border border-[#2b354e] shadow-lg shadow-black/20">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white shadow-md shadow-blue-950/40">
-                <Sparkles className="w-4 h-4" />
-              </div>
-              <div>
-                <h3 className="text-xs font-bold text-white tracking-wide">Viral Movie Title Generator</h3>
-                <p className="text-[10px] text-zinc-400">Generate high-CTR, click-worthy titles for Facebook Reels, TikTok & YouTube</p>
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
-                Original Movie Title / Topic
-              </label>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={movieTitleInput}
-                  onChange={(e) => setMovieTitleInput(e.target.value)}
-                  placeholder="e.g. The Legend of Swordsman / អាថ៌កំបាំងដាវពិឃាត..."
-                  className="flex-1 bg-[#12141c] border border-[#282d3e] rounded-xl px-3 py-2.5 text-xs text-white placeholder-zinc-500 focus:border-blue-500 focus:outline-none"
-                />
                 <button
-                  onClick={handleSuggestTitles}
-                  disabled={isGeneratingTitles}
-                  className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white text-xs font-bold transition-all shadow-md shadow-blue-950/40 disabled:opacity-50 flex items-center gap-1.5 shrink-0"
+                  onClick={() => setShowPreview(true)}
+                  className="px-3 py-1.5 rounded-xl bg-[#22273a] hover:bg-[#2d344e] text-purple-300 hover:text-white text-[11px] font-bold transition-all flex items-center gap-1.5 cursor-pointer border border-purple-500/20"
                 >
-                  {isGeneratingTitles ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <Sparkles className="w-3.5 h-3.5" />
-                  )}
-                  <span>Suggest Titles</span>
+                  <Play className="w-3 h-3" />
+                  <span>Full Editor</span>
                 </button>
               </div>
-            </div>
-          </div>
 
-          {/* Titles List */}
-          {suggestedTitles.length > 0 && (
-            <div className="space-y-2.5">
-              <div className="flex items-center justify-between">
-                <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider">
-                  Generated Title Ideas ({suggestedTitles.length})
-                </span>
+              {/* Action Buttons: Apply to Timeline */}
+              <div className="flex gap-2">
+                <button
+                  onClick={handleApply}
+                  disabled={isApplying}
+                  className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white text-xs font-bold shadow-lg shadow-emerald-950/40 transition-all cursor-pointer active:scale-95"
+                >
+                  {isApplying ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Synthesizing Voice & Injecting Timeline...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>Apply Narration to Timeline</span>
+                    </>
+                  )}
+                </button>
               </div>
 
-              <div className="space-y-2">
-                {suggestedTitles.map((t, idx) => (
+              {/* Quick Segments Preview List */}
+              <div className="space-y-2 max-h-64 overflow-y-auto pr-1 custom-scrollbar">
+                {narrationSegments.map((seg, idx) => (
                   <div
                     key={idx}
-                    className="p-3 rounded-xl bg-[#171924] border border-[#272b3c] hover:border-blue-500/40 transition-all flex flex-col gap-2 group"
+                    className="p-2.5 rounded-xl bg-[#10121a] border border-[#232738] hover:border-purple-500/30 transition-all space-y-1.5"
                   >
-                    <div className="flex items-center justify-between">
-                      <span className="text-[9px] px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/30 font-bold">
-                        {t.category_label || t.category}
+                    <div className="flex items-center justify-between text-[10px]">
+                      <span className="font-mono font-bold text-indigo-400 bg-[#171a26] px-1.5 py-0.5 rounded border border-[#252a3d]">
+                        Scene #{idx + 1} ({formatTime(seg.start_time)} - {formatTime(seg.end_time)})
                       </span>
-                      <div className="flex items-center gap-1">
-                        <button
-                          onClick={() => handleApplyTitleAsProjectName(t.title, idx)}
-                          className="px-2 py-1 bg-[#222736] hover:bg-[#2e3549] text-zinc-300 hover:text-white rounded-lg text-[10px] font-semibold flex items-center gap-1 transition-colors"
-                          title="Use as Project Name"
-                        >
-                          {appliedTitleIdx === idx ? <Check className="w-3 h-3 text-emerald-400" /> : <PenTool className="w-3 h-3" />}
-                          <span>{appliedTitleIdx === idx ? 'Applied' : 'Use Title'}</span>
-                        </button>
-                        <button
-                          onClick={() => handleCopyTitle(t.title, idx)}
-                          className="px-2 py-1 bg-blue-600/30 hover:bg-blue-600/50 text-blue-200 rounded-lg text-[10px] font-semibold flex items-center gap-1 transition-colors border border-blue-500/30"
-                          title="Copy Title"
-                        >
-                          {copiedTitleIdx === idx ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                          <span>{copiedTitleIdx === idx ? 'Copied' : 'Copy'}</span>
-                        </button>
-                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handlePlayLineSample(seg, idx)}
+                        className={`px-2 py-0.5 rounded text-[10px] font-semibold flex items-center gap-1 cursor-pointer transition-all ${
+                          playingIdx === idx
+                            ? 'bg-pink-600 text-white'
+                            : 'bg-[#1b1f2e] text-purple-300 hover:bg-[#252b40]'
+                        }`}
+                      >
+                        {audioLoadingIdx === idx ? (
+                          <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                        ) : playingIdx === idx ? (
+                          <Pause className="w-2.5 h-2.5" />
+                        ) : (
+                          <Play className="w-2.5 h-2.5" />
+                        )}
+                        <span>{playingIdx === idx ? 'Playing' : 'Listen'}</span>
+                      </button>
                     </div>
-                    <p className="text-xs font-bold text-white font-khmer leading-relaxed select-text">
-                      {t.title}
+                    <p className="text-xs text-zinc-200 font-khmer leading-relaxed select-text">
+                      "{seg.text}"
                     </p>
-                    {t.description && (
-                      <p className="text-[10px] text-zinc-400">{t.description}</p>
-                    )}
                   </div>
                 ))}
               </div>
@@ -808,76 +1024,203 @@ export function NarrationPanel() {
         </div>
       )}
 
-      {/* TAB 3: SHORTS & SOCIAL MEDIA PRODUCTION SCRIPT */}
+      {/* TAB 2: SHORTS & SOCIAL MEDIA PRODUCTION SCRIPT STUDIO */}
       {activeTab === 'social' && (
         <div className="space-y-4 animate-in fade-in duration-200">
-          <div className="p-3.5 rounded-2xl bg-gradient-to-r from-[#24172f] to-[#171524] border border-[#3b284e] shadow-lg shadow-black/20">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-white shadow-md shadow-pink-950/40">
+          {/* Main Controls Card */}
+          <div className="p-3.5 rounded-2xl bg-gradient-to-r from-[#24172f] to-[#171524] border border-[#3b284e] shadow-lg shadow-black/20 space-y-3">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-white shadow-md shadow-pink-950/40 shrink-0">
                 <Share2 className="w-4 h-4" />
               </div>
               <div>
-                <h3 className="text-xs font-bold text-white tracking-wide">Short-Form Script & Social Package</h3>
+                <h3 className="text-xs font-bold text-white tracking-wide">Short-Form Script & Social Studio</h3>
                 <p className="text-[10px] text-zinc-400">Director cues, visual shots, on-screen text, voiceovers & viral SEO metadata</p>
               </div>
             </div>
 
-            <div className="space-y-2">
+            {/* Topic Input */}
+            <div className="space-y-1.5">
               <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
-                Original Movie Title / Topic
+                Movie Title / Topic
               </label>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={movieTitleInput}
-                  onChange={(e) => setMovieTitleInput(e.target.value)}
-                  placeholder="e.g. Blade of the Guardians / យុទ្ធសិល្ប៍ដាវទេព..."
-                  className="flex-1 bg-[#12141c] border border-[#282d3e] rounded-xl px-3 py-2.5 text-xs text-white placeholder-zinc-500 focus:border-pink-500 focus:outline-none"
-                />
-                <button
-                  onClick={handleGenerateSocial}
-                  disabled={isGeneratingSocial}
-                  className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white text-xs font-bold transition-all shadow-md shadow-pink-950/40 disabled:opacity-50 flex items-center gap-1.5 shrink-0"
-                >
-                  {isGeneratingSocial ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <Share2 className="w-3.5 h-3.5" />
-                  )}
-                  <span>Generate Script</span>
-                </button>
+              <input
+                type="text"
+                value={topicInput}
+                onChange={(e) => setTopicInput(e.target.value)}
+                placeholder="e.g. Blade of the Guardians / យុទ្ធសិល្ប៍ដាវទេព..."
+                className="w-full bg-[#12141c] border border-[#282d3e] rounded-xl px-3 py-2 text-xs text-white placeholder-zinc-500 focus:border-pink-500 focus:outline-none"
+              />
+            </div>
+
+            {/* Target Platform Selector */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
+                Target Platform
+              </label>
+              <div className="grid grid-cols-4 gap-1.5">
+                {[
+                  { id: 'tiktok', label: 'TikTok', icon: '🎵' },
+                  { id: 'youtube_shorts', label: 'Shorts', icon: '🔴' },
+                  { id: 'facebook_reels', label: 'FB Reels', icon: '🔵' },
+                  { id: 'instagram_reels', label: 'IG Reels', icon: '📸' },
+                ].map((p) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() => setSocialPlatform(p.id as any)}
+                    className={`py-1.5 px-2 rounded-xl text-[11px] font-semibold flex items-center justify-center gap-1 transition-all border ${
+                      socialPlatform === p.id
+                        ? 'bg-pink-600 text-white border-pink-400 shadow-md shadow-pink-950/40'
+                        : 'bg-[#141622] text-zinc-400 border-[#262a3d] hover:text-white hover:border-zinc-600'
+                    }`}
+                  >
+                    <span>{p.icon}</span>
+                    <span>{p.label}</span>
+                  </button>
+                ))}
               </div>
             </div>
+
+            {/* Tone Selector */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
+                Narrative Tone & Vibe
+              </label>
+              <div className="grid grid-cols-3 gap-1.5">
+                {[
+                  { id: 'suspense', label: '🔥 Suspense' },
+                  { id: 'fast_action', label: '⚡ Fast Action' },
+                  { id: 'dramatic', label: '🎭 Dramatic' },
+                  { id: 'humor', label: '😂 Witty Humor' },
+                  { id: 'twist', label: '🧠 Plot Twist' },
+                ].map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => setSocialTone(t.id as any)}
+                    className={`py-1.5 px-2 rounded-xl text-[10px] font-semibold text-center transition-all border ${
+                      socialTone === t.id
+                        ? 'bg-purple-600 text-white border-purple-400 shadow-md shadow-purple-950/40'
+                        : 'bg-[#141622] text-zinc-400 border-[#262a3d] hover:text-white hover:border-zinc-600'
+                    }`}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Target Duration Selector */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
+                Target Video Duration
+              </label>
+              <div className="grid grid-cols-3 gap-1.5">
+                {[
+                  { id: '15-30s', label: '⚡ 15-30s (Ultra-Punchy)' },
+                  { id: '30-60s', label: '⏱️ 30-60s (Standard)' },
+                  { id: '60-90s', label: '🎬 60-90s (Extended)' },
+                ].map((d) => (
+                  <button
+                    key={d.id}
+                    type="button"
+                    onClick={() => setSocialDuration(d.id as any)}
+                    className={`py-1.5 px-2 rounded-xl text-[10px] font-semibold text-center transition-all border ${
+                      socialDuration === d.id
+                        ? 'bg-indigo-600 text-white border-indigo-400 shadow-md shadow-indigo-950/40'
+                        : 'bg-[#141622] text-zinc-400 border-[#262a3d] hover:text-white hover:border-zinc-600'
+                    }`}
+                  >
+                    {d.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Optional Custom Notes */}
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowSocialNotes(!showSocialNotes)}
+                className="text-[10px] text-pink-400 hover:text-pink-300 font-semibold flex items-center gap-1 transition-colors"
+              >
+                <span>{showSocialNotes ? '− Hide Custom Instructions' : '+ Add Custom Director Instructions (Optional)'}</span>
+              </button>
+              {showSocialNotes && (
+                <div className="mt-2">
+                  <textarea
+                    rows={2}
+                    value={socialCustomNotes}
+                    onChange={(e) => setSocialCustomNotes(e.target.value)}
+                    placeholder="e.g. Focus on the betrayal scene, make the ending leave a big question..."
+                    className="w-full bg-[#12141c] border border-[#282d3e] rounded-xl px-3 py-2 text-xs text-white placeholder-zinc-500 focus:border-pink-500 focus:outline-none"
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Generate Button */}
+            <button
+              onClick={handleGenerateSocial}
+              disabled={isGeneratingSocial}
+              className="w-full py-2.5 px-4 rounded-xl bg-gradient-to-r from-purple-600 via-pink-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white text-xs font-bold transition-all shadow-md shadow-pink-950/40 disabled:opacity-50 flex items-center justify-center gap-2 cursor-pointer active:scale-98"
+            >
+              {isGeneratingSocial ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Sparkles className="w-4 h-4" />
+              )}
+              <span>{isGeneratingSocial ? 'Composing Script & Package...' : 'Generate Shorts & Social Package'}</span>
+            </button>
           </div>
 
           {/* Social Script Output */}
           {socialScript && (
-            <div className="space-y-3">
+            <div ref={socialResultRef} className="space-y-3 pt-1">
               {/* Quick Actions Bar */}
               <div className="grid grid-cols-2 gap-2">
                 <button
                   onClick={handleCopyFullPost}
-                  className="py-2.5 px-3 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-bold shadow-lg shadow-emerald-950/40 transition-all flex items-center justify-center gap-1.5 active:scale-98"
+                  className="py-2 px-3 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-bold shadow-lg shadow-emerald-950/40 transition-all flex items-center justify-center gap-1.5 active:scale-98 cursor-pointer"
                 >
-                  {copiedFullPost ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedFullPost ? 'Copied Full Post!' : 'Copy Social Post'}</span>
+                  {copiedFullPost ? <Check className="w-3.5 h-3.5 text-white" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedFullPost ? 'Copied Full Post!' : 'Copy Social Caption'}</span>
                 </button>
 
-                {socialScript.blocks && socialScript.blocks.length > 0 && (
+                <button
+                  onClick={handleCopyCueSheet}
+                  className="py-2 px-3 rounded-xl bg-[#232736] hover:bg-[#2d3346] text-zinc-200 hover:text-white border border-[#353d54] text-xs font-bold transition-all flex items-center justify-center gap-1.5 active:scale-98 cursor-pointer"
+                >
+                  {copiedCueSheet ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <BookOpen className="w-3.5 h-3.5 text-indigo-400" />}
+                  <span>{copiedCueSheet ? 'Copied Cue Sheet!' : 'Copy Cue Sheet'}</span>
+                </button>
+              </div>
+
+              {socialScript.blocks && socialScript.blocks.length > 0 && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <button
                     onClick={handleApplySocialBlocksToTimeline}
                     disabled={isApplyingSocialBlocks}
-                    className="py-2.5 px-3 rounded-xl bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 hover:from-indigo-500 hover:to-pink-500 text-white text-xs font-bold shadow-lg shadow-purple-950/40 transition-all flex items-center justify-center gap-1.5 active:scale-98 disabled:opacity-50"
+                    className="py-2.5 px-3 rounded-xl bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 hover:from-indigo-500 hover:to-pink-500 text-white text-xs font-bold shadow-lg shadow-purple-950/40 transition-all flex items-center justify-center gap-1.5 active:scale-98 disabled:opacity-50 cursor-pointer"
                   >
                     {isApplyingSocialBlocks ? (
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
                     ) : (
-                      <Play className="w-3.5 h-3.5" />
+                      <Play className="w-3.5 h-3.5 fill-white" />
                     )}
-                    <span>{isApplyingSocialBlocks ? 'Applying...' : 'Apply to Timeline'}</span>
+                    <span>{isApplyingSocialBlocks ? 'Applying to Timeline...' : 'Apply to Timeline'}</span>
                   </button>
-                )}
-              </div>
+
+                  <button
+                    onClick={handleOpenSocialInEditor}
+                    className="py-2.5 px-3 rounded-xl bg-[#202534] hover:bg-[#2c3246] text-indigo-200 hover:text-white border border-indigo-500/30 text-xs font-bold transition-all flex items-center justify-center gap-1.5 active:scale-98 cursor-pointer"
+                  >
+                    <BookOpen className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Preview in Full Editor</span>
+                  </button>
+                </div>
+              )}
 
               {/* Overview Stats Badges */}
               {(socialScript.total_duration || socialScript.tone || socialScript.bgm_suggestion) && (
@@ -903,6 +1246,44 @@ export function NarrationPanel() {
                       <span className="font-semibold text-white">{socialScript.bgm_suggestion}</span>
                     </div>
                   )}
+                </div>
+              )}
+
+              {/* Pinned Comment Box */}
+              {socialScript.pinned_comment && (
+                <div className="p-3 rounded-xl bg-[#171e29] border border-[#27384e] space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold text-cyan-400 uppercase tracking-wider flex items-center gap-1">
+                      <MessageSquare className="w-3 h-3" /> Pinned Comment (Debate Starter)
+                    </span>
+                    <button
+                      onClick={handleCopyPinnedComment}
+                      className="text-[10px] text-cyan-300 hover:text-white flex items-center gap-1 bg-[#1e2a3b] hover:bg-[#27374d] px-2 py-0.5 rounded cursor-pointer transition-colors"
+                    >
+                      {copiedPinnedComment ? <Check className="w-2.5 h-2.5 text-emerald-400" /> : <Copy className="w-2.5 h-2.5" />}
+                      <span>{copiedPinnedComment ? 'Copied' : 'Copy'}</span>
+                    </button>
+                  </div>
+                  <p className="text-xs font-bold text-cyan-100 font-khmer leading-relaxed select-text">
+                    "{socialScript.pinned_comment}"
+                  </p>
+                </div>
+              )}
+
+              {/* Director Video Editing Tips */}
+              {socialScript.editing_tips && socialScript.editing_tips.length > 0 && (
+                <div className="p-3 rounded-xl bg-[#1d1726] border border-[#3b274c] space-y-1.5">
+                  <span className="text-[10px] font-bold text-pink-400 uppercase tracking-wider flex items-center gap-1">
+                    <Sparkles className="w-3 h-3" /> Pro Video Editing Tips
+                  </span>
+                  <ul className="space-y-1 text-[11px] text-zinc-300">
+                    {socialScript.editing_tips.map((tip, idx) => (
+                      <li key={idx} className="flex items-start gap-1.5">
+                        <span className="text-pink-400 mt-0.5">•</span>
+                        <span>{tip}</span>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
 
@@ -939,7 +1320,7 @@ export function NarrationPanel() {
                           )}
                         </div>
 
-                        {/* Visual & Text on screen */}
+                        {/* Visual & Sound Effect */}
                         {block.visual && (
                           <div className="flex items-start gap-1.5 text-[11px] text-zinc-300 bg-[#12141c] p-2 rounded-lg border border-[#212534]">
                             <Eye className="w-3.5 h-3.5 text-blue-400 shrink-0 mt-0.5" />
@@ -950,24 +1331,54 @@ export function NarrationPanel() {
                           </div>
                         )}
 
+                        {block.sound_effect && (
+                          <div className="flex items-center gap-1.5 text-[10px] text-indigo-300 bg-[#151928] px-2 py-1 rounded border border-indigo-500/20">
+                            <Zap className="w-3 h-3 text-indigo-400 shrink-0" />
+                            <span className="font-semibold">SFX:</span>
+                            <span>{block.sound_effect}</span>
+                          </div>
+                        )}
+
                         {block.text_on_screen && (
                           <div className="flex items-start gap-1.5 text-[11px] text-amber-300 bg-[#1a1714] p-2 rounded-lg border border-amber-500/20">
                             <Tag className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
                             <div>
-                              <span className="text-amber-500/80 text-[10px] block font-semibold uppercase">On-Screen Text:</span>
+                              <span className="text-amber-500/80 text-[10px] block font-semibold uppercase">On-Screen Text / Sticker:</span>
                               <span className="font-bold">{block.text_on_screen}</span>
                             </div>
                           </div>
                         )}
 
-                        {/* Spoken Voiceover */}
+                        {/* Spoken Voiceover Line with Preview Audio */}
                         {block.voiceover && (
-                          <div className="flex items-start gap-1.5 text-xs text-white bg-[#1a1424] p-2.5 rounded-lg border border-purple-500/30">
-                            <Mic className="w-3.5 h-3.5 text-purple-400 shrink-0 mt-0.5" />
-                            <div className="flex-1">
-                              <span className="text-purple-400 text-[10px] block font-semibold uppercase">Voiceover:</span>
-                              <p className="leading-relaxed font-khmer font-medium italic">"{block.voiceover}"</p>
+                          <div className="text-xs text-white bg-[#1a1424] p-2.5 rounded-lg border border-purple-500/30 space-y-1.5">
+                            <div className="flex items-center justify-between">
+                              <span className="text-purple-400 text-[10px] font-semibold uppercase flex items-center gap-1">
+                                <Mic className="w-3 h-3" /> Voiceover Line
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => handlePlayBlockVoiceover(block.voiceover, idx)}
+                                disabled={blockAudioLoadingIdx === idx}
+                                className={`px-2 py-0.5 rounded text-[10px] font-semibold flex items-center gap-1 transition-all cursor-pointer ${
+                                  playingBlockIdx === idx
+                                    ? 'bg-pink-600 text-white'
+                                    : 'bg-[#291e3b] hover:bg-[#382a52] text-purple-200'
+                                }`}
+                              >
+                                {blockAudioLoadingIdx === idx ? (
+                                  <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                                ) : playingBlockIdx === idx ? (
+                                  <Pause className="w-2.5 h-2.5" />
+                                ) : (
+                                  <Play className="w-2.5 h-2.5" />
+                                )}
+                                <span>{playingBlockIdx === idx ? 'Playing' : 'Listen Voice'}</span>
+                              </button>
                             </div>
+                            <p className="leading-relaxed font-khmer font-medium italic select-text">
+                              "{block.voiceover}"
+                            </p>
                           </div>
                         )}
                       </div>
@@ -984,7 +1395,7 @@ export function NarrationPanel() {
                   </span>
                   <button
                     onClick={handleCopyHook}
-                    className="text-[10px] text-zinc-400 hover:text-white flex items-center gap-1 bg-[#222634] px-2 py-0.5 rounded"
+                    className="text-[10px] text-zinc-400 hover:text-white flex items-center gap-1 bg-[#222634] px-2 py-0.5 rounded cursor-pointer"
                   >
                     {copiedHook ? <Check className="w-2.5 h-2.5 text-emerald-400" /> : <Copy className="w-2.5 h-2.5" />}
                     <span>{copiedHook ? 'Copied' : 'Copy'}</span>
@@ -1019,22 +1430,22 @@ export function NarrationPanel() {
               <div className="p-3 rounded-xl bg-[#171924] border border-[#272b3c] space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="text-[10px] font-bold text-teal-400 uppercase tracking-wider flex items-center gap-1">
-                    <Hash className="w-3 h-3" /> Viral Hashtags
+                    <Hash className="w-3 h-3" /> Viral Hashtags & SEO Tags
                   </span>
                   <button
                     onClick={handleCopyHashtags}
-                    className="text-[10px] text-zinc-400 hover:text-white flex items-center gap-1 bg-[#222634] px-2 py-0.5 rounded"
+                    className="text-[10px] text-zinc-400 hover:text-white flex items-center gap-1 bg-[#222634] px-2 py-0.5 rounded cursor-pointer"
                   >
                     {copiedHashtags ? <Check className="w-2.5 h-2.5 text-emerald-400" /> : <Copy className="w-2.5 h-2.5" />}
                     <span>{copiedHashtags ? 'Copied' : 'Copy All'}</span>
                   </button>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
-                  {socialScript.hashtags.map((tag, idx) => (
+                  {(socialScript.hashtags || []).map((tag, idx) => (
                     <button
                       key={idx}
                       onClick={() => handleCopyChip(tag)}
-                      className={`text-[10px] px-2 py-1 rounded-lg border transition-all ${
+                      className={`text-[10px] px-2 py-1 rounded-lg border transition-all cursor-pointer ${
                         copiedChip === tag
                           ? 'bg-emerald-600/30 border-emerald-500/50 text-emerald-200'
                           : 'bg-[#1e2230] border-[#2e354a] text-zinc-300 hover:text-white hover:border-teal-500/50'
@@ -1070,7 +1481,9 @@ export function NarrationPanel() {
                     <Clapperboard className="w-4 h-4" />
                   </div>
                   <div>
-                    <h2 className="text-sm font-bold text-white">Movie Recap Narration Script</h2>
+                    <h2 className="text-sm font-bold text-white">
+                      {activeTab === 'social' ? 'Shorts & Social Production Script' : 'Movie Recap Narration Script'}
+                    </h2>
                     <p className="text-[11px] text-zinc-400">
                       {narrationSegments.length} timeline segments · Click text to edit · Audition single lines
                     </p>
