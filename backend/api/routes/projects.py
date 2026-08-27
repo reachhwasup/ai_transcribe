@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -84,6 +85,85 @@ async def create_project(data: ProjectCreate, db: AsyncSession = Depends(get_db)
     )
     project = result.scalar_one_or_none()
     return ProjectResponse.model_validate(project)
+
+
+class OpenFolderRequest(BaseModel):
+    path: str
+
+
+@router.get("/default-folders")
+async def get_default_folders_endpoint():
+    """Return common user directories (Downloads, Desktop, Movies, etc.)."""
+    home = os.path.expanduser("~")
+    downloads = os.path.join(home, "Downloads")
+    desktop = os.path.join(home, "Desktop")
+    movies = os.path.join(home, "Movies")
+    return {
+        "home": home,
+        "downloads": downloads if os.path.exists(downloads) else home,
+        "desktop": desktop if os.path.exists(desktop) else home,
+        "movies": movies if os.path.exists(movies) else home,
+    }
+
+
+@router.post("/open-folder")
+async def open_folder_in_finder_endpoint(body: OpenFolderRequest):
+    """Open a folder or reveal a file in macOS Finder / Windows Explorer."""
+    raw_path = os.path.expanduser(body.path.strip())
+    if not os.path.exists(raw_path):
+        parent = os.path.dirname(raw_path)
+        if os.path.exists(parent):
+            raw_path = parent
+        else:
+            raise HTTPException(404, f"Path not found: {raw_path}")
+
+    import sys
+    import subprocess
+    try:
+        if sys.platform == "darwin":
+            if os.path.isfile(raw_path):
+                subprocess.Popen(["open", "-R", raw_path])
+            else:
+                subprocess.Popen(["open", raw_path])
+        elif sys.platform == "win32":
+            if os.path.isfile(raw_path):
+                subprocess.Popen(["explorer", f"/select,{raw_path}"])
+            else:
+                subprocess.Popen(["explorer", raw_path])
+        else:
+            target = os.path.dirname(raw_path) if os.path.isfile(raw_path) else raw_path
+            subprocess.Popen(["xdg-open", target])
+        return {"status": "ok", "path": raw_path}
+    except Exception as e:
+        raise HTTPException(500, f"Could not open path: {e}")
+
+
+@router.post("/select-folder")
+async def select_folder_dialog_endpoint():
+    """Open native OS folder chooser dialog and return chosen path."""
+    import sys
+    import subprocess
+    try:
+        if sys.platform == "darwin":
+            cmd = [
+                "osascript", "-e",
+                'POSIX path of (choose folder with prompt "Select Destination Folder for Export:")'
+            ]
+            res = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=120)
+            if res.returncode == 0 and res.stdout.strip():
+                clean_path = res.stdout.strip().rstrip("/")
+                return {"path": clean_path}
+        elif sys.platform == "win32":
+            cmd = [
+                "powershell", "-command",
+                "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath }"
+            ]
+            res = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=120)
+            if res.returncode == 0 and res.stdout.strip():
+                return {"path": res.stdout.strip()}
+    except Exception as e:
+        print(f"Folder picker error: {e}")
+    return {"path": None}
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
@@ -174,9 +254,19 @@ async def upload_video(
     with open(file_path, "wb") as f:
         f.write(content)
 
-    # Remove old video if exists
+    # Remove old video and stale audio stems if exists
     if project.video_path and os.path.exists(project.video_path):
-        os.remove(project.video_path)
+        try:
+            os.remove(project.video_path)
+        except OSError:
+            pass
+    for stem_name in ("bgm.wav", "vocals.wav", "preview.mp4", "full_audio.wav"):
+        stem_p = os.path.join(project_dir, stem_name)
+        if os.path.exists(stem_p):
+            try:
+                os.remove(stem_p)
+            except OSError:
+                pass
 
     # Get video duration
     duration = get_video_duration(file_path)
@@ -218,3 +308,75 @@ async def upload_video(
     )
     project = result.scalar_one_or_none()
     return ProjectResponse.model_validate(project)
+
+
+@router.delete("/{project_id}/video", response_model=ProjectResponse)
+async def remove_project_video(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove video and all video clips from a project so user can upload the correct video."""
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    # Remove clips
+    existing_clips = await db.execute(
+        select(VideoClip).where(VideoClip.project_id == project_id)
+    )
+    for clip in existing_clips.scalars().all():
+        await db.delete(clip)
+
+    project.video_path = ""
+    project.video_filename = ""
+    project.duration = 0.0
+    project.preview_path = ""
+    project.preview_status = "none"
+
+    await db.commit()
+    await db.refresh(project)
+
+    result = await db.execute(
+        select(Project)
+        .options(selectinload(Project.segments), selectinload(Project.video_clips))
+        .where(Project.id == project_id)
+    )
+    project = result.scalar_one_or_none()
+    return ProjectResponse.model_validate(project)
+
+
+@router.post("/{project_id}/watermark")
+async def upload_watermark(
+    project_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload a watermark / logo image for a project."""
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    ext = Path(file.filename).suffix.lower()
+    allowed = {".png", ".jpg", ".jpeg", ".webp", ".svg"}
+    if ext not in allowed:
+        raise HTTPException(400, f"Unsupported image file type. Allowed: {', '.join(allowed)}")
+
+    watermark_dir = os.path.join(settings.upload_dir, project_id, "watermarks")
+    os.makedirs(watermark_dir, exist_ok=True)
+
+    safe_filename = f"logo_{uuid.uuid4()}{ext}"
+    file_path = os.path.join(watermark_dir, safe_filename)
+
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    url_path = f"/uploads/{project_id}/watermarks/{safe_filename}"
+    return {
+        "url": url_path,
+        "filename": file.filename,
+        "path": file_path,
+    }
+

@@ -1,7 +1,7 @@
 import { useRef, useState, useCallback, useEffect, useMemo, RefObject } from 'react';
 import { useProjectStore } from '../stores/projectStore';
 import type { Segment, VideoClip } from '../types';
-import { getVideoClips, splitClipAtPlayhead, deleteVideoClip, restoreVideoClips, updateVideoClip, reorderVideoClips, updateProject, flipVideo, rotateVideo, changeVideoSpeed, cropVideo, blurVideoRegion, appendVideoFileToTimeline, addVideoClip, separateProjectAudio, sanitizeProjectTimeline } from '../api/client';
+import { getVideoClips, splitClipAtPlayhead, deleteVideoClip, restoreVideoClips, updateVideoClip, reorderVideoClips, updateProject, flipVideo, rotateVideo, changeVideoSpeed, cropVideo, blurVideoRegion, appendVideoFileToTimeline, addVideoClip, separateProjectAudio, sanitizeProjectTimeline, removeProjectVideo } from '../api/client';
 import { buildClipLayout, totalTimelineDuration, timelineToSource, sourceToTimeline, sourceRangeToTimeline } from '../utils/clipTimemap';
 import {
   Volume2,
@@ -163,6 +163,16 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     } catch {}
     return false;
   });
+  const [videoVolume, setVideoVolume] = useState<number>(() => {
+    try {
+      const pId = currentProject?.id;
+      if (!pId) return 0.6;
+      const raw = localStorage.getItem(`timeline-video-volume-${pId}`);
+      return raw ? Number(raw) : 0.6;
+    } catch {
+      return 0.6;
+    }
+  });
   const [bgmVolume, setBgmVolume] = useState<number>(() => {
     try {
       const pId = currentProject?.id;
@@ -243,9 +253,10 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
         a2: a2Muted,
       })
     );
+    localStorage.setItem(`timeline-video-volume-${currentProject.id}`, String(videoVolume));
     localStorage.setItem(`timeline-bgm-volume-${currentProject.id}`, String(bgmVolume));
     localStorage.setItem(`timeline-vocals-volume-${currentProject.id}`, String(vocalsVolume));
-  }, [currentProject?.id, mutedTracks, aiMutedProfiles, b1Muted, v1Muted, a2Muted, bgmVolume, vocalsVolume]);
+  }, [currentProject?.id, mutedTracks, aiMutedProfiles, b1Muted, v1Muted, a2Muted, videoVolume, bgmVolume, vocalsVolume]);
 
   // Generate Voice Audio state
   const [audioGenerating, setAudioGenerating] = useState(false);
@@ -279,6 +290,8 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
   const flipPanelRef = useRef<HTMLDivElement>(null);
   const rotatePanelRef = useRef<HTMLDivElement>(null);
   const speedPanelRef = useRef<HTMLDivElement>(null);
+  const moreToolsPanelRef = useRef<HTMLDivElement>(null);
+  const [showMoreToolsPanel, setShowMoreToolsPanel] = useState(false);
   const zoomDropdownRef = useRef<HTMLDivElement>(null);
   const [showZoomDropdown, setShowZoomDropdown] = useState(false);
 
@@ -366,7 +379,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
   const [thumbnails, setThumbnails] = useState<string[]>([]);
   const thumbGenRef = useRef(false);
 
-  // Wire A2 mute to actual video audio (always mute video audio if stems are separated or a2Muted)
+  // Wire A2 mute and videoVolume to actual video audio (scaled by master volume)
   useEffect(() => {
     if (videoRef.current) {
       if (audioSeparated || a2Muted || masterMuted) {
@@ -374,10 +387,10 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
         videoRef.current.volume = 0;
       } else {
         videoRef.current.muted = false;
-        videoRef.current.volume = masterVolume;
+        videoRef.current.volume = Math.max(0.0, Math.min(1.0, videoVolume * masterVolume));
       }
     }
-  }, [a2Muted, audioSeparated, masterMuted, masterVolume, videoRef]);
+  }, [a2Muted, audioSeparated, masterMuted, masterVolume, videoVolume, videoRef]);
 
   // Wire V1 mute and volume to vocals audio element (scaled by master volume)
   useEffect(() => {
@@ -642,23 +655,32 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     addVideoInputRef.current?.click();
   };
 
-  // Delete a clip (non-destructive — no video rebuild)
+  // Delete a clip from timeline (leaves master asset in MY ASSETS)
   const handleDeleteClip = useCallback(async (clipId: string) => {
     if (!currentProject) return;
     pushUndo();
     try {
-      const result = await deleteVideoClip(currentProject.id, clipId);
-      if (result.clips) {
+      if (clipId === 'vocals-track' || clipId === 'bgm-track') {
+        onRemoveAudioSeparation?.();
+        setSelectedClipId(null);
+        return;
+      }
+      const targetId = clipId === 'main-clip' ? (videoClips[0]?.id || clipId) : clipId;
+      const result = await deleteVideoClip(currentProject.id, targetId);
+      if (result.clips && result.clips.length > 0) {
         setVideoClips(result.clips);
       } else {
-        setVideoClips(videoClips.filter(c => c.id !== clipId));
+        setVideoClips([]);
       }
       setSelectedClipId(null);
     } catch (err: any) {
       console.error('Delete clip failed:', err?.response?.data?.detail || err?.message);
+      // If error (e.g. clipId was synthetic 'main-clip'), clear local clips
+      setVideoClips(videoClips.filter((c) => c.id !== clipId));
+      setSelectedClipId(null);
       undoStackRef.current.pop(); // revert snapshot on failure
     }
-  }, [currentProject, videoClips, setVideoClips, pushUndo]);
+  }, [currentProject, videoClips, setVideoClips, pushUndo, onRemoveAudioSeparation]);
 
   // Delete a segment with undo support
   const handleDeleteSegment = useCallback(async (segmentId: string) => {
@@ -1289,8 +1311,9 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     setAudioGenerating(true);
     setAudioGenerated(false);
     try {
-      const ids = selectedSegmentIds.size > 0 ? Array.from(selectedSegmentIds) : undefined;
-      await generateVoiceForSegments(ids);
+      const isSelection = selectedSegmentIds.size > 0;
+      const ids = isSelection ? Array.from(selectedSegmentIds) : undefined;
+      await generateVoiceForSegments(ids, 1.0, 'A', undefined, undefined, !isSelection);
       setAudioGenerated(true);
       setTimeout(() => setAudioGenerated(false), 3000);
     } catch (err) {
@@ -1732,14 +1755,15 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     return () => el.removeEventListener('wheel', onWheel);
   }, [zoom]);
 
-  // Close flip/rotate/speed/zoom panels on outside click
+  // Close flip/rotate/speed/zoom/more panels on outside click
   useEffect(() => {
-    if (!showFlipPanel && !showRotatePanel && !showSpeedPanel && !showZoomDropdown) return;
+    if (!showFlipPanel && !showRotatePanel && !showSpeedPanel && !showZoomDropdown && !showMoreToolsPanel) return;
     const handleClick = (e: MouseEvent) => {
       if (showFlipPanel && flipPanelRef.current && !flipPanelRef.current.contains(e.target as Node)) setShowFlipPanel(false);
       if (showRotatePanel && rotatePanelRef.current && !rotatePanelRef.current.contains(e.target as Node)) setShowRotatePanel(false);
       if (showSpeedPanel && speedPanelRef.current && !speedPanelRef.current.contains(e.target as Node)) setShowSpeedPanel(false);
       if (showZoomDropdown && zoomDropdownRef.current && !zoomDropdownRef.current.contains(e.target as Node)) setShowZoomDropdown(false);
+      if (showMoreToolsPanel && moreToolsPanelRef.current && !moreToolsPanelRef.current.contains(e.target as Node)) setShowMoreToolsPanel(false);
     };
     const timer = setTimeout(() => {
       document.addEventListener('mousedown', handleClick);
@@ -1748,7 +1772,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
       clearTimeout(timer);
       document.removeEventListener('mousedown', handleClick);
     };
-  }, [showFlipPanel, showRotatePanel, showSpeedPanel, showZoomDropdown]);
+  }, [showFlipPanel, showRotatePanel, showSpeedPanel, showZoomDropdown, showMoreToolsPanel]);
 
   // Time markers calculation — spans the full scrollable width of the timeline
   const targetPxBetweenMarkers = 85;
@@ -1991,12 +2015,12 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
       {/* Meatika Timeline Toolbar */}
       <div className="h-10 border-b border-[#1c1e24] bg-[#121316] px-3 flex items-center justify-between shrink-0 gap-2 relative z-30 overflow-visible">
         {/* Left Action Tools */}
-        <div className="flex items-center gap-1 text-zinc-400 shrink-0">
+        <div className="flex items-center gap-0.5 sm:gap-1 text-zinc-400 shrink min-w-0">
           {/* Undo */}
           <button
             onClick={handleUndo}
             disabled={undoStackRef.current.length === 0}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors disabled:opacity-30"
+            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors disabled:opacity-30 cursor-pointer"
             title="Undo (Ctrl+Z)"
           >
             <Undo2 className="w-4 h-4" />
@@ -2006,219 +2030,322 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
           <button
             onClick={handleRedo}
             disabled={redoStackRef.current.length === 0}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors disabled:opacity-30"
+            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors disabled:opacity-30 cursor-pointer"
             title="Redo (Ctrl+Shift+Z)"
           >
             <Redo2 className="w-4 h-4" />
           </button>
 
-          <div className="w-px h-4 bg-[#24272f] mx-1" />
+          <div className="w-px h-3.5 bg-[#24272f] mx-0.5" />
 
           {/* Split */}
           <button
             onClick={handleSplitAtPlayhead}
             disabled={!currentProject?.video_path || splitProcessing}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors disabled:opacity-30"
+            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors disabled:opacity-30 cursor-pointer"
             title="Split at playhead (S / C)"
           >
-            {splitProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Scissors className="w-4 h-4" />}
-          </button>
-
-          {/* Crop */}
-          <button
-            onClick={handleOpenCrop}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors"
-            title="Crop / Transform Video"
-          >
-            <Crop className="w-4 h-4" />
-          </button>
-
-          {/* Blur Watermark / Region */}
-          <button
-            onClick={handleOpenBlur}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors"
-            title="Blur Logo / Watermark"
-          >
-            <Eraser className="w-4 h-4" />
-          </button>
-
-          {/* Duplicate */}
-          <button
-            onClick={handleDuplicate}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors"
-            title="Duplicate Selected Clip / Segment (Ctrl+D)"
-          >
-            <Copy className="w-4 h-4" />
-          </button>
-
-          {/* Freeze Frame */}
-          <button
-            onClick={handleFreezeFrame}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors"
-            title="Freeze Frame at Playhead"
-          >
-            <Snowflake className="w-4 h-4" />
+            {splitProcessing ? <Loader2 className="w-4 h-4 animate-spin text-pink-400" /> : <Scissors className="w-4 h-4" />}
           </button>
 
           {/* Delete */}
           <button
             onClick={handleDeleteSelected}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] text-red-400 hover:text-red-300 transition-colors"
+            className="p-1.5 rounded-lg hover:bg-[#1e2025] text-red-400 hover:text-red-300 transition-colors cursor-pointer"
             title="Delete Selected (Delete / Backspace)"
           >
             <Trash2 className="w-4 h-4" />
           </button>
 
-          {/* Add Bookmark / Marker */}
-          <button
-            onClick={handleToggleBookmark}
-            className={`p-1.5 rounded-lg transition-colors ${
-              bookmarks.some(b => Math.abs(b - currentTime) < 0.2)
-                ? 'bg-purple-600/30 text-purple-300 border border-purple-500/40'
-                : 'hover:bg-[#1e2025] hover:text-white'
-            }`}
-            title="Add / Remove Bookmark at Playhead (M)"
-          >
-            <Bookmark className="w-4 h-4" />
-          </button>
+          {/* Desktop visible extended tools */}
+          <div className="hidden lg:flex items-center gap-0.5 sm:gap-1">
+            {/* Crop */}
+            <button
+              onClick={handleOpenCrop}
+              className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors cursor-pointer"
+              title="Crop / Transform Video"
+            >
+              <Crop className="w-4 h-4" />
+            </button>
 
-          {/* Speed Curve / Speed Panel */}
-          <div className="relative">
+            {/* Blur Watermark / Region */}
+            <button
+              onClick={handleOpenBlur}
+              className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors cursor-pointer"
+              title="Blur Logo / Watermark"
+            >
+              <Eraser className="w-4 h-4" />
+            </button>
+
+            {/* Duplicate */}
+            <button
+              onClick={handleDuplicate}
+              className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors cursor-pointer"
+              title="Duplicate Selected Clip / Segment (Ctrl+D)"
+            >
+              <Copy className="w-4 h-4" />
+            </button>
+
+            {/* Freeze Frame */}
+            <button
+              onClick={handleFreezeFrame}
+              className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors cursor-pointer"
+              title="Freeze Frame at Playhead"
+            >
+              <Snowflake className="w-4 h-4" />
+            </button>
+
+            {/* Add Bookmark / Marker */}
+            <button
+              onClick={handleToggleBookmark}
+              className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                bookmarks.some(b => Math.abs(b - currentTime) < 0.2)
+                  ? 'bg-purple-600/30 text-purple-300 border border-purple-500/40'
+                  : 'hover:bg-[#1e2025] hover:text-white'
+              }`}
+              title="Add / Remove Bookmark at Playhead (M)"
+            >
+              <Bookmark className="w-4 h-4" />
+            </button>
+
+            {/* Speed Curve / Speed Panel */}
+            <div className="relative">
+              <button
+                onClick={() => {
+                  setShowSpeedPanel(!showSpeedPanel);
+                  setShowRotatePanel(false);
+                  setShowFlipPanel(false);
+                  setShowZoomDropdown(false);
+                  setShowMoreToolsPanel(false);
+                }}
+                className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                  showSpeedPanel ? 'bg-blue-600 text-white' : 'hover:bg-[#1e2025] hover:text-white'
+                }`}
+                title="Change Video Speed"
+              >
+                <TrendingUp className="w-4 h-4" />
+              </button>
+
+              {showSpeedPanel && (
+                <div
+                  ref={speedPanelRef}
+                  className="absolute top-full left-0 mt-1.5 bg-[#1e2025] border border-[#31353e] rounded-xl shadow-2xl p-2 z-50 w-44 space-y-1 animate-in fade-in"
+                >
+                  <div className="text-[10px] text-zinc-400 font-bold px-2 py-1 uppercase tracking-wider">Video Speed</div>
+                  {[0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => handleSpeedChange(s)}
+                      className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
+                    >
+                      <span>{s}x</span>
+                      {isChangingSpeed && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Rotate Video */}
+            <div className="relative">
+              <button
+                onClick={() => {
+                  setShowRotatePanel(!showRotatePanel);
+                  setShowSpeedPanel(false);
+                  setShowFlipPanel(false);
+                  setShowZoomDropdown(false);
+                  setShowMoreToolsPanel(false);
+                }}
+                className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                  showRotatePanel ? 'bg-blue-600 text-white' : 'hover:bg-[#1e2025] hover:text-white'
+                }`}
+                title="Rotate Video"
+              >
+                <RotateCw className="w-4 h-4" />
+              </button>
+
+              {showRotatePanel && (
+                <div
+                  ref={rotatePanelRef}
+                  className="absolute top-full left-0 mt-1.5 bg-[#1e2025] border border-[#31353e] rounded-xl shadow-2xl p-2 z-50 w-44 space-y-1 animate-in fade-in"
+                >
+                  <div className="text-[10px] text-zinc-400 font-bold px-2 py-1 uppercase tracking-wider">Rotate</div>
+                  <button
+                    onClick={() => handleRotate(90)}
+                    disabled={isRotating}
+                    className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
+                  >
+                    <span>90° Clockwise</span>
+                    {isRotating && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
+                  </button>
+                  <button
+                    onClick={() => handleRotate(270)}
+                    disabled={isRotating}
+                    className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
+                  >
+                    <span>90° Counter-CW</span>
+                    {isRotating && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
+                  </button>
+                  <button
+                    onClick={() => handleRotate(180)}
+                    disabled={isRotating}
+                    className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
+                  >
+                    <span>180° Flip</span>
+                    {isRotating && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Flip Video */}
+            <div className="relative">
+              <button
+                onClick={() => {
+                  setShowFlipPanel(!showFlipPanel);
+                  setShowSpeedPanel(false);
+                  setShowRotatePanel(false);
+                  setShowZoomDropdown(false);
+                  setShowMoreToolsPanel(false);
+                }}
+                className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                  showFlipPanel ? 'bg-blue-600 text-white' : 'hover:bg-[#1e2025] hover:text-white'
+                }`}
+                title="Flip Video"
+              >
+                <FlipHorizontal className="w-4 h-4" />
+              </button>
+
+              {showFlipPanel && (
+                <div
+                  ref={flipPanelRef}
+                  className="absolute top-full left-0 mt-1.5 bg-[#1e2025] border border-[#31353e] rounded-xl shadow-2xl p-2 z-50 w-44 space-y-1 animate-in fade-in"
+                >
+                  <div className="text-[10px] text-zinc-400 font-bold px-2 py-1 uppercase tracking-wider">Flip Mirror</div>
+                  <button
+                    onClick={() => handleFlip('horizontal')}
+                    disabled={isFlipping}
+                    className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
+                  >
+                    <span>Flip Horizontal</span>
+                    {isFlipping && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
+                  </button>
+                  <button
+                    onClick={() => handleFlip('vertical')}
+                    disabled={isFlipping}
+                    className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
+                  >
+                    <span>Flip Vertical</span>
+                    {isFlipping && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Collapsed More Tools Dropdown on smaller screens (< lg) */}
+          <div className="lg:hidden relative">
             <button
               onClick={() => {
-                setShowSpeedPanel(!showSpeedPanel);
+                setShowMoreToolsPanel(!showMoreToolsPanel);
+                setShowSpeedPanel(false);
                 setShowRotatePanel(false);
                 setShowFlipPanel(false);
                 setShowZoomDropdown(false);
               }}
-              className={`p-1.5 rounded-lg transition-colors ${
-                showSpeedPanel ? 'bg-blue-600 text-white' : 'hover:bg-[#1e2025] hover:text-white'
+              className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                showMoreToolsPanel ? 'bg-[#282c34] text-white' : 'hover:bg-[#1e2025] hover:text-white'
               }`}
-              title="Change Video Speed"
+              title="More Editing Tools"
             >
-              <TrendingUp className="w-4 h-4" />
+              <MoreHorizontal className="w-4 h-4" />
             </button>
 
-            {showSpeedPanel && (
+            {showMoreToolsPanel && (
               <div
-                ref={speedPanelRef}
-                className="absolute top-full left-0 mt-1.5 bg-[#1e2025] border border-[#31353e] rounded-xl shadow-2xl p-2 z-50 w-44 space-y-1 animate-in fade-in"
+                ref={moreToolsPanelRef}
+                className="absolute top-full left-0 mt-1.5 bg-[#181a20] border border-[#2e3340] rounded-xl shadow-2xl p-1.5 z-50 w-48 space-y-1 animate-in fade-in"
               >
-                <div className="text-[10px] text-zinc-400 font-bold px-2 py-1 uppercase tracking-wider">Video Speed</div>
-                {[0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map((s) => (
-                  <button
-                    key={s}
-                    onClick={() => handleSpeedChange(s)}
-                    className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors"
-                  >
-                    <span>{s}x</span>
-                    {isChangingSpeed && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Rotate Video */}
-          <div className="relative">
-            <button
-              onClick={() => {
-                setShowRotatePanel(!showRotatePanel);
-                setShowSpeedPanel(false);
-                setShowFlipPanel(false);
-                setShowZoomDropdown(false);
-              }}
-              className={`p-1.5 rounded-lg transition-colors ${
-                showRotatePanel ? 'bg-blue-600 text-white' : 'hover:bg-[#1e2025] hover:text-white'
-              }`}
-              title="Rotate Video"
-            >
-              <RotateCw className="w-4 h-4" />
-            </button>
-
-            {showRotatePanel && (
-              <div
-                ref={rotatePanelRef}
-                className="absolute top-full left-0 mt-1.5 bg-[#1e2025] border border-[#31353e] rounded-xl shadow-2xl p-2 z-50 w-44 space-y-1 animate-in fade-in"
-              >
-                <div className="text-[10px] text-zinc-400 font-bold px-2 py-1 uppercase tracking-wider">Rotate</div>
+                <div className="text-[10px] text-zinc-500 font-bold px-2 py-1 uppercase tracking-wider">
+                  Editing Actions
+                </div>
+                <button
+                  onClick={() => {
+                    handleOpenCrop();
+                    setShowMoreToolsPanel(false);
+                  }}
+                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
+                >
+                  <Crop className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Crop / Transform</span>
+                </button>
+                <button
+                  onClick={() => {
+                    handleOpenBlur();
+                    setShowMoreToolsPanel(false);
+                  }}
+                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
+                >
+                  <Eraser className="w-3.5 h-3.5 text-pink-400" />
+                  <span>Blur Watermark</span>
+                </button>
+                <button
+                  onClick={() => {
+                    handleDuplicate();
+                    setShowMoreToolsPanel(false);
+                  }}
+                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
+                >
+                  <Copy className="w-3.5 h-3.5 text-purple-400" />
+                  <span>Duplicate Selected</span>
+                </button>
+                <button
+                  onClick={() => {
+                    handleFreezeFrame();
+                    setShowMoreToolsPanel(false);
+                  }}
+                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
+                >
+                  <Snowflake className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>Freeze Frame</span>
+                </button>
+                <button
+                  onClick={() => {
+                    handleToggleBookmark();
+                    setShowMoreToolsPanel(false);
+                  }}
+                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
+                >
+                  <Bookmark className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Add Bookmark (M)</span>
+                </button>
+                <div className="w-full h-px bg-white/5 my-1" />
                 <button
                   onClick={() => handleRotate(90)}
-                  disabled={isRotating}
-                  className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors"
+                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
                 >
-                  <span>90° Clockwise</span>
-                  {isRotating && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
+                  <RotateCw className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Rotate 90°</span>
                 </button>
-                <button
-                  onClick={() => handleRotate(270)}
-                  disabled={isRotating}
-                  className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors"
-                >
-                  <span>90° Counter-CW</span>
-                  {isRotating && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
-                </button>
-                <button
-                  onClick={() => handleRotate(180)}
-                  disabled={isRotating}
-                  className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors"
-                >
-                  <span>180° Flip</span>
-                  {isRotating && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* Flip Video */}
-          <div className="relative">
-            <button
-              onClick={() => {
-                setShowFlipPanel(!showFlipPanel);
-                setShowSpeedPanel(false);
-                setShowRotatePanel(false);
-                setShowZoomDropdown(false);
-              }}
-              className={`p-1.5 rounded-lg transition-colors ${
-                showFlipPanel ? 'bg-blue-600 text-white' : 'hover:bg-[#1e2025] hover:text-white'
-              }`}
-              title="Flip Video"
-            >
-              <FlipHorizontal className="w-4 h-4" />
-            </button>
-
-            {showFlipPanel && (
-              <div
-                ref={flipPanelRef}
-                className="absolute top-full left-0 mt-1.5 bg-[#1e2025] border border-[#31353e] rounded-xl shadow-2xl p-2 z-50 w-44 space-y-1 animate-in fade-in"
-              >
-                <div className="text-[10px] text-zinc-400 font-bold px-2 py-1 uppercase tracking-wider">Flip Mirror</div>
                 <button
                   onClick={() => handleFlip('horizontal')}
-                  disabled={isFlipping}
-                  className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors"
+                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
                 >
+                  <FlipHorizontal className="w-3.5 h-3.5 text-indigo-400" />
                   <span>Flip Horizontal</span>
-                  {isFlipping && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
-                </button>
-                <button
-                  onClick={() => handleFlip('vertical')}
-                  disabled={isFlipping}
-                  className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors"
-                >
-                  <span>Flip Vertical</span>
-                  {isFlipping && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
                 </button>
               </div>
             )}
           </div>
+
+          <div className="w-px h-3.5 bg-[#24272f] mx-0.5" />
 
           {/* Voiceover Live Recording */}
           <div className="flex items-center">
             {isRecordingVoice ? (
               <button
                 onClick={handleStopVoiceRecording}
-                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-mono transition-all animate-pulse"
+                className="flex items-center gap-1 px-2 py-1 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-mono transition-all animate-pulse cursor-pointer"
                 title="Stop Recording Voiceover"
               >
                 <span className="w-2 h-2 rounded-full bg-white animate-ping" />
@@ -2227,11 +2354,11 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
             ) : (
               <button
                 onClick={handleStartVoiceRecording}
-                className="flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-[#1e2025] text-zinc-400 hover:text-white text-xs transition-colors"
+                className="flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-[#1e2025] text-zinc-400 hover:text-white text-xs transition-colors cursor-pointer"
                 title="Record Voiceover at Playhead"
               >
                 <Mic className="w-3.5 h-3.5 text-rose-400" />
-                <span>Record</span>
+                <span className="hidden md:inline text-[11px]">Record</span>
               </button>
             )}
           </div>
@@ -2240,7 +2367,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
           <button
             onClick={handleSeparateAudioClick}
             disabled={isSeparatingAudio}
-            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all ${
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium transition-all cursor-pointer ${
               audioSeparated
                 ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30'
                 : 'bg-[#181a1f] border border-[#26282e] hover:border-amber-500/40 text-zinc-300 hover:text-white'
@@ -2254,34 +2381,34 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
             {isSeparatingAudio ? (
               <>
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-purple-400" />
-                <span className="text-[11px] text-purple-300">Isolating BGM...</span>
+                <span className="hidden xl:inline text-[11px] text-purple-300">Isolating...</span>
               </>
             ) : audioSeparated ? (
               <>
                 <Check className="w-3.5 h-3.5 text-emerald-400" />
-                <span className="text-[11px]">BGM Isolated</span>
+                <span className="hidden xl:inline text-[11px]">BGM Isolated</span>
               </>
             ) : (
               <>
                 <Music className="w-3.5 h-3.5 text-amber-400" />
-                <span className="text-[11px]">Isolate BGM</span>
+                <span className="hidden xl:inline text-[11px]">Isolate BGM</span>
               </>
             )}
           </button>
         </div>
 
         {/* Center Transport & Frame Navigation */}
-        <div className="flex items-center gap-1 bg-[#181a1f] px-2 py-0.5 rounded-xl border border-[#24272f] shrink-0">
+        <div className="flex items-center gap-0.5 sm:gap-1 bg-[#181a1f] px-1.5 sm:px-2 py-0.5 rounded-xl border border-[#24272f] shrink-0">
           <button
             onClick={handleJumpPrevCut}
-            className="p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors"
+            className="hidden sm:inline-flex p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors cursor-pointer"
             title="Jump to Previous Cut Point ([)"
           >
             <SkipBack className="w-3.5 h-3.5" />
           </button>
           <button
             onClick={() => handleStepFrame(-1)}
-            className="p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors"
+            className="p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors cursor-pointer"
             title="Step 1 Frame Backward (←)"
           >
             <ChevronLeft className="w-3.5 h-3.5" />
@@ -2293,42 +2420,44 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                 else videoRef.current.pause();
               }
             }}
-            className="p-1 px-1.5 rounded-lg bg-pink-600/30 hover:bg-pink-600/50 text-pink-300 hover:text-white border border-pink-500/30 transition-colors"
+            className="p-1 px-1.5 rounded-lg bg-pink-600/30 hover:bg-pink-600/50 text-pink-300 hover:text-white border border-pink-500/30 transition-colors cursor-pointer"
             title="Play / Pause (Space)"
           >
             {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 fill-current" />}
           </button>
           <button
             onClick={() => handleStepFrame(1)}
-            className="p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors"
+            className="p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors cursor-pointer"
             title="Step 1 Frame Forward (→)"
           >
             <ChevronRight className="w-3.5 h-3.5" />
           </button>
           <button
             onClick={handleJumpNextCut}
-            className="p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors"
+            className="hidden sm:inline-flex p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors cursor-pointer"
             title="Jump to Next Cut Point (])"
           >
             <SkipForward className="w-3.5 h-3.5" />
           </button>
 
-          <div className="w-px h-3.5 bg-zinc-700/50 mx-1" />
+          <div className="w-px h-3 bg-zinc-700/50 mx-0.5 sm:mx-1" />
 
           {/* Frame-accurate Timecode */}
-          <div className="font-mono text-xs font-semibold text-zinc-200 tracking-wider px-1">
+          <div className="font-mono text-[11px] sm:text-xs font-semibold text-zinc-200 tracking-wider px-0.5 sm:px-1 whitespace-nowrap">
             <span className="text-pink-300 font-bold">{formatFrameTime(currentTime)}</span>
-            <span className="text-zinc-600 mx-1">/</span>
-            <span className="text-zinc-500">{formatFrameTime(duration)}</span>
+            <span className="hidden sm:inline">
+              <span className="text-zinc-600 mx-1">/</span>
+              <span className="text-zinc-500">{formatFrameTime(duration)}</span>
+            </span>
           </div>
         </div>
 
         {/* Right Controls */}
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
           {/* Fit to View Button */}
           <button
             onClick={handleFitToView}
-            className="p-1.5 rounded-lg bg-[#181a1f] hover:bg-[#242730] text-zinc-400 hover:text-white border border-[#24272f] hover:border-zinc-600 transition-colors"
+            className="p-1.5 rounded-lg bg-[#181a1f] hover:bg-[#242730] text-zinc-400 hover:text-white border border-[#24272f] hover:border-zinc-600 transition-colors cursor-pointer"
             title="Zoom to Fit Full Timeline (Z)"
           >
             <Maximize2 className="w-3.5 h-3.5" />
@@ -2337,17 +2466,39 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
           {/* Shortcuts Button */}
           <button
             onClick={() => setShowShortcutsModal(true)}
-            className="p-1.5 rounded-lg bg-[#181a1f] hover:bg-[#242730] text-zinc-400 hover:text-white border border-[#24272f] transition-colors"
+            className="hidden sm:inline-flex p-1.5 rounded-lg bg-[#181a1f] hover:bg-[#242730] text-zinc-400 hover:text-white border border-[#24272f] transition-colors cursor-pointer"
             title="Keyboard Shortcuts Cheatsheet"
           >
             <Keyboard className="w-3.5 h-3.5" />
+          </button>
+
+          {/* Snapping Magnet Badge */}
+          <button
+            onClick={() => setMagnetEnabled(!magnetEnabled)}
+            className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+              magnetEnabled ? 'bg-blue-600 text-white shadow-sm' : 'bg-[#181a1f] text-zinc-400 hover:text-white'
+            }`}
+            title="Clip Snapping (N)"
+          >
+            <Magnet className="w-3.5 h-3.5" />
+          </button>
+
+          {/* Ripple Button */}
+          <button
+            onClick={() => setRippleEnabled(!rippleEnabled)}
+            className={`hidden md:inline-flex p-1.5 rounded-lg transition-colors cursor-pointer ${
+              rippleEnabled ? 'bg-blue-600 text-white shadow-sm' : 'bg-[#181a1f] text-zinc-400 hover:text-white'
+            }`}
+            title="Ripple Edit"
+          >
+            <MoveHorizontal className="w-3.5 h-3.5" />
           </button>
 
           {/* Timeline Track Zoom dropdown */}
           <div className="relative" ref={zoomDropdownRef}>
             <button
               onClick={() => setShowZoomDropdown(!showZoomDropdown)}
-              className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#181a1f] border border-[#26282e] hover:border-[#3a3e49] text-xs font-mono text-zinc-300 hover:text-white transition-colors"
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-[#181a1f] border border-[#26282e] hover:border-[#3a3e49] text-xs font-mono text-zinc-300 hover:text-white transition-colors cursor-pointer"
               title="Timeline Track Zoom"
             >
               <span>
@@ -2385,7 +2536,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                         }
                         setShowZoomDropdown(false);
                       }}
-                      className={`w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-[#282c34] flex items-center justify-between transition-colors ${
+                      className={`w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-[#282c34] flex items-center justify-between transition-colors cursor-pointer ${
                         isCurrent ? 'text-pink-400 font-bold bg-[#282c34]' : 'text-zinc-300'
                       }`}
                     >
@@ -2398,33 +2549,11 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
             )}
           </div>
 
-          {/* Magnet Button Badge */}
-          <button
-            onClick={() => setMagnetEnabled(!magnetEnabled)}
-            className={`p-1.5 rounded-lg transition-colors ${
-              magnetEnabled ? 'bg-blue-600 text-white shadow-sm' : 'bg-[#181a1f] text-zinc-400 hover:text-white'
-            }`}
-            title="Snapping"
-          >
-            <Magnet className="w-3.5 h-3.5" />
-          </button>
-
-          {/* Ripple Button */}
-          <button
-            onClick={() => setRippleEnabled(!rippleEnabled)}
-            className={`p-1.5 rounded-lg transition-colors ${
-              rippleEnabled ? 'bg-blue-600 text-white shadow-sm' : 'bg-[#181a1f] text-zinc-400 hover:text-white'
-            }`}
-            title="Ripple Edit"
-          >
-            <MoveHorizontal className="w-3.5 h-3.5" />
-          </button>
-
-          {/* Timeline Zoom Slider */}
-          <div className="flex items-center gap-1.5 pl-1">
+          {/* Timeline Zoom Slider (desktop only) */}
+          <div className="hidden xl:flex items-center gap-1 pl-1">
             <button
               onClick={() => zoomBy(1 / 1.3)}
-              className="p-1 rounded hover:bg-[#1e2025] text-zinc-400 hover:text-white transition-colors"
+              className="p-1 rounded hover:bg-[#1e2025] text-zinc-400 hover:text-white transition-colors cursor-pointer"
               title="Zoom Out"
             >
               <ZoomOut className="w-3.5 h-3.5" />
@@ -2437,12 +2566,12 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
               step={0.01}
               value={Math.log(zoom / 0.05) / Math.log(20 / 0.05)}
               onChange={(e) => setZoom(+((0.05 * Math.pow(20 / 0.05, parseFloat(e.target.value))).toFixed(3)))}
-              className="w-16 h-1 accent-white bg-[#26282e] rounded-lg cursor-pointer"
+              className="w-14 h-1 accent-white bg-[#26282e] rounded-lg cursor-pointer"
             />
 
             <button
               onClick={() => zoomBy(1.3)}
-              className="p-1 rounded hover:bg-[#1e2025] text-zinc-400 hover:text-white transition-colors"
+              className="p-1 rounded hover:bg-[#1e2025] text-zinc-400 hover:text-white transition-colors cursor-pointer"
               title="Zoom In"
             >
               <ZoomIn className="w-3.5 h-3.5" />
@@ -2556,13 +2685,48 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
               </div>
             </div>
             <div className="flex items-center gap-1.5 text-zinc-400">
-              <button
-                onClick={() => setA2Muted(!a2Muted)}
-                className="hover:text-white transition-colors"
-                title="Mute video audio"
-              >
-                {a2Muted ? <VolumeX className="w-3 h-3 text-red-400" /> : <Volume2 className="w-3 h-3" />}
-              </button>
+              {!audioSeparated ? (
+                <div className="flex items-center gap-1 bg-[#101116] px-1.5 py-0.5 rounded-lg border border-purple-500/20" title={`Video Audio Volume: ${Math.round(videoVolume * 100)}%`}>
+                  <button
+                    onClick={() => setA2Muted(!a2Muted)}
+                    className="p-0.5 rounded hover:bg-purple-900/50 text-zinc-400 hover:text-white transition-colors"
+                    title={a2Muted ? 'Unmute Video Audio' : 'Mute Video Audio'}
+                  >
+                    {a2Muted || videoVolume === 0 ? (
+                      <VolumeX className="w-3 h-3 text-red-400" />
+                    ) : videoVolume < 0.5 ? (
+                      <Volume1 className="w-3 h-3 text-purple-400" />
+                    ) : (
+                      <Volume2 className="w-3 h-3 text-purple-400" />
+                    )}
+                  </button>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={a2Muted ? 0 : videoVolume}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setVideoVolume(v);
+                      if (a2Muted && v > 0) setA2Muted(false);
+                    }}
+                    className="w-12 h-1 bg-zinc-700 accent-purple-400 rounded-lg cursor-pointer"
+                    title={`Video Audio Volume: ${Math.round(videoVolume * 100)}%`}
+                  />
+                  <span className="text-[9px] font-mono text-purple-300/90 w-6 text-right select-none">
+                    {a2Muted ? '0%' : `${Math.round(videoVolume * 100)}%`}
+                  </span>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setA2Muted(!a2Muted)}
+                  className="hover:text-white transition-colors"
+                  title="Mute video audio"
+                >
+                  {a2Muted ? <VolumeX className="w-3 h-3 text-red-400" /> : <Volume2 className="w-3 h-3" />}
+                </button>
+              )}
               <button
                 onClick={() => toggleHidden('V1')}
                 className="hover:text-white transition-colors"
@@ -3013,54 +3177,31 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                 })
               ) : currentProject?.video_path ? (
                 <div
-                  className="absolute top-2 rounded-md overflow-hidden"
-                  style={{
-                    left: 0,
-                    width: timeToX(duration),
-                    height: VIDEO_TRACK_HEIGHT - 16,
-                    border: '2px solid #0d9488',
-                    background: 'var(--bg-base)',
+                  onClick={async () => {
+                    if (!currentProject) return;
+                    try {
+                      const updated = await addVideoClip(currentProject.id, 0, currentProject.duration || 10);
+                      setVideoClips(updated);
+                    } catch (err) {
+                      console.error('Failed to add clip:', err);
+                    }
                   }}
+                  className="px-4 py-2 flex items-center gap-2.5 h-full cursor-pointer hover:bg-teal-950/30 text-teal-400 hover:text-teal-300 border border-dashed border-teal-500/40 rounded-lg mx-2 my-1 transition-all"
+                  title="Click to place master video from My Assets back onto Timeline"
                 >
-                  <div className="relative flex items-center h-full w-full overflow-hidden rounded-md bg-[#131b24] border border-teal-900/50">
-                    {thumbnails.length > 0 ? (
-                      <div className="relative h-full aspect-video shrink-0 bg-black/40 overflow-hidden border-r border-teal-500/30">
-                        <img
-                          src={thumbnails[0]}
-                          alt=""
-                          className="w-full h-full object-cover"
-                          draggable={false}
-                        />
-                        <div className="absolute inset-0 bg-gradient-to-r from-transparent via-transparent to-[#131b24]/80 pointer-events-none" />
-                      </div>
-                    ) : (
-                      <div className="h-full aspect-video shrink-0 bg-teal-950/60 flex items-center justify-center border-r border-teal-500/30">
-                        <Film className="w-4 h-4 text-teal-400/50" />
-                      </div>
-                    )}
-
-                    <div className="flex-1 min-w-0 px-2.5 flex items-center justify-between gap-2 pointer-events-none">
-                      <div className="flex items-center gap-1.5 truncate">
-                        <span className="px-1.5 py-0.5 rounded bg-teal-950 border border-teal-400/40 text-[9px] font-black text-teal-300 uppercase tracking-wider shrink-0 shadow-sm">
-                          Clip A
-                        </span>
-                        <span className="text-[11px] font-semibold text-zinc-200 truncate tracking-tight">
-                          {currentProject?.video_filename || 'Video'}
-                        </span>
-                      </div>
-                      <span className="text-[10px] text-teal-300/80 font-mono font-bold shrink-0 bg-black/40 px-1.5 py-0.5 rounded border border-white/5">
-                        {fmtTime(duration)}
-                      </span>
-                    </div>
-                  </div>
+                  <Plus className="w-4 h-4" />
+                  <span className="text-xs font-semibold">
+                    + Place "{currentProject.video_filename || 'Master Video'}" from My Assets onto Timeline
+                  </span>
                 </div>
               ) : (
                 <div
                   onClick={handleAddClipClick}
-                  className="px-4 py-2 flex items-center gap-2 h-full cursor-pointer hover:bg-teal-950/20 text-teal-400 transition-colors"
+                  className="px-4 py-2 flex items-center gap-2.5 h-full cursor-pointer hover:bg-teal-950/30 text-teal-400 hover:text-teal-300 border border-dashed border-teal-500/40 rounded-lg mx-2 my-1 transition-all"
+                  title="Upload a new video to timeline"
                 >
                   <Plus className="w-4 h-4" />
-                  <span className="text-xs font-medium">Click to Add Video to Timeline</span>
+                  <span className="text-xs font-semibold">Click to Add / Upload Video to Timeline</span>
                 </div>
               )}
 
@@ -3286,19 +3427,29 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                 ))}
 
                 <div
-                  className={`absolute top-1 rounded-lg border border-blue-500/40 overflow-hidden transition-all shadow-sm ${
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedClipId('vocals-track');
+                    setActiveSegment(null);
+                  }}
+                  className={`group absolute top-1 rounded-lg overflow-hidden cursor-pointer transition-all shadow-sm select-none ${
                     v1Muted ? 'opacity-35 grayscale' : 'opacity-100'
+                  } ${
+                    selectedClipId === 'vocals-track'
+                      ? 'ring-2 ring-blue-400 ring-offset-1 ring-offset-zinc-950 shadow-[0_0_15px_rgba(96,165,250,0.4)]'
+                      : 'hover:brightness-110'
                   }`}
                   style={{
                     left: 0,
                     width: Math.max(timeToX(duration), 60),
                     height: TRACK_HEIGHT - 8,
+                    border: selectedClipId === 'vocals-track' ? '2px solid #60a5fa' : '1px solid rgba(59, 130, 246, 0.4)',
                     background: 'linear-gradient(180deg, #1e3a8a 0%, #172554 100%)',
                   }}
                 >
                   {/* Subtle audio waveform dots */}
-                  <div className="absolute inset-0 opacity-30 bg-[radial-gradient(#60a5fa_1px,transparent_1px)] [background-size:6px_6px]" />
-                  <div className="relative px-2.5 flex items-center justify-between h-full z-10">
+                  <div className="absolute inset-0 opacity-30 bg-[radial-gradient(#60a5fa_1px,transparent_1px)] [background-size:6px_6px] pointer-events-none" />
+                  <div className="relative px-2.5 flex items-center justify-between h-full z-10 pointer-events-none">
                     <div className="flex items-center gap-1.5 min-w-0">
                       <Mic className="w-3.5 h-3.5 text-blue-300 shrink-0" />
                       <span className="text-[11px] font-bold text-blue-100 truncate">
@@ -3314,6 +3465,20 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                       <div className="w-0.5 h-2.5 bg-blue-300 rounded-full" />
                     </div>
                   </div>
+
+                  {/* Delete button (on selection or hover) */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (confirm('Remove isolated vocals & BGM?')) onRemoveAudioSeparation?.();
+                    }}
+                    className={`absolute top-1 right-1 p-1 rounded-md bg-red-950/90 hover:bg-red-800 text-red-200 border border-red-700/60 transition-opacity z-30 shadow cursor-pointer ${
+                      selectedClipId === 'vocals-track' ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                    }`}
+                    title="Delete / Remove Isolated Audio (Delete/Backspace key)"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
                 </div>
               </div>
             )}
@@ -3333,19 +3498,29 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                 ))}
 
                 <div
-                  className={`absolute top-1 rounded-lg border border-amber-500/40 overflow-hidden transition-all shadow-sm ${
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedClipId('bgm-track');
+                    setActiveSegment(null);
+                  }}
+                  className={`group absolute top-1 rounded-lg overflow-hidden cursor-pointer transition-all shadow-sm select-none ${
                     b1Muted ? 'opacity-35 grayscale' : 'opacity-100'
+                  } ${
+                    selectedClipId === 'bgm-track'
+                      ? 'ring-2 ring-amber-400 ring-offset-1 ring-offset-zinc-950 shadow-[0_0_15px_rgba(251,191,36,0.4)]'
+                      : 'hover:brightness-110'
                   }`}
                   style={{
                     left: 0,
                     width: Math.max(timeToX(duration), 60),
                     height: TRACK_HEIGHT - 8,
+                    border: selectedClipId === 'bgm-track' ? '2px solid #fbbf24' : '1px solid rgba(245, 158, 11, 0.4)',
                     background: 'linear-gradient(180deg, #78350f 0%, #451a03 100%)',
                   }}
                 >
                   {/* Subtle audio waveform dots */}
-                  <div className="absolute inset-0 opacity-30 bg-[radial-gradient(#fbbf24_1px,transparent_1px)] [background-size:6px_6px]" />
-                  <div className="relative px-2.5 flex items-center justify-between h-full z-10">
+                  <div className="absolute inset-0 opacity-30 bg-[radial-gradient(#fbbf24_1px,transparent_1px)] [background-size:6px_6px] pointer-events-none" />
+                  <div className="relative px-2.5 flex items-center justify-between h-full z-10 pointer-events-none">
                     <div className="flex items-center gap-1.5 min-w-0">
                       <Music className="w-3.5 h-3.5 text-amber-300 shrink-0" />
                       <span className="text-[11px] font-bold text-amber-100 truncate">
@@ -3361,6 +3536,20 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                       <div className="w-0.5 h-3.5 bg-amber-300 rounded-full" />
                     </div>
                   </div>
+
+                  {/* Delete button (on selection or hover) */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (confirm('Remove isolated vocals & BGM?')) onRemoveAudioSeparation?.();
+                    }}
+                    className={`absolute top-1 right-1 p-1 rounded-md bg-red-950/90 hover:bg-red-800 text-red-200 border border-red-700/60 transition-opacity z-30 shadow cursor-pointer ${
+                      selectedClipId === 'bgm-track' ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                    }`}
+                    title="Delete / Remove Isolated Audio (Delete/Backspace key)"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
                 </div>
               </div>
             )}

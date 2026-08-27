@@ -39,7 +39,7 @@
 }
 
 html, body {
-  font-family: 'Inter', 'Noto Sans Khmer', sans-serif;
+  font-family: 'Kantumruy Pro', 'Noto Sans Khmer', 'Battambang', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   background-color: var(--bg-base);
   color: var(--text-primary);
   overflow: hidden;
@@ -91,9 +91,30 @@ input[type="color"]::-webkit-color-swatch {
   border-radius: 4px;
 }
 
-/* Khmer text styling */
+/* Khmer Typography System */
 .font-khmer {
-  font-family: 'Noto Sans Khmer', 'Battambang', sans-serif;
+  font-family: 'Kantumruy Pro', 'Noto Sans Khmer', 'Battambang', 'Siemreap', sans-serif;
+  line-height: 1.6;
+}
+
+.font-khmer-heading {
+  font-family: 'Koulen', 'Moul', 'Kantumruy Pro', sans-serif;
+  line-height: 1.4;
+}
+
+.font-khmer-display {
+  font-family: 'Moul', 'Koulen', cursive;
+  line-height: 1.5;
+}
+
+.font-khmer-serif {
+  font-family: 'Hanuman', 'Noto Serif Khmer', serif;
+  line-height: 1.6;
+}
+
+.font-khmer-santepheap {
+  font-family: 'Koh Santepheap', 'Kantumruy Pro', sans-serif;
+  line-height: 1.6;
 }
 
 /* Scrollbar styling */

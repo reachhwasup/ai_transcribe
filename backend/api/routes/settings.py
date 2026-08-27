@@ -12,10 +12,10 @@ from backend.database.models import ApiKey, AppSetting
 router = APIRouter(prefix="/settings", tags=["settings"])
 
 AVAILABLE_MODELS = [
-    {"id": "gemini-flash-latest", "name": "Gemini Flash Latest", "description": "Always latest stable Flash model (Recommended)"},
-    {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "description": "High accuracy, fast transcription"},
-    {"id": "gemini-flash-lite-latest", "name": "Gemini Flash Lite", "description": "Lightweight, fastest responses"},
-    {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro", "description": "Deep reasoning & large context"},
+    {"id": "gemini-3.5-flash", "name": "Gemini 3.5 Flash", "description": "High accuracy, fast transcription (Recommended)"},
+    {"id": "gemini-3.5-flash-lite", "name": "Gemini 3.5 Flash Lite", "description": "Ultra-fast responses & high quota"},
+    {"id": "gemini-3.6-flash", "name": "Gemini 3.6 Flash", "description": "Advanced multi-modal speech recognition"},
+    {"id": "gemini-flash-latest", "name": "Gemini Flash Latest", "description": "Latest stable Flash release"},
 ]
 
 

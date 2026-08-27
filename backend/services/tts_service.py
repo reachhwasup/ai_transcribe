@@ -145,23 +145,27 @@ def assign_speaker_voices(segments: list, language: str = "") -> list:
     return segments
 
 
-# Emotion → prosody offsets (rate %, pitch Hz, volume %) tuned for natural, warm human speech without robotic artifacts.
+# Emotion → prosody offsets (rate %, pitch Hz, volume %) tuned for natural, warm, and catchy speech.
 EMOTION_PROSODY: dict[str, tuple[int, int, int]] = {
-    "cheerful": (3, 2, 0),
-    "happy": (3, 2, 0),
-    "excited": (4, 4, 1),
-    "sad": (-4, -2, -1),
-    "angry": (3, 2, 1),
-    "scream": (5, 4, 2),
-    "screaming": (5, 4, 2),
-    "shout": (4, 3, 2),
-    "shouting": (4, 3, 2),
-    "calm": (-2, -2, 0),
-    "serious": (-2, -2, 0),
-    "fearful": (3, 2, 0),
-    "surprised": (3, 3, 1),
-    "whisper": (-4, -2, -2),
-    "whispering": (-4, -2, -2),
+    "laughing": (6, 5, 2),
+    "laugh": (6, 5, 2),
+    "chuckle": (4, 3, 1),
+    "playful": (5, 4, 1),
+    "cheerful": (4, 3, 1),
+    "happy": (4, 3, 1),
+    "excited": (6, 5, 2),
+    "sad": (-5, -3, -1),
+    "angry": (4, 3, 2),
+    "scream": (7, 6, 3),
+    "screaming": (7, 6, 3),
+    "shout": (5, 4, 2),
+    "shouting": (5, 4, 2),
+    "calm": (-3, -2, 0),
+    "serious": (-3, -2, 0),
+    "fearful": (4, 3, 1),
+    "surprised": (5, 4, 2),
+    "whisper": (-5, -3, -2),
+    "whispering": (-5, -3, -2),
 }
 
 
@@ -449,7 +453,9 @@ def _clean_and_detect_emotion(text: str, default_emotion: str = "") -> tuple[str
             detected_emotion = "scream"
         elif any(k in t for k in ("angry", "furious", "mad", "rage", "ខឹង", "កំហឹង")):
             detected_emotion = "angry"
-        elif any(k in t for k in ("happy", "cheerful", "joy", "laugh", "smile", "សប្បាយ", "រីករាយ")):
+        elif any(k in t for k in ("laugh", "laughing", "laughter", "chuckle", "giggle", "chuckles", "giggles", "សើច", "អស់សំណើច", "កំប្លែង", "ហាហា", "ហិហិ")):
+            detected_emotion = "laughing"
+        elif any(k in t for k in ("happy", "cheerful", "joy", "smile", "សប្បាយ", "រីករាយ")):
             detected_emotion = "happy"
         elif any(k in t for k in ("sad", "crying", "grief", "depressed", "melancholy", "ពិបាកចិត្ត", "យំ", "សោកសៅ")):
             detected_emotion = "sad"
@@ -460,10 +466,26 @@ def _clean_and_detect_emotion(text: str, default_emotion: str = "") -> tuple[str
         elif any(k in t for k in ("calm", "gentle", "soft", "ស្ងប់")):
             detected_emotion = "calm"
 
+    # Also detect inline laughter keywords in text if no explicit emotion
+    if not detected_emotion:
+        text_lower = text.lower()
+        if any(k in text_lower for k in ("ហាហា", "ហិហិ", "hahaha", "haha", "hehe", "keke", "សើច")):
+            detected_emotion = "laughing"
+
     # Strip ALL bracketed/parenthesized direction tags so TTS NEVER pronounces them
     clean = re.sub(r'[\(\[\{][^\)\]\}]*[\)\]\}]', '', text)
     clean = re.sub(r'\s+', ' ', clean).strip()
-    clean_text = clean if clean else text
+
+    if not clean:
+        # Segment was ONLY a bracketed tag like [Laughs] or (សើច)
+        if detected_emotion in ("laughing", "happy") or any(k in text.lower() for k in ("laugh", "chuckle", "giggle", "សើច", "ហាហា", "haha")):
+            has_khmer = any(0x1780 <= ord(c) <= 0x17FF for c in text)
+            clean_text = "ហាហាហា!" if has_khmer else "Haha!"
+            detected_emotion = "laughing"
+        else:
+            clean_text = text
+    else:
+        clean_text = clean
 
     return clean_text, detected_emotion or "neutral"
 
@@ -825,11 +847,38 @@ def _codec_for_ext(path: str) -> list:
 
 
 def _build_filter_chain(voice_profile: str = "", emotion: str = "", atempo_filters: Optional[list[str]] = None) -> str:
-    """Build clean ffmpeg audio graph preserving pristine neural vocal warmth and natural clarity."""
+    """Build cinematic broadcast mastering audio graph for punchy, catchy, clear vocal delivery."""
     filters = []
 
-    # Clean transparent peak limiter to prevent clipping without altering vocal timbre
-    filters.append("alimiter=limit=0.98")
+    vp = (voice_profile or "").lower().strip()
+    em = (emotion or "").lower().strip()
+
+    # 1. Clean low-end rumble (HPF at 75Hz)
+    filters.append("highpass=f=75")
+
+    # 2. Vocal Presence & Warmth EQ (crisp high-mids for intelligibility + warm body)
+    if vp in ("grandpa", "elderly_male"):
+        filters.append("equalizer=f=180:t=q:w=1.2:g=2.2,equalizer=f=3200:t=q:w=1.2:g=1.5")
+    elif vp in ("grandma", "elderly_female"):
+        filters.append("equalizer=f=350:t=q:w=1.2:g=1.5,equalizer=f=3000:t=q:w=1.2:g=1.8")
+    elif vp in ("child_boy", "child_girl", "child", "boy", "girl"):
+        filters.append("equalizer=f=400:t=q:w=1.2:g=-1.0,equalizer=f=4000:t=q:w=1.2:g=2.5")
+    elif vp == "male":
+        filters.append("equalizer=f=200:t=q:w=1.2:g=1.8,equalizer=f=3300:t=q:w=1.2:g=2.2")
+    else:
+        filters.append("equalizer=f=280:t=q:w=1.2:g=1.2,equalizer=f=3500:t=q:w=1.2:g=2.4")
+
+    # 3. Dynamic Emotion Tone Enhancements
+    if em in ("laughing", "laugh", "happy", "cheerful", "playful"):
+        filters.append("equalizer=f=5000:t=q:w=1.2:g=1.8")
+    elif em in ("excited", "scream", "shout"):
+        filters.append("equalizer=f=3800:t=q:w=1.0:g=2.0")
+
+    # 4. Gentle broadcast vocal compressor (keeps dialogue punchy, tight, and audible over BGM)
+    filters.append("acompressor=threshold=-18dB:ratio=2.5:attack=15:release=120:makeup=2dB")
+
+    # 5. Clean peak limiter
+    filters.append("alimiter=limit=0.96")
 
     if atempo_filters:
         filters.extend(atempo_filters)

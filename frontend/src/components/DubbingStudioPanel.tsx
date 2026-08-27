@@ -1,6 +1,7 @@
 import React, { useState, useRef, useMemo, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { useProjectStore } from '../stores/projectStore';
-import { importSrtFile } from '../api/client';
+import { importSrtFile, generateCatchyHooks } from '../api/client';
 import { buildClipLayout, timelineToSource } from '../utils/clipTimemap';
 import {
   UploadCloud,
@@ -36,6 +37,10 @@ import {
   Music,
   Activity,
   Smile,
+  Target,
+  Flame,
+  Zap,
+  Wand2,
 } from 'lucide-react';
 import type { Segment } from '../types';
 
@@ -158,6 +163,8 @@ const FIT_MODES: Record<FitMode, FitModeInfo> = {
 };
 
 const EMOTIONS_LIST = [
+  { id: 'crying', label: 'Crying / Weeping', emoji: '😭', color: 'bg-blue-500/20 text-blue-300 border-blue-500/40' },
+  { id: 'laughing', label: 'Laughing / Haha', emoji: '😂', color: 'bg-pink-500/20 text-pink-300 border-pink-500/40' },
   { id: 'scream', label: 'Scream / Shout', emoji: '📢', color: 'bg-red-500/20 text-red-300 border-red-500/40' },
   { id: 'angry', label: 'Angry', emoji: '😡', color: 'bg-orange-500/20 text-orange-300 border-orange-500/40' },
   { id: 'fearful', label: 'Fearful', emoji: '😰', color: 'bg-amber-500/20 text-amber-300 border-amber-500/40' },
@@ -174,6 +181,7 @@ export default function DubbingStudioPanel() {
   const {
     currentProject,
     loadProject,
+    addSegment,
     generateVoiceForSegments,
     generateTranscript,
     updateSegment,
@@ -225,6 +233,24 @@ export default function DubbingStudioPanel() {
   const [generatingSegmentId, setGeneratingSegmentId] = useState<string | null>(null);
   const [playingSegmentId, setPlayingSegmentId] = useState<string | null>(null);
 
+  // Catchy Hook Generator State
+  const [showHookModal, setShowHookModal] = useState(false);
+  const [hookDuration, setHookDuration] = useState<number>(4.0);
+  const [hookTone, setHookTone] = useState<string>('viral');
+  const [isGeneratingHooks, setIsGeneratingHooks] = useState(false);
+  const [generatedHooks, setGeneratedHooks] = useState<
+    Array<{
+      hook_id: string;
+      text: string;
+      category: string;
+      category_label: string;
+      estimated_seconds: number;
+      why_it_works: string;
+    }>
+  >([]);
+  const [previewingHookId, setPreviewingHookId] = useState<string | null>(null);
+  const [insertingHookId, setInsertingHookId] = useState<string | null>(null);
+
   // Multi-segment selection for custom batch dubbing
   const [selectedSegmentIds, setSelectedSegmentIds] = useState<Set<string>>(new Set());
   const lastSelectedIdxRef = useRef<number | null>(null);
@@ -235,8 +261,23 @@ export default function DubbingStudioPanel() {
   const [showVoiceDropdown, setShowVoiceDropdown] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
+  const [activeSpeakerPopoverId, setActiveSpeakerPopoverId] = useState<string | null>(null);
+  const [showBatchSpeakerMenu, setShowBatchSpeakerMenu] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  const [hookToast, setHookToast] = useState<string | null>(null);
+
+  const CHARACTER_PRESETS = [
+    { label: 'តួអង្គប្រុស (Male)', speaker: 'តួអង្គប្រុស (Male)', gender: 'male', voice_profile: 'male', voice_name: 'km-KH-PisethNeural', avatar: '👨' },
+    { label: 'តួអង្គស្រី (Female)', speaker: 'តួអង្គស្រី (Female)', gender: 'female', voice_profile: 'female', voice_name: 'km-KH-SreymomNeural', avatar: '👩' },
+    { label: 'អ្នករៀបរាប់ (Narrator)', speaker: 'អ្នករៀបរាប់ (Narrator)', gender: 'male', voice_profile: 'male', voice_name: 'km-KH-PisethNeural', avatar: '🎙️' },
+    { label: 'លោកតា (Grandpa)', speaker: 'លោកតា (Grandpa)', gender: 'male', voice_profile: 'grandpa', voice_name: 'km-KH-PisethNeural', avatar: '👴' },
+    { label: 'លោកយាយ (Grandma)', speaker: 'លោកយាយ (Grandma)', gender: 'female', voice_profile: 'grandma', voice_name: 'km-KH-SreymomNeural', avatar: '👵' },
+    { label: 'ក្មេងប្រុស (Boy)', speaker: 'ក្មេងប្រុស (Boy)', gender: 'male', voice_profile: 'child_boy', voice_name: 'km-KH-PisethNeural', avatar: '👦' },
+    { label: 'ក្មេងស្រី (Girl)', speaker: 'ក្មេងស្រី (Girl)', gender: 'female', voice_profile: 'child_girl', voice_name: 'km-KH-SreymomNeural', avatar: '👧' },
+  ];
 
   // Auto-scroll to selected segment when clicked from timeline or active in project (only when not playing)
   useEffect(() => {
@@ -257,6 +298,17 @@ export default function DubbingStudioPanel() {
       }
     }
   }, [activeGeneratingSegmentId]);
+
+  // Close hook modal on Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && showHookModal) {
+        setShowHookModal(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showHookModal]);
 
   // Extract unique character list
   const characters = useMemo(() => {
@@ -338,12 +390,35 @@ export default function DubbingStudioPanel() {
     lastSelectedIdxRef.current = null;
   };
 
+  const handleBatchAssignCharacter = async (preset: typeof CHARACTER_PRESETS[0]) => {
+    const ids = Array.from(selectedSegmentIds);
+    for (const id of ids) {
+      await updateSegment(id, {
+        speaker: preset.speaker,
+        gender: preset.gender,
+        voice_profile: preset.voice_profile,
+        voice_name: preset.voice_name,
+      });
+    }
+    setShowBatchSpeakerMenu(false);
+  };
+
+  const handleAssignCharacterSingle = async (segId: string, preset: typeof CHARACTER_PRESETS[0]) => {
+    await updateSegment(segId, {
+      speaker: preset.speaker,
+      gender: preset.gender,
+      voice_profile: preset.voice_profile,
+      voice_name: preset.voice_name,
+    });
+    setActiveSpeakerPopoverId(null);
+  };
+
   const handleGenerateSelectedSpeech = async () => {
     if (!currentProject?.id || selectedSegmentIds.size === 0) return;
     setIsGeneratingAll(true);
     try {
       const voiceParam = selectedVoiceActor.id === 'auto' ? undefined : selectedVoiceActor.id;
-      await generateVoiceForSegments(Array.from(selectedSegmentIds), speechSpeed, fitMode, voiceParam);
+      await generateVoiceForSegments(Array.from(selectedSegmentIds), speechSpeed, fitMode, voiceParam, undefined, false);
       await loadProject(currentProject.id);
     } catch (e) {
       console.error(e);
@@ -352,7 +427,7 @@ export default function DubbingStudioPanel() {
     }
   };
 
-  const handleGenerateAllSpeech = async () => {
+  const handleGenerateAllSpeech = async (forceRedub = false) => {
     if (!currentProject?.id || segments.length === 0) return;
     setIsGeneratingAll(true);
     try {
@@ -361,7 +436,7 @@ export default function DubbingStudioPanel() {
         selectedCharacterFilter === 'all' && statusFilter === 'all' && !searchQuery
           ? undefined
           : displayedSegments.map((s) => s.id);
-      await generateVoiceForSegments(targetIds, speechSpeed, fitMode, voiceParam);
+      await generateVoiceForSegments(targetIds, speechSpeed, fitMode, voiceParam, undefined, !forceRedub);
       await loadProject(currentProject.id);
     } catch (e) {
       console.error(e);
@@ -375,7 +450,7 @@ export default function DubbingStudioPanel() {
     setGeneratingSegmentId(segId);
     try {
       const voiceParam = selectedVoiceActor.id === 'auto' ? undefined : selectedVoiceActor.id;
-      await generateVoiceForSegments([segId], speechSpeed, fitMode, voiceParam);
+      await generateVoiceForSegments([segId], speechSpeed, fitMode, voiceParam, undefined, false);
       await loadProject(currentProject.id);
     } catch (e) {
       console.error(e);
@@ -404,6 +479,28 @@ export default function DubbingStudioPanel() {
       lower.includes('[shout]')
     ) {
       return EMOTIONS_LIST.find((e) => e.id === 'scream')!;
+    }
+    if (
+      lower.includes('យំ') ||
+      lower.includes('ទារកយំ') ||
+      lower.includes('កូនយំ') ||
+      lower.includes('ខ្សឹកខ្សួល') ||
+      lower.includes('cry') ||
+      lower.includes('crying') ||
+      lower.includes('weep') ||
+      lower.includes('sobbing') ||
+      lower.includes('[baby crying]')
+    ) {
+      return EMOTIONS_LIST.find((e) => e.id === 'crying')!;
+    }
+    if (
+      lower.includes('ហាហា') ||
+      lower.includes('សើច') ||
+      lower.includes('laugh') ||
+      lower.includes('giggle') ||
+      lower.includes('haha')
+    ) {
+      return EMOTIONS_LIST.find((e) => e.id === 'laughing')!;
     }
     if (lower.includes('កំហឹង') || lower.includes('ខឹង') || lower.includes('ឈប់ភ្លាម')) {
       return EMOTIONS_LIST.find((e) => e.id === 'angry')!;
@@ -513,6 +610,108 @@ export default function DubbingStudioPanel() {
     }
   };
 
+  const handleGenerateHooks = async () => {
+    if (!currentProject?.id) return;
+    setIsGeneratingHooks(true);
+    try {
+      const hooks = await generateCatchyHooks(currentProject.id, {
+        originalTitle: currentProject.name,
+        language: currentProject.language || 'km',
+        durationSeconds: hookDuration,
+        tone: hookTone,
+      });
+      setGeneratedHooks(hooks || []);
+    } catch (err) {
+      console.error('Failed to generate hooks:', err);
+    } finally {
+      setIsGeneratingHooks(false);
+    }
+  };
+
+  const handlePreviewHookTTS = async (text: string, hookId: string) => {
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      previewAudioRef.current = null;
+    }
+    if (previewingHookId === hookId) {
+      setPreviewingHookId(null);
+      return;
+    }
+
+    setPreviewingHookId(hookId);
+    try {
+      const voiceParam = selectedVoiceActor.id === 'auto' ? 'male' : selectedVoiceActor.id;
+      const res = await fetch(`/api/tts/speak`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          voice: voiceParam,
+          speed: speechSpeed,
+          language: currentProject?.language || 'km',
+        }),
+      });
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        previewAudioRef.current = audio;
+        audio.onended = () => {
+          setPreviewingHookId(null);
+          previewAudioRef.current = null;
+        };
+        audio.onerror = () => {
+          setPreviewingHookId(null);
+          previewAudioRef.current = null;
+        };
+        audio.play().catch(() => setPreviewingHookId(null));
+      } else {
+        setPreviewingHookId(null);
+      }
+    } catch (e) {
+      console.error('Preview TTS failed:', e);
+      setPreviewingHookId(null);
+    }
+  };
+
+  const handleInsertHookSegment = async (hook: { text: string; estimated_seconds?: number }, dubNow: boolean = false) => {
+    if (!currentProject?.id) return;
+    const dur = hook.estimated_seconds || hookDuration || 4.0;
+    setInsertingHookId(hook.text);
+    try {
+      const newSeg = {
+        start_time: 0.0,
+        end_time: dur,
+        text: hook.text,
+        speaker: 'Intro Hook (អ្នករៀបរាប់)',
+        voice_profile: 'male',
+        emotion: 'excited',
+      };
+      await addSegment(newSeg);
+      await loadProject(currentProject.id);
+
+      // Auto-close modal immediately so the user returns to their project
+      setShowHookModal(false);
+      setHookToast(dubNow ? '⚡ Intro Hook inserted at 0:00 and dubbed!' : '✨ Intro Hook inserted at 0:00!');
+      setTimeout(() => setHookToast(null), 4000);
+
+      if (dubNow) {
+        const fresh = useProjectStore.getState().currentProject?.segments || [];
+        const target = fresh.find((s) => s.start_time === 0.0 && s.text === hook.text);
+        if (target) {
+          const voiceParam = selectedVoiceActor.id === 'auto' ? undefined : selectedVoiceActor.id;
+          await generateVoiceForSegments([target.id], speechSpeed, fitMode, voiceParam, undefined, false);
+          await loadProject(currentProject.id);
+        }
+      }
+    } catch (err) {
+      console.error('Insert hook failed:', err);
+      setShowHookModal(false);
+    } finally {
+      setInsertingHookId(null);
+    }
+  };
+
   const tooltipMode = hoveredFitMode ? FIT_MODES[hoveredFitMode] : null;
 
   return (
@@ -525,6 +724,19 @@ export default function DubbingStudioPanel() {
         className="hidden"
         onChange={handleImportSrt}
       />
+
+      {/* Toast Notification for Hook Insert / Actions */}
+      {hookToast && (
+        <div className="mx-4 mt-2 px-3.5 py-2 rounded-xl bg-gradient-to-r from-pink-950/90 to-purple-950/90 border border-pink-500/50 text-pink-200 text-xs font-semibold flex items-center justify-between shadow-lg shadow-pink-950/50 animate-in fade-in slide-in-from-top-2 shrink-0">
+          <div className="flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-pink-300 animate-spin" style={{ animationDuration: '3s' }} />
+            <span>{hookToast}</span>
+          </div>
+          <button onClick={() => setHookToast(null)} className="text-zinc-400 hover:text-white cursor-pointer ml-2">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* 1. Header Bar with Stats & Voice Selector */}
       <div className="px-4 py-3 border-b border-[#1b1f2b] bg-[#12151e]/95 backdrop-blur-md flex items-center justify-between gap-3 shrink-0 shadow-sm">
@@ -552,6 +764,22 @@ export default function DubbingStudioPanel() {
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Catchy Intro Hook Generator Button */}
+          <button
+            onClick={() => {
+              setShowHookModal(true);
+              if (generatedHooks.length === 0 && !isGeneratingHooks) {
+                handleGenerateHooks();
+              }
+            }}
+            className="h-8 flex items-center gap-1.5 px-2.5 rounded-xl bg-pink-500/15 hover:bg-pink-500/25 border border-pink-500/30 hover:border-pink-400 text-pink-200 hover:text-white text-xs font-semibold shadow-xs transition-all active:scale-95 cursor-pointer shrink-0"
+            title="Generate catchy Intro Hook voiceover before dubbing (First 3-8 seconds)"
+          >
+            <Flame className="w-3.5 h-3.5 text-pink-400 shrink-0" />
+            <span>Intro Hook</span>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-pink-500/30 text-pink-300 font-mono font-bold">3-8s</span>
+          </button>
+
           {/* Voice Actor Selector */}
           <div className="relative">
             <button
@@ -619,8 +847,39 @@ export default function DubbingStudioPanel() {
 
           {characters.map((char) => {
             const count = segments.filter((s) => s.speaker === char).length;
-            const isFemale = /woman|girl|female|she|her|នារី|ស្រី|ឈីវ|ស៊ាង|ស៊ីលៀវ/i.test(char);
-            const isMale = /man|boy|male|he|his|បុរស|ប្រុស|បង|ប៉ូហ៊ូ|ថាង/i.test(char);
+            const charSegs = segments.filter((s) => s.speaker === char);
+            const profiles = charSegs.map((s) => (s.voice_profile || '').toLowerCase());
+            const genders = charSegs.map((s) => (s.gender || '').toLowerCase());
+
+            let avatar = '🎭';
+            let isFemale = false;
+            let isMale = false;
+
+            if (/intro hook|hook/i.test(char)) {
+              avatar = '🎯';
+              isMale = true;
+            } else if (/narrator|អ្នករៀបរាប់/i.test(char)) {
+              avatar = '🎙️';
+              isMale = true;
+            } else if (profiles.some((p) => p.includes('grandpa')) || /grandpa|លោកតា|ជីតា/i.test(char)) {
+              avatar = '👴';
+              isMale = true;
+            } else if (profiles.some((p) => p.includes('grandma')) || /grandma|លោកយាយ|ជីដូន/i.test(char)) {
+              avatar = '👵';
+              isFemale = true;
+            } else if (profiles.some((p) => p.includes('child_boy')) || /child boy|ក្មេងប្រុស/i.test(char)) {
+              avatar = '👦';
+              isMale = true;
+            } else if (profiles.some((p) => p.includes('child_girl')) || /child girl|ក្មេងស្រី/i.test(char)) {
+              avatar = '👧';
+              isFemale = true;
+            } else if (profiles.some((p) => p.includes('female')) || genders.some((g) => g === 'female') || /woman|girl|female|ស្រី|អ្នកនាង|កញ្ញា|លោកស្រី|តួអង្គស្រី|តួឯកស្រី/i.test(char)) {
+              avatar = '👩';
+              isFemale = true;
+            } else if (profiles.some((p) => p.includes('male')) || genders.some((g) => g === 'male') || /man|boy|male|បុរស|ប្រុស|តួអង្គប្រុស|តួឯកប្រុស/i.test(char)) {
+              avatar = '👨';
+              isMale = true;
+            }
 
             return (
               <button
@@ -636,7 +895,7 @@ export default function DubbingStudioPanel() {
                     : 'bg-[#181c26] text-zinc-400 hover:text-zinc-200 border border-[#262c3b]'
                 }`}
               >
-                <span>{isFemale ? '👩' : isMale ? '👨' : '🎭'}</span>
+                <span>{avatar}</span>
                 <span>{char}</span>
                 <span className="text-[10px] opacity-75 font-mono">({count})</span>
               </button>
@@ -732,15 +991,48 @@ export default function DubbingStudioPanel() {
           </div>
 
           {selectedSegmentIds.size > 0 && (
-            <div className="flex items-center gap-2 animate-in fade-in">
+            <div className="flex items-center gap-2 animate-in fade-in relative">
               <span className="text-[11px] font-bold text-purple-300 font-mono bg-purple-500/20 px-2.5 py-0.5 rounded-full border border-purple-500/40 shadow-sm">
                 {selectedSegmentIds.size} Selected
               </span>
 
+              {/* Batch Character Assign Dropdown */}
+              <div className="relative">
+                <button
+                  onClick={() => setShowBatchSpeakerMenu(!showBatchSpeakerMenu)}
+                  className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-[#1e2335] hover:bg-[#2a324b] text-zinc-200 hover:text-white border border-[#343f5d] text-xs font-semibold transition-all cursor-pointer"
+                  title="Assign voice character to all selected lines"
+                >
+                  <Users className="w-3.5 h-3.5 text-pink-400" />
+                  <span>Assign Character</span>
+                  <ChevronDown className="w-3 h-3 text-zinc-400" />
+                </button>
+
+                {showBatchSpeakerMenu && (
+                  <div className="absolute right-0 top-full mt-1.5 w-56 bg-[#161a27] border border-[#2b334a] rounded-xl shadow-2xl p-1.5 z-50 space-y-1 animate-in fade-in zoom-in-95">
+                    <div className="px-2.5 py-1 text-[10px] font-bold text-zinc-400 uppercase tracking-wider border-b border-white/5">
+                      Batch Assign ({selectedSegmentIds.size} lines)
+                    </div>
+                    {CHARACTER_PRESETS.map((preset) => (
+                      <button
+                        key={preset.speaker}
+                        onClick={() => handleBatchAssignCharacter(preset)}
+                        className="w-full px-2.5 py-1.5 rounded-lg hover:bg-purple-600/30 hover:text-white text-zinc-300 text-xs font-medium flex items-center gap-2 transition-colors text-left cursor-pointer"
+                      >
+                        <span className="text-base leading-none">{preset.avatar}</span>
+                        <div className="flex-1 truncate">
+                          <div>{preset.label}</div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
               <button
                 onClick={handleGenerateSelectedSpeech}
                 disabled={isGeneratingAll}
-                className="flex items-center gap-1.5 px-3.5 py-1 rounded-lg bg-gradient-to-r from-purple-600 via-pink-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-xs shadow-md shadow-purple-950/50 transition-all active:scale-95 disabled:opacity-50 border border-white/20"
+                className="flex items-center gap-1.5 px-3.5 py-1 rounded-lg bg-gradient-to-r from-purple-600 via-pink-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-xs shadow-md shadow-purple-950/50 transition-all active:scale-95 disabled:opacity-50 border border-white/20 cursor-pointer"
               >
                 <Sparkles className="w-3.5 h-3.5 text-yellow-300" />
                 <span>Dub Selected ({selectedSegmentIds.size})</span>
@@ -850,11 +1142,25 @@ export default function DubbingStudioPanel() {
               const isActive = activeSegmentId === seg.id;
               const isSelected = selectedSegmentIds.has(seg.id);
               const isFemale =
+                seg.voice_profile === 'female' ||
+                seg.voice_profile === 'grandma' ||
+                seg.voice_profile === 'child_girl' ||
                 seg.gender === 'female' ||
-                (seg.speaker && /woman|girl|female|she|her|នារី|ស្រី|ឈីវ|ស៊ាង|ស៊ីលៀវ/i.test(seg.speaker));
+                Boolean(seg.speaker && /woman|girl|female|ស្រី|កញ្ញា|លោកស្រី/i.test(seg.speaker));
               const isMale =
+                seg.voice_profile === 'male' ||
+                seg.voice_profile === 'grandpa' ||
+                seg.voice_profile === 'child_boy' ||
                 seg.gender === 'male' ||
-                (seg.speaker && /man|boy|male|he|his|បុរស|ប្រុស|បង|ប៉ូហ៊ូ|ថាង/i.test(seg.speaker));
+                Boolean(seg.speaker && /man|boy|male|ប្រុស/i.test(seg.speaker));
+
+              const charAvatar =
+                seg.voice_profile === 'grandpa' ? '👴' :
+                seg.voice_profile === 'grandma' ? '👵' :
+                seg.voice_profile === 'child_boy' ? '👦' :
+                seg.voice_profile === 'child_girl' ? '👧' :
+                /narrator|អ្នករៀបរាប់/i.test(seg.speaker || '') ? '🎙️' :
+                isFemale ? '👩' : isMale ? '👨' : '🎭';
 
               return (
                 <div
@@ -913,21 +1219,48 @@ export default function DubbingStudioPanel() {
                         <span>{formatTime(seg.start_time)} → {formatTime(seg.end_time)}</span>
                       </span>
 
-                      {/* Speaker / Character Badge */}
-                      {seg.speaker && (
-                        <span
-                          className={`text-[10px] px-2 py-0.5 rounded-full font-bold border flex items-center gap-1 ${
+                      {/* Interactive Speaker / Character Switcher Badge */}
+                      <div className="relative">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setActiveSpeakerPopoverId(activeSpeakerPopoverId === seg.id ? null : seg.id);
+                          }}
+                          className={`text-[10px] px-2 py-0.5 rounded-full font-bold border flex items-center gap-1 transition-all hover:scale-105 active:scale-95 cursor-pointer ${
                             isFemale
-                              ? 'bg-pink-500/15 text-pink-300 border-pink-500/30'
+                              ? 'bg-pink-500/15 text-pink-300 border-pink-500/30 hover:bg-pink-500/25'
                               : isMale
-                              ? 'bg-blue-500/15 text-blue-300 border-blue-500/30'
-                              : 'bg-purple-500/15 text-purple-300 border-purple-500/30'
+                              ? 'bg-blue-500/15 text-blue-300 border-blue-500/30 hover:bg-blue-500/25'
+                              : 'bg-purple-500/15 text-purple-300 border-purple-500/30 hover:bg-purple-500/25'
                           }`}
+                          title="Click to change character & voice"
                         >
-                          <span>{isFemale ? '👩' : isMale ? '👨' : '🎭'}</span>
-                          <span>{seg.speaker}</span>
-                        </span>
-                      )}
+                          <span>{charAvatar}</span>
+                          <span>{seg.speaker || (isMale ? 'តួអង្គប្រុស' : 'តួអង្គស្រី')}</span>
+                          <ChevronDown className="w-2.5 h-2.5 opacity-60" />
+                        </button>
+
+                        {activeSpeakerPopoverId === seg.id && (
+                          <div
+                            onClick={(e) => e.stopPropagation()}
+                            className="absolute left-0 top-full mt-1 w-52 bg-[#161a27] border border-[#2b334a] rounded-xl shadow-2xl p-1.5 z-50 space-y-0.5 animate-in fade-in zoom-in-95"
+                          >
+                            <div className="px-2 py-1 text-[9px] font-bold text-zinc-400 uppercase tracking-wider border-b border-white/5">
+                              Switch Character / Voice
+                            </div>
+                            {CHARACTER_PRESETS.map((preset) => (
+                              <button
+                                key={preset.speaker}
+                                onClick={() => handleAssignCharacterSingle(seg.id, preset)}
+                                className="w-full px-2 py-1 rounded-lg hover:bg-purple-600/30 hover:text-white text-zinc-300 text-[11px] font-medium flex items-center gap-2 transition-colors text-left cursor-pointer"
+                              >
+                                <span className="text-sm leading-none">{preset.avatar}</span>
+                                <span className="truncate">{preset.label}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
 
                       {/* Emotion Switcher */}
                       {(() => {
@@ -1041,7 +1374,11 @@ export default function DubbingStudioPanel() {
                   ) : (
                     <div className="space-y-1.5 pl-1">
                       {/* Spoken Khmer Translation */}
-                      <p className="text-sm font-semibold text-zinc-100 font-khmer leading-relaxed">
+                      <p className={`font-khmer leading-relaxed ${
+                        /hook/i.test(seg.speaker || '') || (seg as any).is_hook
+                          ? 'text-base font-bold text-pink-200 tracking-wide'
+                          : 'text-sm font-semibold text-zinc-100'
+                      }`}>
                         {seg.text}
                       </p>
 
@@ -1134,108 +1471,113 @@ export default function DubbingStudioPanel() {
           </div>
         )}
 
-        {/* Studio Controls Row */}
-        <div className="p-3.5 flex items-center justify-between gap-3">
-          {/* Fit Mode Selector & Speed */}
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-1.5">
-              <span className="text-[11px] text-zinc-400 font-semibold mr-0.5">Fit Mode</span>
-              {(['A', 'B', 'C'] as const).map((mode) => {
-                const info = FIT_MODES[mode];
-                const isActive = fitMode === mode;
-                const isHovered = hoveredFitMode === mode;
-                return (
-                  <button
-                    key={mode}
-                    onClick={() => setFitMode(mode)}
-                    onMouseEnter={() => setHoveredFitMode(mode)}
-                    onMouseLeave={() => setHoveredFitMode(null)}
-                    className={`relative w-8 h-8 rounded-xl text-xs font-black transition-all duration-150 ${
-                      isActive
-                        ? `bg-gradient-to-br ${info.color} text-white shadow-lg shadow-purple-950/50 scale-105 ring-1 ring-white/30`
-                        : isHovered
-                        ? 'bg-[#222838] border border-[#384259] text-white scale-105'
-                        : 'bg-[#181b24] border border-[#252b3a] text-zinc-400 hover:text-white'
-                    }`}
-                    title={`Mode ${mode}: ${info.title}`}
-                  >
-                    {mode}
-                    {isActive && (
-                      <span className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-white" />
-                    )}
-                  </button>
-                );
-              })}
-            </div>
+        {/* Studio Controls Row (Compact & Sleek) */}
+        <div className="px-3 py-2 flex items-center justify-between gap-2 flex-wrap">
+          {/* Left: Fit Mode Selector */}
+          <div className="flex items-center gap-1.5">
+            <span className="text-[10px] text-zinc-400 font-semibold mr-0.5">Fit Mode</span>
+            {(['A', 'B', 'C'] as const).map((mode) => {
+              const info = FIT_MODES[mode];
+              const isActive = fitMode === mode;
+              const isHovered = hoveredFitMode === mode;
+              return (
+                <button
+                  key={mode}
+                  onClick={() => setFitMode(mode)}
+                  onMouseEnter={() => setHoveredFitMode(mode)}
+                  onMouseLeave={() => setHoveredFitMode(null)}
+                  className={`relative w-6 h-6 sm:w-7 sm:h-7 rounded-lg text-[10px] sm:text-[11px] font-black transition-all duration-150 cursor-pointer ${
+                    isActive
+                      ? `bg-gradient-to-br ${info.color} text-white shadow-md shadow-purple-950/60 ring-1 ring-white/30 scale-105`
+                      : isHovered
+                      ? 'bg-[#222838] border border-[#384259] text-white'
+                      : 'bg-[#181b24] border border-[#252b3a] text-zinc-400 hover:text-white'
+                  }`}
+                  title={`Mode ${mode}: ${info.title}`}
+                >
+                  {mode}
+                  {isActive && (
+                    <span className="absolute -bottom-0.5 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-white shadow-xs" />
+                  )}
+                </button>
+              );
+            })}
+          </div>
 
+          {/* Right: Speed Selector & Master Action Buttons */}
+          <div className="flex items-center gap-2">
             {/* Speed Selector */}
-            <div className="flex items-center gap-1.5 border-l border-[#242b3c] pl-3">
-              <span className="text-[11px] text-zinc-400 font-semibold">Speed</span>
+            <div className="flex items-center gap-1 bg-[#181b24] border border-[#252b3a] hover:border-purple-500/40 rounded-lg px-2 py-0.5 h-7 transition-colors">
+              <span className="text-[9.5px] text-zinc-400 font-semibold">Speed</span>
               <select
                 value={speechSpeed}
                 onChange={(e) => setSpeechSpeed(Number(e.target.value))}
-                className="bg-[#181b24] border border-[#252b3a] rounded-lg px-2 py-1 text-xs text-white focus:outline-none font-mono font-bold"
+                className="bg-transparent text-[10px] text-white focus:outline-none font-mono font-bold cursor-pointer"
               >
-                <option value={0.85}>0.85x (Slow)</option>
-                <option value={1.0}>1.0x (Normal)</option>
-                <option value={1.15}>1.15x (Brisk)</option>
-                <option value={1.25}>1.25x (Fast)</option>
-                <option value={1.35}>1.35x (Rapid)</option>
+                <option value={0.85} className="bg-[#181b24] text-white">0.85x (Slow)</option>
+                <option value={1.0} className="bg-[#181b24] text-white">1.0x (Normal)</option>
+                <option value={1.15} className="bg-[#181b24] text-white">1.15x (Brisk)</option>
+                <option value={1.25} className="bg-[#181b24] text-white">1.25x (Fast)</option>
+                <option value={1.35} className="bg-[#181b24] text-white">1.35x (Rapid)</option>
               </select>
             </div>
-          </div>
 
-          {/* Action Hero Buttons */}
-          <div className="flex items-center gap-2">
+            {/* Action Hero Buttons */}
             {selectedSegmentIds.size > 0 ? (
               <>
                 <button
                   onClick={handleGenerateSelectedSpeech}
                   disabled={isGeneratingAll}
-                  className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 via-pink-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-xs shadow-xl shadow-purple-950/70 active:scale-95 transition-all disabled:opacity-40 flex items-center gap-2 border border-white/20"
+                  className="h-7 px-3 rounded-lg bg-gradient-to-r from-purple-600 via-pink-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-[11px] shadow-md shadow-purple-950/70 active:scale-95 transition-all disabled:opacity-40 flex items-center gap-1.5 border border-white/20 cursor-pointer"
                   title="Generate voice for selected segments"
                 >
                   {isGeneratingAll ? (
-                    <span className="flex items-center gap-2">
-                      <Loader2 className="w-4 h-4 animate-spin text-white" />
+                    <span className="flex items-center gap-1.5">
+                      <Loader2 className="w-3 h-3 animate-spin text-white" />
                       <span>Synthesizing ({audioGenProgress}/{audioGenTotal || selectedSegmentIds.size})...</span>
                     </span>
                   ) : (
                     <>
-                      <Sparkles className="w-4 h-4 text-yellow-300" />
-                      <span>Dub Selected ({selectedSegmentIds.size} lines)</span>
+                      <Sparkles className="w-3 h-3 text-yellow-300" />
+                      <span>Dub Selected ({selectedSegmentIds.size})</span>
                     </>
                   )}
                 </button>
 
                 <button
-                  onClick={handleGenerateAllSpeech}
+                  onClick={() => handleGenerateAllSpeech(false)}
                   disabled={isGeneratingAll || displayedSegments.length === 0}
-                  className="px-4 py-2.5 rounded-xl bg-[#1c2233] hover:bg-[#262f46] text-zinc-300 hover:text-white font-semibold text-xs border border-[#2e3952] transition-all disabled:opacity-40"
-                  title="Dub all lines in project"
+                  className="h-7 px-2.5 rounded-lg bg-[#1c2233] hover:bg-[#262f46] text-zinc-300 hover:text-white font-semibold text-[11px] border border-[#2e3952] transition-all disabled:opacity-40 cursor-pointer"
+                  title="Continue dubbing all lines in project"
                 >
-                  Dub All ({displayedSegments.length})
+                  {displayedSegments.filter((s) => !s.audio_url).length > 0 && displayedSegments.filter((s) => !s.audio_url).length < displayedSegments.length
+                    ? `Continue (${displayedSegments.filter((s) => !s.audio_url).length} left)`
+                    : `Dub All (${displayedSegments.length})`}
                 </button>
               </>
             ) : (
               <button
-                onClick={handleGenerateAllSpeech}
+                onClick={() => handleGenerateAllSpeech(false)}
                 disabled={isGeneratingAll || displayedSegments.length === 0}
-                className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 via-indigo-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 text-white font-bold text-xs shadow-xl shadow-purple-950/60 active:scale-95 transition-all disabled:opacity-40 flex items-center gap-2 border border-white/10"
-                title="Generate voice audio for character lines"
+                className="h-7 px-3.5 rounded-lg bg-gradient-to-r from-purple-600 via-indigo-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 text-white font-bold text-[11px] shadow-md shadow-purple-950/60 active:scale-95 transition-all disabled:opacity-40 flex items-center gap-1.5 border border-white/10 cursor-pointer"
+                title="Continue voice dubbing for remaining lines"
               >
                 {isGeneratingAll ? (
-                  <span className="flex items-center gap-2">
-                    <Loader2 className="w-4 h-4 animate-spin text-white" />
+                  <span className="flex items-center gap-1.5">
+                    <Loader2 className="w-3 h-3 animate-spin text-white" />
                     <span>Synthesizing Voice Track...</span>
                   </span>
                 ) : (
                   <>
-                    <Mic className="w-4 h-4 text-purple-200" />
+                    <Mic className="w-3 h-3 text-purple-200" />
                     <span>
                       {selectedCharacterFilter === 'all'
-                        ? 'Dub All Lines'
-                        : `Dub ${selectedCharacterFilter} (${displayedSegments.length} lines)`}
+                        ? displayedSegments.filter((s) => !s.audio_url).length > 0 && displayedSegments.filter((s) => !s.audio_url).length < displayedSegments.length
+                          ? `Continue Dubbing (${displayedSegments.filter((s) => !s.audio_url).length} left)`
+                          : 'Dub All Lines'
+                        : displayedSegments.filter((s) => !s.audio_url).length > 0 && displayedSegments.filter((s) => !s.audio_url).length < displayedSegments.length
+                        ? `Continue ${selectedCharacterFilter} (${displayedSegments.filter((s) => !s.audio_url).length} left)`
+                        : `Dub ${selectedCharacterFilter} (${displayedSegments.length})`}
                     </span>
                   </>
                 )}
@@ -1244,6 +1586,274 @@ export default function DubbingStudioPanel() {
           </div>
         </div>
       </div>
+
+      {/* 6. AI Catchy Opening Hook Modal — Portaled to Body to prevent clipping */}
+      {showHookModal &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md select-none font-sans"
+            onClick={() => setShowHookModal(false)}
+          >
+            <div
+              className="w-full max-w-xl bg-[#12141c] border border-white/10 rounded-2xl shadow-2xl shadow-black/90 overflow-hidden flex flex-col h-[80vh] max-h-[80vh] animate-in zoom-in-95 duration-150"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Modal Header (Fixed at top) */}
+              <div className="px-4 py-3 border-b border-white/10 bg-[#161824] flex items-center justify-between shrink-0 z-10">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-pink-500 to-purple-600 flex items-center justify-center text-white shadow-md shadow-pink-500/20 shrink-0">
+                    <Flame className="w-4 h-4 text-yellow-300" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-xs font-bold text-white tracking-wide truncate">
+                        AI Intro Hook Studio
+                      </h3>
+                      <span className="text-[9px] px-2 py-0.5 rounded-full bg-pink-500/20 text-pink-300 border border-pink-500/30 font-bold uppercase tracking-wider font-mono">
+                        First 3-8s
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-zinc-400 truncate">
+                      Generate viral opening hooks to boost retention
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowHookModal(false)}
+                  className="w-7 h-7 rounded-lg bg-white/5 hover:bg-white/15 text-zinc-300 hover:text-white flex items-center justify-center transition-all cursor-pointer border border-white/10 shrink-0"
+                  title="Close Studio (Esc)"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Modal Body (Strictly Scrollable with min-h-0) */}
+              <div className="p-3.5 overflow-y-auto space-y-3 flex-1 min-h-0 bg-[#0d0f17]">
+                {/* Duration & Tone Controls */}
+                <div className="p-3 rounded-xl bg-[#161824] border border-white/5 space-y-2.5">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 items-center">
+                    {/* Duration Selector */}
+                    <div className="space-y-1">
+                      <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1">
+                        <Clock className="w-3 h-3 text-pink-400" />
+                        <span>Duration</span>
+                      </label>
+                      <div className="grid grid-cols-4 gap-1">
+                        {[
+                          { sec: 3.0, label: '3s' },
+                          { sec: 4.5, label: '4.5s' },
+                          { sec: 6.0, label: '6s' },
+                          { sec: 8.0, label: '8s' },
+                        ].map((item) => {
+                          const active = hookDuration === item.sec;
+                          return (
+                            <button
+                              key={item.sec}
+                              onClick={() => setHookDuration(item.sec)}
+                              className={`py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer flex items-center justify-center font-mono ${
+                                active
+                                  ? 'bg-pink-600 text-white shadow-xs font-bold'
+                                  : 'bg-[#1e2130] text-zinc-400 hover:text-white border border-white/5'
+                              }`}
+                            >
+                              {item.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Tone Style Selector */}
+                    <div className="space-y-1">
+                      <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1">
+                        <Wand2 className="w-3 h-3 text-amber-400" />
+                        <span>Hook Vibe</span>
+                      </label>
+                      <select
+                        value={hookTone}
+                        onChange={(e) => setHookTone(e.target.value)}
+                        className="w-full bg-[#1e2130] border border-white/10 rounded-lg px-2.5 py-1 text-xs text-white focus:outline-none focus:ring-1 focus:ring-pink-500 font-medium cursor-pointer"
+                      >
+                        <option value="viral">🔥 Viral Curiosity (តើអ្នកដឹងទេ...)</option>
+                        <option value="suspense">🎭 Suspense & Mystery (រឿងរ៉ាវអាថ៌កំបាំង...)</option>
+                        <option value="shocking">⚡ Action Shocking (នឹកស្មានមិនដល់...)</option>
+                        <option value="comedy">😂 Comedy Commentary (សើចចុកពោះ...)</option>
+                        <option value="emotional">❤️ Emotional Story (មនោសញ្ចេតនា...)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Generate Button Row */}
+                  <div className="pt-2 border-t border-white/5 flex items-center justify-between gap-2">
+                    <span className="text-[10px] text-zinc-400 truncate">
+                      Crafts high-CTR Khmer opening hooks
+                    </span>
+                    <button
+                      onClick={handleGenerateHooks}
+                      disabled={isGeneratingHooks}
+                      className="px-4 py-1.5 rounded-lg bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 text-white text-xs font-bold shadow-md shadow-pink-500/20 flex items-center gap-1.5 transition-all active:scale-95 disabled:opacity-50 cursor-pointer shrink-0"
+                    >
+                      {isGeneratingHooks ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          <span>Generating...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-3.5 h-3.5 text-yellow-300" />
+                          <span>{generatedHooks.length > 0 ? 'Regenerate' : 'Generate Hooks'}</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Generated Hook Cards */}
+                {isGeneratingHooks && generatedHooks.length === 0 ? (
+                  <div className="py-8 text-center space-y-2 rounded-xl bg-[#161824]/60 border border-white/5">
+                    <Loader2 className="w-5 h-5 animate-spin text-pink-400 mx-auto" />
+                    <p className="text-xs text-zinc-400">Crafting viral hook variations...</p>
+                  </div>
+                ) : generatedHooks.length === 0 ? (
+                  <div className="py-8 text-center space-y-2 border border-dashed border-white/10 rounded-xl bg-[#161824]/30">
+                    <Target className="w-5 h-5 text-pink-400 mx-auto" />
+                    <p className="text-xs text-zinc-400">Click "Generate Hooks" above to craft intro voiceovers</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    <div className="flex items-center justify-between text-[11px] px-0.5 text-zinc-400">
+                      <span className="font-semibold text-zinc-200">Hook Variations ({generatedHooks.length}):</span>
+                      <span>Click Audition or Insert</span>
+                    </div>
+
+                    <div className="space-y-2">
+                      {generatedHooks.map((hook, hIdx) => {
+                        const isPreviewing = previewingHookId === (hook.hook_id || `hook-${hIdx}`);
+                        const isInserting = insertingHookId === hook.text;
+                        const isCopied = copiedId === `hook-${hIdx}`;
+
+                        return (
+                          <div
+                            key={hook.hook_id || hIdx}
+                            className="p-3 rounded-xl bg-[#161824] border border-white/5 hover:border-pink-500/40 transition-all space-y-2 relative group"
+                          >
+                            {/* Top Meta Row */}
+                            <div className="flex items-center justify-between gap-1.5 flex-wrap">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-[9px] font-bold text-pink-400 font-mono bg-pink-500/10 px-1.5 py-0.5 rounded border border-pink-500/20">
+                                  #{hIdx + 1}
+                                </span>
+                                <span className="text-[9px] px-2 py-0.5 rounded-full font-semibold bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                                  {hook.category_label || hook.category || 'Viral Hook'}
+                                </span>
+                                <span className="text-[9px] px-1.5 py-0.5 rounded font-mono bg-black/40 text-zinc-400 border border-white/5">
+                                  ~{hook.estimated_seconds || hookDuration}s
+                                </span>
+                              </div>
+
+                              <div className="flex items-center gap-1">
+                                {/* 1-Click Copy */}
+                                <button
+                                  onClick={() => handleCopyText(hook.text, `hook-${hIdx}`)}
+                                  className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-zinc-400 hover:text-white transition-all text-[10px] font-medium flex items-center gap-1 border border-white/5 cursor-pointer"
+                                  title="Copy hook text"
+                                >
+                                  {isCopied ? (
+                                    <>
+                                      <Check className="w-3 h-3 text-emerald-400" />
+                                      <span className="text-emerald-400">Copied</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Copy className="w-3 h-3" />
+                                      <span>Copy</span>
+                                    </>
+                                  )}
+                                </button>
+
+                                {/* Voice Preview Button */}
+                                <button
+                                  onClick={() => handlePreviewHookTTS(hook.text, hook.hook_id || `hook-${hIdx}`)}
+                                  className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-[10px] font-semibold transition-all cursor-pointer border ${
+                                    isPreviewing
+                                      ? 'bg-purple-600 text-white border-purple-400 animate-pulse'
+                                      : 'bg-[#1e2130] hover:bg-[#272b3e] text-zinc-300 hover:text-white border-white/5'
+                                  }`}
+                                  title={isPreviewing ? 'Stop voice sample' : 'Listen to AI voice audition'}
+                                >
+                                  {isPreviewing ? (
+                                    <>
+                                      <Pause className="w-3 h-3 text-yellow-300" />
+                                      <span>Playing</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Play className="w-3 h-3 text-pink-400 fill-pink-400" />
+                                      <span>Audition</span>
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Hook Text Display */}
+                            <div className="text-xs sm:text-sm font-bold text-white font-khmer leading-relaxed select-text bg-black/30 p-2.5 rounded-lg border border-white/5">
+                              "{hook.text}"
+                            </div>
+
+                            {/* Action Buttons */}
+                            <div className="pt-1 flex items-center justify-end gap-1.5">
+                              <button
+                                onClick={() => handleInsertHookSegment(hook, false)}
+                                disabled={isInserting}
+                                className="px-3 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-zinc-300 hover:text-white border border-white/5 text-[11px] font-medium flex items-center gap-1 transition-all cursor-pointer"
+                              >
+                                <Target className="w-3 h-3 text-pink-400" />
+                                <span>Insert at 0:00</span>
+                              </button>
+
+                              <button
+                                onClick={() => handleInsertHookSegment(hook, true)}
+                                disabled={isInserting}
+                                className="px-3.5 py-1 rounded-lg bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 text-white text-[11px] font-bold shadow-sm flex items-center gap-1.5 transition-all active:scale-95 cursor-pointer disabled:opacity-50"
+                              >
+                                {isInserting ? (
+                                  <>
+                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                    <span>Inserting...</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Zap className="w-3 h-3 text-yellow-300 fill-yellow-300" />
+                                    <span>Insert & Dub Now</span>
+                                  </>
+                                )}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Modal Footer */}
+              <div className="px-4 py-2.5 border-t border-white/10 bg-[#0e1017] flex items-center justify-between gap-2 shrink-0">
+                <span className="text-[10px] text-zinc-500">
+                  Adds hook at 0:00 as <span className="text-pink-300">"Intro Hook"</span>
+                </span>
+                <button
+                  onClick={() => setShowHookModal(false)}
+                  className="px-3 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-zinc-300 hover:text-white text-xs font-medium transition-colors cursor-pointer border border-white/5"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
     </div>
   );
 }

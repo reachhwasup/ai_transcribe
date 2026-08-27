@@ -30,6 +30,11 @@ export async function deleteProject(id: string): Promise<void> {
   await api.delete(`/projects/${id}`);
 }
 
+export async function removeProjectVideo(projectId: string): Promise<Project> {
+  const { data } = await api.delete(`/projects/${projectId}/video`);
+  return data;
+}
+
 // Video upload
 export async function uploadVideo(projectId: string, file: File, onProgress?: (pct: number) => void): Promise<Project> {
   const formData = new FormData();
@@ -482,6 +487,18 @@ export async function exportVideoForPlatform(
   backgroundAudio?: string,
   exportFolder?: string,
   outputFilename?: string,
+  quality?: 'compact' | 'standard' | 'high',
+  bgmVolume?: number,
+  voiceOffsetMs?: number,
+  logoOptions?: {
+    logo_url?: string;
+    logo_enabled?: boolean;
+    logo_position?: string;
+    logo_scale_pct?: number;
+    logo_opacity?: number;
+    logo_x_pct?: number;
+    logo_y_pct?: number;
+  },
 ): Promise<{ blob: Blob; filename?: string; savedPath?: string; exportFolder?: string }> {
   const payload = {
     platform,
@@ -499,6 +516,16 @@ export async function exportVideoForPlatform(
     subtitle_style: subtitleStyle ?? null,
     export_folder: exportFolder || null,
     output_filename: outputFilename || null,
+    quality: quality || 'standard',
+    bgm_volume: bgmVolume !== undefined ? bgmVolume : 0.35,
+    voice_offset_ms: voiceOffsetMs ?? 0,
+    logo_url: logoOptions?.logo_url || null,
+    logo_enabled: logoOptions?.logo_enabled || false,
+    logo_position: logoOptions?.logo_position || 'top_right',
+    logo_scale_pct: logoOptions?.logo_scale_pct || 15.0,
+    logo_opacity: logoOptions?.logo_opacity !== undefined ? logoOptions.logo_opacity : 1.0,
+    logo_x_pct: logoOptions?.logo_x_pct !== undefined ? logoOptions.logo_x_pct : 85.0,
+    logo_y_pct: logoOptions?.logo_y_pct !== undefined ? logoOptions.logo_y_pct : 5.0,
   };
 
   try {
@@ -564,11 +591,18 @@ export async function exportVideoForPlatform(
       throw new Error('Render finished without download URL');
     }
 
-    const fileRes = await fetch(downloadUrl);
-    if (!fileRes.ok) {
-      throw new Error('Failed to download rendered video file');
+    // If the file was already saved directly to the local disk (destination folder),
+    // skip fetching multi-GB video blob into browser memory to eliminate the 95% loading delay
+    let blob: Blob;
+    if (savedLocalPath) {
+      blob = new Blob([], { type: 'video/mp4' });
+    } else {
+      const fileRes = await fetch(downloadUrl);
+      if (!fileRes.ok) {
+        throw new Error('Failed to download rendered video file');
+      }
+      blob = await fileRes.blob();
     }
-    const blob = await fileRes.blob();
     return { blob, filename: finalFilename, savedPath: savedLocalPath, exportFolder: savedFolder };
   } catch (streamErr: any) {
     console.warn('Streaming video export error, falling back to direct endpoint:', streamErr);
@@ -604,6 +638,16 @@ export async function getDefaultFolders(): Promise<{
 export async function openFolderInSystem(path: string): Promise<{ status: string; path: string }> {
   const { data } = await api.post('/projects/open-folder', { path });
   return data;
+}
+
+// Open native OS folder chooser dialog
+export async function selectFolderInSystem(): Promise<string | null> {
+  try {
+    const { data } = await api.post('/projects/select-folder');
+    return data?.path || null;
+  } catch {
+    return null;
+  }
 }
 
 // Video cut/trim (in-place, replaces project video)
@@ -717,6 +761,38 @@ export async function blurVideoRegion(
   height: number,
 ): Promise<VideoToolResult> {
   return blurVideoRegions(projectId, [{ x, y, width, height }]);
+}
+
+// Logo / Watermark / Image Overlay
+export async function uploadProjectLogo(
+  projectId: string,
+  file: File,
+): Promise<{ url: string; filename: string; path: string }> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const { data } = await api.post(`/projects/${projectId}/watermark`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+  return data;
+}
+
+export async function applyVideoLogo(
+  projectId: string,
+  options: {
+    logo_url: string;
+    position?: string;
+    scale_pct?: number;
+    opacity?: number;
+    x_pct?: number;
+    y_pct?: number;
+  },
+): Promise<VideoToolResult> {
+  const { data } = await api.post(
+    `/projects/${projectId}/export/apply-logo`,
+    options,
+    { timeout: 600000 },
+  );
+  return data;
 }
 
 // Video resize (in-place)
@@ -1156,5 +1232,69 @@ export async function fillMissingCaptions(
     { min_gap: minGapSeconds },
     { timeout: 600000 },
   );
+  return data;
+}
+
+export async function generateMovieTitles(
+  projectId: string,
+  originalTitle?: string,
+  language?: string,
+): Promise<Array<{ category: string; category_label: string; title: string; description: string }>> {
+  const { data } = await api.post(`/projects/${projectId}/transcripts/generate-titles`, {
+    original_title: originalTitle,
+    language: language || 'km',
+  });
+  return data;
+}
+
+export async function generateCatchyHooks(
+  projectId: string,
+  options: {
+    originalTitle?: string;
+    language?: string;
+    durationSeconds?: number;
+    tone?: string;
+  } = {},
+): Promise<
+  Array<{
+    hook_id: string;
+    text: string;
+    category: string;
+    category_label: string;
+    estimated_seconds: number;
+    why_it_works: string;
+  }>
+> {
+  const { data } = await api.post(`/projects/${projectId}/transcripts/generate-hooks`, {
+    original_title: options.originalTitle,
+    language: options.language || 'km',
+    duration_seconds: options.durationSeconds ?? 4.0,
+    tone: options.tone || 'viral',
+  });
+  return data;
+}
+
+export async function generateViralMetadata(
+  projectId: string,
+  options: {
+    originalTitle?: string;
+    language?: string;
+    tone?: string;
+    platform?: string;
+  } = {},
+): Promise<{
+  titles: Array<{ category: string; category_label: string; title: string; description: string }>;
+  hook?: string;
+  captions?: { tiktok?: string; youtube_shorts?: string };
+  hashtags?: string[];
+  pinned_comment?: string;
+  call_to_action?: string;
+}> {
+  const { data } = await api.post(`/projects/${projectId}/transcripts/generate-viral-metadata`, {
+    original_title: options.originalTitle,
+    language: options.language || 'km',
+    tone: options.tone || 'viral',
+    platform: options.platform || 'all',
+  });
   return data;
 }

@@ -5,6 +5,8 @@ import uuid
 import subprocess
 import shutil
 import threading
+import tempfile
+import wave
 from pathlib import Path
 from backend.config import settings
 
@@ -15,7 +17,7 @@ PLATFORM_PRESETS = {
         "name": "TikTok",
         "width": 1080,
         "height": 1920,
-        "video_bitrate": "6M",
+        "video_bitrate": "3.8M",
         "audio_bitrate": "128k",
         "fps": 30,
         "max_duration": 600,  # 10 min
@@ -25,7 +27,7 @@ PLATFORM_PRESETS = {
         "name": "YouTube",
         "width": 1920,
         "height": 1080,
-        "video_bitrate": "8M",
+        "video_bitrate": "4.5M",
         "audio_bitrate": "192k",
         "fps": 30,
         "max_duration": None,
@@ -35,7 +37,7 @@ PLATFORM_PRESETS = {
         "name": "YouTube Shorts",
         "width": 1080,
         "height": 1920,
-        "video_bitrate": "6M",
+        "video_bitrate": "3.8M",
         "audio_bitrate": "128k",
         "fps": 30,
         "max_duration": 60,
@@ -45,7 +47,7 @@ PLATFORM_PRESETS = {
         "name": "Instagram Square",
         "width": 1080,
         "height": 1080,
-        "video_bitrate": "6M",
+        "video_bitrate": "3.2M",
         "audio_bitrate": "128k",
         "fps": 30,
         "max_duration": 600,
@@ -55,7 +57,7 @@ PLATFORM_PRESETS = {
         "name": "Instagram Reels",
         "width": 1080,
         "height": 1920,
-        "video_bitrate": "6M",
+        "video_bitrate": "3.8M",
         "audio_bitrate": "128k",
         "fps": 30,
         "max_duration": 90,
@@ -65,7 +67,7 @@ PLATFORM_PRESETS = {
         "name": "Facebook Portrait",
         "width": 1080,
         "height": 1350,
-        "video_bitrate": "6M",
+        "video_bitrate": "3.5M",
         "audio_bitrate": "128k",
         "fps": 30,
         "max_duration": None,
@@ -75,7 +77,7 @@ PLATFORM_PRESETS = {
         "name": "Facebook Reels",
         "width": 1080,
         "height": 1920,
-        "video_bitrate": "6M",
+        "video_bitrate": "3.8M",
         "audio_bitrate": "128k",
         "fps": 30,
         "max_duration": 90,
@@ -85,7 +87,7 @@ PLATFORM_PRESETS = {
         "name": "Original Source",
         "width": 1920,
         "height": 1080,
-        "video_bitrate": "8M",
+        "video_bitrate": "4.5M",
         "audio_bitrate": "192k",
         "fps": 30,
         "max_duration": None,
@@ -110,6 +112,51 @@ def _get_ffprobe() -> str:
     if not ffprobe:
         ffprobe = shutil.which("ffmpeg")
     return ffprobe or "ffprobe"
+
+
+def probe_video(video_path: str) -> dict:
+    """Probe video metadata including duration, width, height, fps."""
+    if not os.path.exists(video_path):
+        return {}
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        dur = get_duration_ffprobe(video_path)
+        return {"duration": dur}
+    try:
+        cmd = [
+            ffprobe, "-v", "error",
+            "-show_entries", "stream=width,height,r_frame_rate,duration:format=duration",
+            "-of", "json",
+            video_path,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if r.returncode == 0 and r.stdout.strip():
+            import json as _json
+            data = _json.loads(r.stdout)
+            result = {}
+            for stream in data.get("streams", []):
+                if "width" in stream and "height" in stream:
+                    result["width"] = stream["width"]
+                    result["height"] = stream["height"]
+                    if "duration" in stream:
+                        try:
+                            result["duration"] = float(stream["duration"])
+                        except Exception:
+                            pass
+                    break
+            if "duration" not in result:
+                fmt_dur = data.get("format", {}).get("duration")
+                if fmt_dur:
+                    try:
+                        result["duration"] = float(fmt_dur)
+                    except Exception:
+                        pass
+            if "duration" not in result or result.get("duration", 0) <= 0:
+                result["duration"] = get_duration_ffprobe(video_path)
+            return result
+    except Exception:
+        pass
+    return {"duration": get_duration_ffprobe(video_path)}
 
 
 def generate_preview(video_path: str, out_path: str) -> str:
@@ -189,30 +236,42 @@ def _build_subtitle_concat_demuxer(
 
     concat_path = os.path.abspath(os.path.join(abs_export_dir, f"_subs_concat_{uuid.uuid4()}.txt"))
 
-    sorted_subs = sorted(sub_images, key=lambda s: s["start"])
+    sorted_subs = sorted(sub_images, key=lambda s: float(s["start"]))
     lines = ["ffconcat version 1.0"]
 
     current_time = 0.0
-    for si in sorted_subs:
+    for idx, si in enumerate(sorted_subs):
         start = max(0.0, float(si["start"]))
-        end = max(start, float(si["end"]))
+        raw_end = max(start + 0.05, float(si["end"]))
         img_path = os.path.abspath(si["path"])
 
-        # Transparent gap before subtitle
-        if start > current_time + 0.005:
+        # Lookahead: the next subtitle's start time prevents overlapping drift
+        next_start = float(sorted_subs[idx + 1]["start"]) if idx + 1 < len(sorted_subs) else raw_end + 3600.0
+
+        # Cap display end time so it never overflows into the next subtitle's start
+        display_end = min(raw_end, max(start + 0.05, next_start))
+
+        # 1. Insert transparent gap if there is silence/space before this subtitle
+        if start > current_time:
             gap = start - current_time
-            lines.append(f"file '{trans_path}'")
-            lines.append(f"duration {gap:.4f}")
-            current_time = start
+            if gap > 0.001:
+                lines.append(f"file '{trans_path}'")
+                lines.append(f"duration {gap:.6f}")
+                current_time = start
+        elif start < current_time:
+            # If previous subtitle ran up to current_time, start this subtitle immediately
+            start = current_time
+            display_end = max(start + 0.05, display_end)
 
-        dur = max(0.05, end - start)
+        # 2. Add this subtitle's exact duration
+        dur = max(0.05, display_end - start)
         lines.append(f"file '{img_path}'")
-        lines.append(f"duration {dur:.4f}")
-        current_time = end
+        lines.append(f"duration {dur:.6f}")
+        current_time += dur
 
-    # Trailing transparent padding
+    # Trailing transparent padding to cover remainder of video
     lines.append(f"file '{trans_path}'")
-    lines.append("duration 3600.0")
+    lines.append("duration 7200.0")
     lines.append(f"file '{trans_path}'")
 
     with open(concat_path, "w", encoding="utf-8") as f:
@@ -307,14 +366,23 @@ def _generate_subtitle_images(srt_path: str, width: int, height: int, size_pct: 
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     ]
 
+    _font_cache = {}
+
     def _load_font(paths, size=None):
         f_size = size or font_size
+        cache_key = (tuple(paths), f_size)
+        if cache_key in _font_cache:
+            return _font_cache[cache_key]
         for fp in paths:
             try:
-                return ImageFont.truetype(fp, f_size, layout_engine=layout_engine)
+                font = ImageFont.truetype(fp, f_size, layout_engine=layout_engine)
+                _font_cache[cache_key] = font
+                return font
             except Exception:
                 continue
-        return ImageFont.load_default()
+        default_font = ImageFont.load_default()
+        _font_cache[cache_key] = default_font
+        return default_font
 
     # Detect if text contains Khmer Unicode range (U+1780–U+17FF)
     def _has_khmer(text):
@@ -371,8 +439,10 @@ def _generate_subtitle_images(srt_path: str, width: int, height: int, size_pct: 
                         wrapped_lines.append(current)
         return "\n".join(wrapped_lines) if wrapped_lines else raw_text
 
-    sub_images = []
-    for i, seg in enumerate(segments):
+    import concurrent.futures
+
+    def _render_one(item):
+        i, seg = item
         img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         raw_text = seg["text"]
@@ -436,8 +506,14 @@ def _generate_subtitle_images(srt_path: str, width: int, height: int, size_pct: 
             stroke_fill=(outline_rgb[0], outline_rgb[1], outline_rgb[2], 255) if outline_w > 0 else None,
         )
         img_path = os.path.join(export_dir, f"_sub_{uuid.uuid4()}_{i}.png")
-        img.save(img_path)
-        sub_images.append({"path": img_path, "start": seg["start"], "end": seg["end"]})
+        img.save(img_path, "PNG", compress_level=1)
+        return {"path": img_path, "start": seg["start"], "end": seg["end"]}
+
+    sub_images = []
+    max_workers = min(8, max(2, (os.cpu_count() or 4)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        items = list(enumerate(segments))
+        sub_images = list(executor.map(_render_one, items))
 
     return sub_images
 
@@ -457,12 +533,25 @@ def export_video_for_platform(
     subtitle_position: str = "bottom",  # bottom | middle | top
     subtitle_style: dict | None = None,  # full caption style (colors, outline, box)
     progress_callback: Any = None,  # Optional callable (percent: int, message: str) -> None
+    quality: str = "standard",  # compact (~2.2M, ~70% smaller) | standard (~3.8M, balanced) | high (~6.5M, master)
+    bgm_volume: float = 0.35,  # volume factor for background audio/music (0.0 to 1.0, default 0.35 so TTS is clear)
+    logo_path: str | None = None,  # image file path for watermark/logo overlay
+    logo_url: str | None = None,  # optional alias for logo_path
+    logo_enabled: bool = False,
+    logo_position: str = "top_right",  # top_left | top_right | bottom_left | bottom_right | center | custom
+    logo_x_pct: float | None = None,  # 0-100 percentage for custom position
+    logo_y_pct: float | None = None,  # 0-100 percentage for custom position
+    logo_scale_pct: float = 15.0,  # width of logo as % of video width (5% - 50%)
+    logo_opacity: float = 1.0,  # 0.0 - 1.0
 ) -> str:
     """
     Export video formatted for a specific platform.
-    Optionally burns subtitles and mixes TTS audio overlay.
+    Optionally burns subtitles, overlays watermark/logo, and mixes TTS audio overlay.
     Returns path to the exported file.
     """
+    if not logo_path and logo_url:
+        logo_path = logo_url.lstrip("/") if os.path.exists(logo_url.lstrip("/")) else logo_url
+
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
 
@@ -478,6 +567,20 @@ def export_video_for_platform(
 
     w = preset["width"]
     h = preset["height"]
+
+    # Quality and Bitrate optimization
+    if quality == "compact":
+        target_v_bitrate = "2200k"
+        target_crf = "26"
+        target_a_bitrate = "96k"
+    elif quality == "high":
+        target_v_bitrate = "6500k"
+        target_crf = "20"
+        target_a_bitrate = "192k"
+    else:  # standard (default)
+        target_v_bitrate = preset.get("video_bitrate", "3.8M")
+        target_crf = "23"
+        target_a_bitrate = preset.get("audio_bitrate", "128k")
 
     if platform == "custom":
         try:
@@ -506,6 +609,7 @@ def export_video_for_platform(
     # Isolated music-only bed: when present it becomes the background audio
     # instead of the original mix, so voices are gone but music stays.
     has_music = bool(music_audio_path and os.path.exists(music_audio_path))
+    has_logo = bool(logo_enabled and logo_path and os.path.exists(logo_path))
 
     # Probe whether video has audio
     has_video_audio = False
@@ -536,6 +640,13 @@ def export_video_for_platform(
     if sub_concat_path:
         sub_input_idx = next_idx
         cmd += ["-f", "concat", "-safe", "0", "-i", sub_concat_path]
+        next_idx += 1
+
+    # Add Watermark / Logo input
+    logo_input_idx = None
+    if has_logo:
+        logo_input_idx = next_idx
+        cmd += ["-i", logo_path]
         next_idx += 1
 
     # Add TTS audio input
@@ -593,16 +704,18 @@ def export_video_for_platform(
         bg_audio = None
 
     # Detect if we can skip video re-encoding (only audio is changing)
-    # True when: no subtitle burn, scale mode is default/native, only audio mix
+    # True when: no subtitle burn, no logo watermark, scale mode is default/native, only audio mix
     audio_only_change = (
         not sub_concat_path
         and not has_libass
         and not want_subs
+        and not has_logo
         and scale_mode == "fit"
     )
 
-    # Decide if we need filter_complex (subtitles overlay, or mixing two audios)
-    need_filter_complex = bool(sub_concat_path) or (has_tts and bg_audio is not None)
+    # Decide if we need filter_complex (subtitles overlay, logo overlay, mixing two audios, or adjusting volume)
+    bg_vol = max(0.0, min(2.0, float(bgm_volume if bgm_volume is not None else 0.35)))
+    need_filter_complex = bool(sub_concat_path) or bool(has_logo) or (has_tts and bg_audio is not None) or (bg_audio is not None and bg_vol != 1.0)
 
     if need_filter_complex:
         fc_parts = []
@@ -614,20 +727,64 @@ def export_video_for_platform(
 
         # Apply single subtitle overlay if using concat demuxer
         if sub_concat_path and sub_input_idx is not None:
-            fc_parts.append(f"[{prev_label}][{sub_input_idx}:v]overlay=0:0:shortest=1[subout]")
+            fc_parts.append(f"[{sub_input_idx}:v]setpts=PTS-STARTPTS[sub_sync]")
+            fc_parts.append(f"[{prev_label}][sub_sync]overlay=0:0:shortest=1[subout]")
             prev_label = "subout"
+
+        # Apply Brand Logo / Watermark overlay
+        if has_logo and logo_input_idx is not None:
+            logo_w = max(24, round(w * max(3.0, min(80.0, float(logo_scale_pct or 15.0))) / 100.0))
+            pad_x = max(16, round(w * 0.03))
+            pad_y = max(16, round(h * 0.03))
+
+            if logo_position == "top_left":
+                ox = f"{pad_x}"
+                oy = f"{pad_y}"
+            elif logo_position == "top_right":
+                ox = f"main_w-overlay_w-{pad_x}"
+                oy = f"{pad_y}"
+            elif logo_position == "bottom_left":
+                ox = f"{pad_x}"
+                oy = f"main_h-overlay_h-{pad_y}"
+            elif logo_position == "bottom_right":
+                ox = f"main_w-overlay_w-{pad_x}"
+                oy = f"main_h-overlay_h-{pad_y}"
+            elif logo_position == "center":
+                ox = "(main_w-overlay_w)/2"
+                oy = "(main_h-overlay_h)/2"
+            else:  # custom coordinates
+                cx = max(0, min(100, float(logo_x_pct if logo_x_pct is not None else 85.0)))
+                cy = max(0, min(100, float(logo_y_pct if logo_y_pct is not None else 5.0)))
+                ox = f"round(main_w*{cx}/100)"
+                oy = f"round(main_h*{cy}/100)"
+
+            op = max(0.05, min(1.0, float(logo_opacity if logo_opacity is not None else 1.0)))
+            fc_parts.append(
+                f"[{logo_input_idx}:v]scale={logo_w}:-1:force_original_aspect_ratio=decrease,format=rgba,colorchannelmixer=aa={op}[logo_scaled]"
+            )
+            fc_parts.append(f"[{prev_label}][logo_scaled]overlay={ox}:{oy}[logo_out]")
+            prev_label = "logo_out"
 
         # Audio mixing
         audio_map = None
+        bg_vol = max(0.0, min(2.0, float(bgm_volume if bgm_volume is not None else 0.35)))
         if has_tts and bg_audio is not None:
+            # Attenuate background audio/music so AI narration is always crisp, clear, and prominent
+            tts_vol = 1.15
             fc_parts.append(
-                f"[{bg_audio}][{tts_idx}:a]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]"
+                f"[{bg_audio}]volume={bg_vol}[bg_attenuated];"
+                f"[{tts_idx}:a]volume={tts_vol}[tts_boosted];"
+                f"[bg_attenuated][tts_boosted]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]"
             )
             audio_map = "[aout]"
         elif has_tts:
             audio_map = f"{tts_idx}:a"
         elif bg_audio is not None:
-            audio_map = bg_audio
+            if bg_vol != 1.0:
+                fc_parts.append(f"[{bg_audio}]volume={bg_vol}[bg_attenuated]")
+                audio_map = "[bg_attenuated]"
+            else:
+                audio_map = bg_audio
 
         fc = ";".join(fc_parts)
         if fc_parts and not audio_only_change:
@@ -658,7 +815,7 @@ def export_video_for_platform(
         cmd += [
             "-c:v", "copy",
             "-c:a", "aac",
-            "-b:a", preset["audio_bitrate"],
+            "-b:a", target_a_bitrate,
             "-movflags", "+faststart",
             output_path,
         ]
@@ -667,9 +824,9 @@ def export_video_for_platform(
         if _has_videotoolbox(ffmpeg):
             cmd += [
                 "-c:v", "h264_videotoolbox",
-                "-b:v", preset["video_bitrate"],
+                "-b:v", target_v_bitrate,
                 "-c:a", "aac",
-                "-b:a", preset["audio_bitrate"],
+                "-b:a", target_a_bitrate,
                 "-r", str(preset["fps"]),
                 "-movflags", "+faststart",
                 "-pix_fmt", "yuv420p",
@@ -679,10 +836,11 @@ def export_video_for_platform(
             cmd += [
                 "-c:v", "libx264",
                 "-preset", "fast",
+                "-crf", target_crf,
                 "-threads", "0",
-                "-b:v", preset["video_bitrate"],
+                "-b:v", target_v_bitrate,
                 "-c:a", "aac",
-                "-b:a", preset["audio_bitrate"],
+                "-b:a", target_a_bitrate,
                 "-r", str(preset["fps"]),
                 "-movflags", "+faststart",
                 "-pix_fmt", "yuv420p",
@@ -695,7 +853,7 @@ def export_video_for_platform(
             proc = subprocess.Popen(
                 cmd_with_progress,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
             )
 
@@ -727,14 +885,22 @@ def export_video_for_platform(
                     except Exception:
                         pass
 
-            proc.wait(timeout=600)
+            render_timeout = max(1800, int((total_dur or 0) * 3))
+            proc.wait(timeout=render_timeout)
             if proc.returncode != 0:
                 err_msg = proc.stderr.read() if proc.stderr else ""
                 raise RuntimeError(f"ffmpeg failed: {err_msg[-500:]}")
             if progress_callback:
                 progress_callback(100, "Rendering complete!")
         else:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            p_dur = 0.0
+            try:
+                p_info = probe_video(video_path)
+                p_dur = float(p_info.get("duration", 0))
+            except Exception:
+                pass
+            render_timeout = max(1800, int(p_dur * 3))
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=render_timeout)
             if result.returncode != 0:
                 raise RuntimeError(f"ffmpeg failed: {result.stderr[-500:]}")
     finally:
@@ -1003,35 +1169,43 @@ def concatenate_video_files(
 def separate_audio(
     video_path: str,
     project_dir: str,
+    fast_mode: bool | None = None,
 ) -> dict:
     """
-    Separate audio from video into vocals and background music tracks.
-    Uses Meta's Demucs neural network for high-quality separation if available,
-    with ffmpeg frequency filtering as fallback.
-    Saves vocals.wav and bgm.wav into the project directory for in-app playback.
-    Returns dict with paths to: vocals, bgm files.
+    Separate audio from video into studio-grade vocals and background music (BGM) tracks.
+    Uses Meta's Demucs Neural AI (htdemucs) with GPU/Apple Silicon MPS acceleration.
+    For long videos, splits into memory-safe chunks and rejoins them seamlessly.
     """
+    video_path = os.path.abspath(video_path)
+    project_dir = os.path.abspath(project_dir)
+
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     ffmpeg = _get_ffmpeg()
     os.makedirs(project_dir, exist_ok=True)
 
-    # Check if video has an audio stream
+    # Check if video has an audio stream and probe duration
     probe_cmd = [ffmpeg, "-i", video_path, "-hide_banner"]
     probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
     probe_output = probe.stdout + probe.stderr
     if "Audio:" not in probe_output:
         raise RuntimeError("This video file does not contain an audio track. Cannot isolate vocals.")
 
+    v_dur = 0.0
+    try:
+        p_info = probe_video(video_path)
+        v_dur = float(p_info.get("duration", 0))
+    except Exception:
+        pass
+
     vocals_path = os.path.join(project_dir, "vocals.wav")
     bgm_path = os.path.join(project_dir, "bgm.wav")
 
-    # Extract full audio from video first (throttled to 2 threads so UI stays smooth)
+    # Extract full audio from video first
     full_path = os.path.join(project_dir, "full_audio.wav")
     cmd_full = [
         ffmpeg, "-y",
-        "-threads", "2",
         "-i", video_path,
         "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
         full_path,
@@ -1040,21 +1214,103 @@ def separate_audio(
     if r.returncode != 0:
         raise RuntimeError(f"Audio extraction failed: {r.stderr[-500:]}")
 
-    # Try Demucs first (high-quality neural network separation)
-    demucs_success = False
+    separated = False
+    
+    # Prioritize Demucs AI Neural separation (Apple Silicon MPS / CUDA / Multi-threaded CPU)
     try:
-        demucs_success = _separate_with_demucs(full_path, vocals_path, bgm_path, project_dir)
+        if v_dur > 200.0:
+            separated = _separate_long_audio_with_demucs(full_path, vocals_path, bgm_path, project_dir, chunk_len=180.0)
+        else:
+            separated = _separate_with_demucs(full_path, vocals_path, bgm_path, project_dir)
     except Exception as e:
-        print(f"Demucs separation failed, falling back to ffmpeg: {e}")
+        print(f"[Demucs] Neural separation encountered exception: {e}")
 
-    if not demucs_success:
+    # Fallback to DSP filter only if neural network is completely unavailable
+    if not separated:
+        print("[Audio] Fallback to DSP filter separation...")
         _separate_with_ffmpeg(full_path, vocals_path, bgm_path, ffmpeg)
 
-    # Clean up full audio (not needed for playback)
+    # Clean up full audio temp file
     if os.path.exists(full_path):
-        os.remove(full_path)
+        try:
+            os.remove(full_path)
+        except OSError:
+            pass
 
     return {"vocals": vocals_path, "bgm": bgm_path}
+
+
+def _separate_long_audio_with_demucs(
+    audio_path: str,
+    vocals_path: str,
+    bgm_path: str,
+    project_dir: str,
+    chunk_len: float = 300.0,
+) -> bool:
+    """Split long audio into 5-minute memory-safe chunks, separate each with Demucs AI, and rejoin seamlessly."""
+    ffmpeg = _get_ffmpeg()
+    audio_path = os.path.abspath(audio_path)
+    vocals_path = os.path.abspath(vocals_path)
+    bgm_path = os.path.abspath(bgm_path)
+    project_dir = os.path.abspath(project_dir)
+
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+            capture_output=True, text=True, timeout=30
+        )
+        total_dur = float(probe.stdout.strip() or 0.0)
+    except Exception:
+        total_dur = 0.0
+
+    if total_dur <= chunk_len + 15.0:
+        return _separate_with_demucs(audio_path, vocals_path, bgm_path, project_dir)
+
+    tmp_dir = tempfile.mkdtemp(prefix="demucs_chunks_")
+    try:
+        num_chunks = int(total_dur // chunk_len) + (1 if total_dur % chunk_len > 0 else 0)
+        print(f"[Demucs] Splitting {total_dur:.1f}s audio into {num_chunks} high-speed neural processing chunks ({chunk_len}s each)...")
+
+        vocal_files = []
+        bgm_files = []
+
+        for i in range(num_chunks):
+            start_t = i * chunk_len
+            dur_t = min(chunk_len, total_dur - start_t)
+            chunk_in = os.path.join(tmp_dir, f"chunk_{i}.wav")
+            chunk_v = os.path.join(tmp_dir, f"vocal_{i}.wav")
+            chunk_b = os.path.join(tmp_dir, f"bgm_{i}.wav")
+
+            cmd = [ffmpeg, "-y", "-ss", str(start_t), "-i", audio_path, "-t", str(dur_t), "-ac", "2", "-ar", "44100", chunk_in]
+            subprocess.run(cmd, capture_output=True, check=True)
+
+            ok = _separate_with_demucs(chunk_in, chunk_v, chunk_b, tmp_dir)
+            if not ok:
+                print(f"[Demucs] Chunk {i+1}/{num_chunks} failed")
+                return False
+
+            vocal_files.append(chunk_v)
+            bgm_files.append(chunk_b)
+            print(f"[Demucs] ✓ Chunk {i+1}/{num_chunks} separated in high-speed mode.")
+
+        def _merge_wav_files(wav_list: list[str], out_wav: str):
+            with wave.open(out_wav, "wb") as outfile:
+                for i, w_path in enumerate(wav_list):
+                    with wave.open(w_path, "rb") as infile:
+                        if i == 0:
+                            outfile.setparams(infile.getparams())
+                        outfile.writeframes(infile.readframes(infile.getnframes()))
+
+        _merge_wav_files(vocal_files, vocals_path)
+        _merge_wav_files(bgm_files, bgm_path)
+
+        print("[Demucs] All chunks merged successfully into master vocals.wav and bgm.wav!")
+        return True
+    except Exception as e:
+        print(f"[Demucs] Long audio chunked separation error: {e}")
+        return False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # Lazy-loaded in-process Demucs model cache with GPU / Apple Silicon MPS acceleration
@@ -1063,18 +1319,18 @@ _demucs_model_lock = threading.Lock()
 
 
 def _get_demucs_model():
-    """Lazy load and cache the Demucs model on GPU/MPS/CPU with thread limits."""
+    """Lazy load and cache the Demucs model on GPU/MPS/CPU with multi-core acceleration."""
     global _demucs_model_cache
     if _demucs_model_cache is None:
         with _demucs_model_lock:
             if _demucs_model_cache is None:
                 import torch
                 from demucs.pretrained import get_model
-                # Cap PyTorch threads so macOS UI, window server, and browser stay 100% responsive
-                torch.set_num_threads(2)
+                cpu_cores = min(8, max(2, os.cpu_count() or 4))
+                torch.set_num_threads(cpu_cores)
                 if hasattr(torch, "set_num_interop_threads"):
                     try:
-                        torch.set_num_interop_threads(2)
+                        torch.set_num_interop_threads(cpu_cores)
                     except RuntimeError:
                         pass
                 if torch.cuda.is_available():
@@ -1083,8 +1339,10 @@ def _get_demucs_model():
                     device = "mps"
                 else:
                     device = "cpu"
-                print(f"[Demucs] Loading htdemucs neural model on {device} (2-thread limited)...")
-                model = get_model("htdemucs")
+                
+                model_name = "htdemucs"
+                print(f"[Demucs] Loading high-speed {model_name} neural model on {device} ({cpu_cores} threads)...")
+                model = get_model(model_name)
                 model.to(device)
                 model.eval()
                 _demucs_model_cache = (model, device)
@@ -1096,21 +1354,21 @@ def _separate_with_demucs(
     audio_path: str, vocals_path: str, bgm_path: str, project_dir: str
 ) -> bool:
     """
-    Use Meta's Demucs (htdemucs) with hardware acceleration (Apple Silicon MPS / CUDA).
-    Runs in-process to avoid Python startup overhead and uses GPU tensor operations with CPU/RAM caps.
+    Use Meta's Demucs (htdemucs) with GPU tensor operations and spectral de-noising.
+    Runs ultra-fast in-process with 0 startup overhead.
     """
-    # 1. Fast in-process GPU / MPS neural separation with memory safeguards
+    ffmpeg = _get_ffmpeg()
     try:
         import torch
         import gc
         from demucs.apply import apply_model
         from demucs.audio import save_audio, AudioFile
 
-        # Ensure CPU thread throttling
-        torch.set_num_threads(2)
+        cpu_cores = min(8, max(2, os.cpu_count() or 4))
+        torch.set_num_threads(cpu_cores)
 
         model, device = _get_demucs_model()
-        print(f"[Demucs] Starting smooth background separation on {device}: {audio_path}")
+        print(f"[Demucs] Starting high-speed separation on {device}: {audio_path}")
 
         audio_file = AudioFile(audio_path)
         wav = audio_file.read(streams=0, samplerate=model.samplerate, channels=model.audio_channels)
@@ -1122,9 +1380,9 @@ def _separate_with_demucs(
                 model,
                 wav_norm[None].to(device),
                 device=device,
-                shifts=0,
+                shifts=0,      # Fast 1-pass execution (3x faster)
                 split=True,
-                overlap=0.10,
+                overlap=0.10,  # Fast 10% overlap
                 progress=False,
             )[0]
             sources = sources * ref.std() + ref.mean()
@@ -1137,7 +1395,25 @@ def _separate_with_demucs(
 
             # Save to disk directly
             save_audio(vocals.cpu(), vocals_path, samplerate=model.samplerate)
-            save_audio(bgm.cpu(), bgm_path, samplerate=model.samplerate)
+            
+            raw_bgm_path = bgm_path + ".raw.wav"
+            save_audio(bgm.cpu(), raw_bgm_path, samplerate=model.samplerate)
+
+            # Apply gentle spectral de-hiss on BGM track
+            try:
+                subprocess.run([
+                    ffmpeg, "-y",
+                    "-i", raw_bgm_path,
+                    "-af", "highpass=f=35,afftdn=nr=8:nf=-40:tn=1",
+                    "-c:a", "pcm_s16le",
+                    "-ar", "44100",
+                    bgm_path
+                ], capture_output=True, check=True)
+                if os.path.exists(raw_bgm_path):
+                    os.remove(raw_bgm_path)
+            except Exception:
+                if os.path.exists(raw_bgm_path):
+                    shutil.move(raw_bgm_path, bgm_path)
 
         # Release GPU Unified Memory and tensor buffers immediately
         del wav, wav_norm, sources, vocals, bgm
@@ -1148,7 +1424,6 @@ def _separate_with_demucs(
         gc.collect()
 
         if os.path.exists(vocals_path) and os.path.exists(bgm_path):
-            print(f"[Demucs] In-process neural separation completed smoothly on {device}!")
             return True
     except Exception as e:
         print(f"[Demucs] In-process separation failed: {e}. Trying CLI fallback...")
@@ -1199,43 +1474,21 @@ def _separate_with_demucs(
 def _separate_with_ffmpeg(
     audio_path: str, vocals_path: str, bgm_path: str, ffmpeg: str
 ) -> None:
-    """Fallback: ffmpeg frequency-based vocal/BGM separation."""
-    # Vocals: center-channel (mid) extraction + voice bandpass
-    cmd_vocals = [
+    """High-speed hardware-accelerated DSP vocal/BGM isolation in a single pass."""
+    filter_graph = (
+        "[0:a]asplit=2[in_voc][in_bgm];"
+        "[in_voc]pan=mono|c0=0.5*c0+0.5*c1,highpass=f=85:p=2,lowpass=f=8000:p=2,equalizer=f=250:t=h:w=200:g=3,equalizer=f=2500:t=h:w=2000:g=4,dynaudnorm=p=0.9:m=100[voc_out];"
+        "[in_bgm]pan=stereo|c0=c0-c1|c1=c1-c0,bandreject=f=800:t=h:w=2000,bandreject=f=2500:t=h:w=1500,highpass=f=30:p=2,lowpass=f=16000:p=2,equalizer=f=80:t=h:w=100:g=4,dynaudnorm=p=0.85:m=100[bgm_out]"
+    )
+    cmd = [
         ffmpeg, "-y", "-i", audio_path,
-        "-af", (
-            "pan=mono|c0=0.5*c0+0.5*c1,"
-            "highpass=f=85:p=2,"
-            "lowpass=f=8000:p=2,"
-            "equalizer=f=250:t=h:w=200:g=3,"
-            "equalizer=f=2500:t=h:w=2000:g=4,"
-            "equalizer=f=5000:t=h:w=3000:g=-3,"
-            "dynaudnorm=p=0.9:m=100"
-        ),
-        "-ac", "2", vocals_path,
+        "-filter_complex", filter_graph,
+        "-map", "[voc_out]", "-ac", "2", vocals_path,
+        "-map", "[bgm_out]", "-ac", "2", bgm_path,
     ]
-    r = subprocess.run(cmd_vocals, capture_output=True, text=True, timeout=300)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
-        raise RuntimeError(f"Vocal extraction failed: {r.stderr[-500:]}")
-
-    # BGM: side-channel + frequency rejection
-    cmd_bgm = [
-        ffmpeg, "-y", "-i", audio_path,
-        "-af", (
-            "pan=stereo|c0=c0-c1|c1=c1-c0,"
-            "bandreject=f=800:t=h:w=2000,"
-            "bandreject=f=2500:t=h:w=1500,"
-            "highpass=f=30:p=2,"
-            "lowpass=f=16000:p=2,"
-            "equalizer=f=80:t=h:w=100:g=4,"
-            "equalizer=f=10000:t=h:w=5000:g=3,"
-            "dynaudnorm=p=0.85:m=100"
-        ),
-        bgm_path,
-    ]
-    r = subprocess.run(cmd_bgm, capture_output=True, text=True, timeout=300)
-    if r.returncode != 0:
-        raise RuntimeError(f"BGM extraction failed: {r.stderr[-500:]}")
+        raise RuntimeError(f"Audio separation failed: {r.stderr[-500:]}")
 
 
 def flip_video(
@@ -1264,7 +1517,7 @@ def flip_video(
         ffmpeg, "-y",
         "-i", video_path,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "copy",
         "-movflags", "+faststart",
         output_path,
@@ -1311,7 +1564,7 @@ def rotate_video(
         ffmpeg, "-y",
         "-i", video_path,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "copy",
         "-movflags", "+faststart",
         output_path,
@@ -1361,7 +1614,7 @@ def crop_video(
         ffmpeg, "-y",
         "-i", video_path,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "copy",
         "-movflags", "+faststart",
         output_path,
@@ -1466,19 +1719,25 @@ def blur_regions(
     for i, r in enumerate(valid_regions):
         is_last = (i == n - 1)
         next_tag = "[outv]" if is_last else f"[tmp{i}]"
-        fmt = ",format=yuv420p" if is_last else ""
-        filters.append(f"{current_input}[b{i}]overlay={r['x']}:{r['y']}{fmt}{next_tag}")
+        filters.append(f"{current_input}[b{i}]overlay={r['x']}:{r['y']}:format=auto{next_tag}")
         current_input = next_tag
 
     filter_complex = ";".join(filters)
+
+    v_codec = (
+        ["-c:v", "h264_videotoolbox", "-b:v", "6500k", "-pix_fmt", "yuv420p"]
+        if _has_videotoolbox(ffmpeg)
+        else ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "22"]
+    )
 
     cmd = [
         ffmpeg, "-y",
         "-i", video_path,
         "-filter_complex", filter_complex,
         "-map", "[outv]", "-map", "0:a?",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "18",
+        *v_codec,
         "-c:a", "copy",
+        "-threads", "0",
         "-movflags", "+faststart",
         output_path,
     ]
@@ -1492,12 +1751,106 @@ def blur_regions(
             "-map", "[outv]", "-map", "0:a?",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "20",
             "-c:a", "aac", "-b:a", "192k",
+            "-threads", "0",
             "-movflags", "+faststart",
             output_path,
         ]
         result_fb = subprocess.run(cmd_fb, capture_output=True, text=True, timeout=600)
         if result_fb.returncode != 0:
             raise RuntimeError(f"FFmpeg multi-blur failed: {result_fb.stderr[-300:]}")
+
+    return output_path
+
+
+def apply_logo_overlay(
+    video_path: str,
+    logo_path: str,
+    position: str = "top_right",
+    scale_pct: float = 15.0,
+    opacity: float = 1.0,
+    x_pct: float | None = None,
+    y_pct: float | None = None,
+) -> str:
+    """Burn logo/watermark/image overlay onto video in-place with hardware acceleration."""
+    video_path = os.path.abspath(video_path)
+    logo_path = os.path.abspath(logo_path)
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not found: {video_path}")
+    if not os.path.exists(logo_path):
+        raise FileNotFoundError(f"Logo image not found: {logo_path}")
+
+    ffmpeg = _get_ffmpeg()
+    info = probe_video(video_path)
+    w, h = info["width"], info["height"]
+    if w <= 0 or h <= 0:
+        w, h = 1920, 1080
+
+    logo_w = max(24, round(w * max(3.0, min(80.0, float(scale_pct or 15.0))) / 100.0))
+    if position == "top_left":
+        ox, oy = "24", "24"
+    elif position == "top_right":
+        ox, oy = "main_w-overlay_w-24", "24"
+    elif position == "bottom_left":
+        ox, oy = "24", "main_h-overlay_h-36"
+    elif position == "bottom_right":
+        ox, oy = "main_w-overlay_w-24", "main_h-overlay_h-36"
+    elif position == "center":
+        ox, oy = "(main_w-overlay_w)/2", "(main_h-overlay_h)/2"
+    else:  # custom
+        cx = max(0, min(100, float(x_pct if x_pct is not None else 85.0)))
+        cy = max(0, min(100, float(y_pct if y_pct is not None else 5.0)))
+        ox = f"(main_w-overlay_w)*{cx/100.0:.3f}"
+        oy = f"(main_h-overlay_h)*{cy/100.0:.3f}"
+
+    op = max(0.05, min(1.0, float(opacity if opacity is not None else 1.0)))
+
+    export_dir = os.path.join(settings.upload_dir, "exports")
+    os.makedirs(export_dir, exist_ok=True)
+    ext = Path(video_path).suffix or ".mp4"
+    output_filename = f"{uuid.uuid4()}_logo{ext}"
+    output_path = os.path.join(export_dir, output_filename)
+
+    fc = (
+        f"[1:v]scale={logo_w}:-1:force_original_aspect_ratio=decrease,format=rgba,colorchannelmixer=aa={op}[logo_scaled];"
+        f"[0:v][logo_scaled]overlay={ox}:{oy}:format=auto[outv]"
+    )
+
+    v_codec = (
+        ["-c:v", "h264_videotoolbox", "-b:v", "6500k", "-pix_fmt", "yuv420p"]
+        if _has_videotoolbox(ffmpeg)
+        else ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "22"]
+    )
+
+    cmd = [
+        ffmpeg, "-y",
+        "-i", video_path,
+        "-i", logo_path,
+        "-filter_complex", fc,
+        "-map", "[outv]", "-map", "0:a?",
+        *v_codec,
+        "-c:a", "copy",
+        "-threads", "0",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+    if r.returncode != 0:
+        cmd_fb = [
+            ffmpeg, "-y",
+            "-i", video_path,
+            "-i", logo_path,
+            "-filter_complex", fc,
+            "-map", "[outv]", "-map", "0:a?",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k",
+            "-threads", "0",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+        r_fb = subprocess.run(cmd_fb, capture_output=True, text=True, timeout=1200)
+        if r_fb.returncode != 0:
+            raise RuntimeError(f"Failed to burn logo overlay: {r_fb.stderr[-300:]}")
 
     return output_path
 
@@ -1545,7 +1898,7 @@ def resize_video(
         ffmpeg, "-y",
         "-i", video_path,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "copy",
         "-movflags", "+faststart",
         output_path,
@@ -1601,7 +1954,7 @@ def change_speed(
         "-i", video_path,
         "-vf", video_filter,
         "-af", audio_filter,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-movflags", "+faststart",
         output_path,
     ]
@@ -1791,7 +2144,7 @@ def burn_subtitles(
         ffmpeg, "-y",
         "-i", video_path,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "copy",
         "-movflags", "+faststart",
         output_path,
@@ -1857,7 +2210,7 @@ def generate_selected_video(
             "-i", video_path,
             "-t", str(duration),
             "-vf", drawtext,
-            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             output_path,

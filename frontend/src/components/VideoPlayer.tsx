@@ -27,10 +27,12 @@ import {
   Loader2,
   Plus,
   Trash2,
+  Image as ImageIcon,
 } from 'lucide-react';
 import { blurVideoRegion, blurVideoRegions } from '../api/client';
 import { buildClipLayout, sourceToTimeline, timelineToSource, totalTimelineDuration, findClipAtTimelineTime, sourceRangeToTimeline } from '../utils/clipTimemap';
 import SubtitleOverlay from './SubtitleOverlay';
+import LogoOverlayModal from './LogoOverlayModal';
 
 interface Props {
   videoRef: RefObject<HTMLVideoElement | null>;
@@ -208,6 +210,7 @@ export default function VideoPlayer({ videoRef }: Props) {
     borderRadius: number;
   }>>(defaultBlurShapes);
   const [activeBlurShapeId, setActiveBlurShapeId] = useState<string>('blur-1');
+  const [showLogoTools, setShowLogoTools] = useState(false);
 
   // Load project-specific blur shapes when switching projects
   useEffect(() => {
@@ -237,10 +240,26 @@ export default function VideoPlayer({ videoRef }: Props) {
     }
   };
 
+  // Close dropdowns on click outside
+  useEffect(() => {
+    const handleOutsideClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest('[data-dropdown-container]')) {
+        setShowRatioDropdown(false);
+        setShowFilterDropdown(false);
+        setShowBlurDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, []);
+
   const activeBlurShape = blurShapes.find((s) => s.id === activeBlurShapeId) || blurShapes[0] || null;
 
   const updateActiveBlurShape = (updates: Partial<typeof blurShapes[0]>) => {
-    const updated = blurShapes.map((s) => (s.id === activeBlurShapeId ? { ...s, ...updates } : s));
+    if (!activeBlurShape) return;
+    const targetId = activeBlurShape.id;
+    const updated = blurShapes.map((s) => (s.id === targetId ? { ...s, ...updates } : s));
     saveBlurShapes(updated);
   };
 
@@ -250,8 +269,8 @@ export default function VideoPlayer({ videoRef }: Props) {
       id: newId,
       name: `Blur Box ${blurShapes.length + 1}`,
       enabled: true,
-      x: 10,
-      y: 10,
+      x: 15,
+      y: 15,
       width: 35,
       height: 14,
       blurRadius: 24,
@@ -265,10 +284,13 @@ export default function VideoPlayer({ videoRef }: Props) {
 
   const handleDeleteBlurShape = (id: string) => {
     const filtered = blurShapes.filter((s) => s.id !== id);
-    const updated = filtered.length === 0 ? defaultBlurShapes : filtered;
-    saveBlurShapes(updated);
-    if (activeBlurShapeId === id) {
-      setActiveBlurShapeId(updated[0].id);
+    saveBlurShapes(filtered);
+    if (filtered.length > 0) {
+      if (activeBlurShapeId === id) {
+        setActiveBlurShapeId(filtered[0].id);
+      }
+    } else {
+      setActiveBlurShapeId('');
     }
   };
 
@@ -716,27 +738,28 @@ export default function VideoPlayer({ videoRef }: Props) {
   return (
     <div
       ref={containerRef}
-      className="flex flex-col bg-zinc-950 border-b border-zinc-800 overflow-hidden select-none relative group/player h-full"
+      className="flex flex-col bg-zinc-950 border-b border-zinc-800 select-none relative group/player h-full"
     >
       {/* Top Viewport Header Toolbar */}
-      <div className="px-3 py-1.5 bg-zinc-900/90 border-b border-zinc-800/80 flex items-center justify-between shrink-0 text-xs text-zinc-300 z-10">
-        {/* Aspect Ratio Switcher */}
-        <div className="relative">
+      <div className="h-10 px-3 bg-[#121316] border-b border-[#1c1e24] flex items-center justify-between shrink-0 text-xs text-zinc-300 z-30 gap-2 overflow-visible relative">
+        {/* Left: Aspect Ratio Switcher */}
+        <div className="relative shrink-0" data-dropdown-container>
           <button
             onClick={() => {
               setShowRatioDropdown(!showRatioDropdown);
               setShowFilterDropdown(false);
               setShowSpeedDropdown(false);
+              setShowBlurDropdown(false);
             }}
-            className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 transition-colors text-[11px] font-semibold"
+            className="h-7 flex items-center gap-1.5 px-2.5 rounded-lg bg-[#181a20] hover:bg-[#22252e] text-zinc-200 hover:text-white border border-[#262933] hover:border-[#3b4050] transition-all text-[11px] font-semibold shadow-xs cursor-pointer"
           >
-            <Ratio className="w-3.5 h-3.5 text-pink-400" />
-            <span>{selectedRatio}</span>
-            <ChevronDown className="w-3 h-3 text-zinc-400" />
+            <Ratio className="w-3.5 h-3.5 text-pink-400 shrink-0" />
+            <span className="font-mono">{selectedRatio}</span>
+            <ChevronDown className="w-3 h-3 text-zinc-500 shrink-0" />
           </button>
 
           {showRatioDropdown && (
-            <div className="absolute left-0 top-full mt-1 w-44 bg-zinc-900 border border-zinc-800 rounded-xl shadow-xl py-1 z-50">
+            <div className="absolute left-0 top-full mt-1.5 w-48 bg-[#181a20] border border-[#2a2e3b] rounded-xl shadow-2xl py-1 z-50 backdrop-blur-md">
               {ASPECT_RATIOS.map((r) => (
                 <button
                   key={r.id}
@@ -744,7 +767,7 @@ export default function VideoPlayer({ videoRef }: Props) {
                     setAspectRatio(r.id);
                     setShowRatioDropdown(false);
                   }}
-                  className={`w-full px-3 py-1.5 text-left text-xs flex items-center justify-between hover:bg-zinc-800 transition-colors ${
+                  className={`w-full px-3 py-1.5 text-left text-xs flex items-center justify-between hover:bg-white/5 transition-colors cursor-pointer ${
                     selectedRatio === r.id ? 'text-pink-400 font-semibold bg-pink-500/10' : 'text-zinc-300'
                   }`}
                 >
@@ -756,27 +779,30 @@ export default function VideoPlayer({ videoRef }: Props) {
           )}
         </div>
 
-        {/* Right Tools: Zoom, Filter, Fullscreen */}
-        <div className="flex items-center gap-1.5">
+        {/* Right Tools: Filter, Blur, Logo, Fullscreen */}
+        <div className="flex items-center gap-1.5 shrink-0 flex-nowrap overflow-visible">
           {/* Visual Filters Dropdown */}
-          <div className="relative">
+          <div className="relative shrink-0" data-dropdown-container>
             <button
               onClick={() => {
                 setShowFilterDropdown(!showFilterDropdown);
                 setShowRatioDropdown(false);
                 setShowSpeedDropdown(false);
+                setShowBlurDropdown(false);
               }}
-              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] transition-colors ${
-                activeFilter !== 'none' ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40' : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300'
+              className={`h-7 flex items-center gap-1.5 px-2.5 rounded-lg text-[11px] font-medium transition-all cursor-pointer ${
+                activeFilter !== 'none'
+                  ? 'bg-purple-600/20 text-purple-200 border border-purple-500/50 shadow-xs'
+                  : 'bg-[#181a20] hover:bg-[#22252e] text-zinc-300 hover:text-white border border-[#262933] hover:border-[#3b4050]'
               }`}
               title="Visual Color Filters & LUTs"
             >
-              <Sparkles className="w-3 h-3 text-purple-400" />
+              <Sparkles className="w-3.5 h-3.5 text-purple-400 shrink-0" />
               <span>{FILTER_PRESETS.find((f) => f.id === activeFilter)?.name || 'Filter'}</span>
             </button>
 
             {showFilterDropdown && (
-              <div className="absolute right-0 top-full mt-1 w-44 bg-zinc-900 border border-zinc-800 rounded-xl shadow-xl py-1 z-50">
+              <div className="absolute right-0 top-full mt-1.5 w-44 bg-[#181a20] border border-[#2a2e3b] rounded-xl shadow-2xl py-1 z-50 backdrop-blur-md">
                 {FILTER_PRESETS.map((f) => (
                   <button
                     key={f.id}
@@ -784,7 +810,7 @@ export default function VideoPlayer({ videoRef }: Props) {
                       setActiveFilter(f.id);
                       setShowFilterDropdown(false);
                     }}
-                    className={`w-full px-3 py-1.5 text-left text-xs flex items-center justify-between hover:bg-zinc-800 transition-colors ${
+                    className={`w-full px-3 py-1.5 text-left text-xs flex items-center justify-between hover:bg-white/5 transition-colors cursor-pointer ${
                       activeFilter === f.id ? 'text-purple-400 font-semibold bg-purple-500/10' : 'text-zinc-300'
                     }`}
                   >
@@ -796,7 +822,7 @@ export default function VideoPlayer({ videoRef }: Props) {
           </div>
 
           {/* Blur Shape / Text Mask Dropdown */}
-          <div className="relative">
+          <div className="relative shrink-0" data-dropdown-container>
             <button
               onClick={() => {
                 setShowBlurDropdown(!showBlurDropdown);
@@ -805,19 +831,19 @@ export default function VideoPlayer({ videoRef }: Props) {
                 setShowCanvasZoomDropdown(false);
                 setShowSpeedDropdown(false);
               }}
-              className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] transition-colors ${
+              className={`h-7 flex items-center gap-1.5 px-2.5 rounded-lg text-[11px] font-medium transition-all cursor-pointer ${
                 blurShapes.some((s) => s.enabled)
-                  ? 'bg-pink-600 text-white shadow-md shadow-pink-950/40 font-semibold'
-                  : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300'
+                  ? 'bg-pink-600/20 text-pink-200 border border-pink-500/50 shadow-xs'
+                  : 'bg-[#181a20] hover:bg-[#22252e] text-zinc-300 hover:text-white border border-[#262933] hover:border-[#3b4050]'
               }`}
               title="Blur multiple logos, watermarks, or subtitles on original video"
             >
-              <Eraser className="w-3 h-3 text-pink-300" />
-              <span>Blur Shapes ({blurShapes.filter((s) => s.enabled).length})</span>
+              <Eraser className="w-3.5 h-3.5 text-pink-400 shrink-0" />
+              <span>Blur ({blurShapes.filter((s) => s.enabled).length})</span>
             </button>
 
             {showBlurDropdown && (
-              <div className="absolute right-0 top-full mt-1 w-80 bg-zinc-900/98 border border-zinc-800 rounded-xl shadow-2xl p-3 z-50 backdrop-blur-md space-y-3">
+              <div className="absolute right-0 top-full mt-1.5 w-80 bg-[#181a20] border border-[#2a2e3b] rounded-xl shadow-2xl p-3 z-50 backdrop-blur-md space-y-3">
                 {/* Header & Add Shape */}
                 <div className="flex items-center justify-between border-b border-zinc-800 pb-2">
                   <div className="flex items-center gap-1.5 font-bold text-xs text-white">
@@ -836,54 +862,63 @@ export default function VideoPlayer({ videoRef }: Props) {
 
                 {/* Shape List / Tabs */}
                 <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
-                  {blurShapes.map((shape, idx) => {
-                    const isActive = shape.id === activeBlurShapeId;
-                    return (
-                      <div
-                        key={shape.id}
-                        onClick={() => setActiveBlurShapeId(shape.id)}
-                        className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs cursor-pointer transition-all border ${
-                          isActive
-                            ? 'bg-pink-950/40 border-pink-500/50 text-white font-semibold shadow-xs'
-                            : 'bg-zinc-800/60 hover:bg-zinc-800 border-zinc-700/50 text-zinc-300'
-                        }`}
+                  {blurShapes.length === 0 ? (
+                    <div className="py-3 px-2 text-center text-zinc-500 text-xs flex flex-col items-center gap-2">
+                      <p>No blur shapes added yet.</p>
+                      <button
+                        onClick={handleAddBlurShape}
+                        className="px-3 py-1 rounded bg-pink-600 hover:bg-pink-500 text-white font-bold text-[11px] flex items-center gap-1"
                       >
-                        <div className="flex items-center gap-2 truncate">
-                          <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: shape.enabled ? '#ec4899' : '#71717a' }} />
-                          <span className="truncate">{shape.name}</span>
-                        </div>
+                        <Plus className="w-3 h-3" /> Add Blur Shape
+                      </button>
+                    </div>
+                  ) : (
+                    blurShapes.map((shape) => {
+                      const isActive = shape.id === activeBlurShapeId;
+                      return (
+                        <div
+                          key={shape.id}
+                          onClick={() => setActiveBlurShapeId(shape.id)}
+                          className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs cursor-pointer transition-all border ${
+                            isActive
+                              ? 'bg-pink-950/40 border-pink-500/50 text-white font-semibold shadow-xs'
+                              : 'bg-zinc-800/60 hover:bg-zinc-800 border-zinc-700/50 text-zinc-300'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2 truncate">
+                            <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: shape.enabled ? '#ec4899' : '#71717a' }} />
+                            <span className="truncate">{shape.name}</span>
+                          </div>
 
-                        <div className="flex items-center gap-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
-                          {/* Toggle ON/OFF */}
-                          <button
-                            onClick={() => {
-                              setBlurShapes((prev) =>
-                                prev.map((s) => (s.id === shape.id ? { ...s, enabled: !s.enabled } : s))
-                              );
-                            }}
-                            className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${
-                              shape.enabled
-                                ? 'bg-pink-600 text-white'
-                                : 'bg-zinc-700 text-zinc-400 hover:text-zinc-200'
-                            }`}
-                          >
-                            {shape.enabled ? 'ON' : 'OFF'}
-                          </button>
+                          <div className="flex items-center gap-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                            {/* Toggle ON/OFF */}
+                            <button
+                              onClick={() => {
+                                const updated = blurShapes.map((s) => (s.id === shape.id ? { ...s, enabled: !s.enabled } : s));
+                                saveBlurShapes(updated);
+                              }}
+                              className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${
+                                shape.enabled
+                                  ? 'bg-pink-600 text-white'
+                                  : 'bg-zinc-700 text-zinc-400 hover:text-zinc-200'
+                              }`}
+                            >
+                              {shape.enabled ? 'ON' : 'OFF'}
+                            </button>
 
-                          {/* Delete Shape */}
-                          {blurShapes.length > 1 && (
+                            {/* Delete Shape */}
                             <button
                               onClick={() => handleDeleteBlurShape(shape.id)}
                               className="p-1 text-zinc-500 hover:text-red-400 transition-colors"
-                              title="Delete shape"
+                              title={`Delete ${shape.name}`}
                             >
                               <Trash2 className="w-3 h-3" />
                             </button>
-                          )}
+                          </div>
                         </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })
+                  )}
                 </div>
 
                 {/* Active Shape Settings */}
@@ -1063,20 +1098,15 @@ export default function VideoPlayer({ videoRef }: Props) {
                       </div>
                     </div>
 
-                    {/* Corner Roundness */}
-                    <div className="space-y-1">
-                      <div className="flex items-center justify-between text-[11px]">
-                        <span className="text-zinc-400">Corner Radius</span>
-                        <span className="text-pink-400 font-mono font-bold">{activeBlurShape.borderRadius}px</span>
-                      </div>
-                      <input
-                        type="range"
-                        min={0}
-                        max={32}
-                        value={activeBlurShape.borderRadius}
-                        onChange={(e) => updateActiveBlurShape({ borderRadius: Number(e.target.value) })}
-                        className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
-                      />
+                    {/* Delete Active Shape Button */}
+                    <div className="pt-1.5">
+                      <button
+                        onClick={() => handleDeleteBlurShape(activeBlurShape.id)}
+                        className="w-full py-1.5 px-3 rounded-lg bg-red-950/40 hover:bg-red-900/60 border border-red-800/40 text-red-300 hover:text-red-100 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Delete {activeBlurShape.name}</span>
+                      </button>
                     </div>
                   </div>
                 )}
@@ -1107,10 +1137,20 @@ export default function VideoPlayer({ videoRef }: Props) {
             )}
           </div>
 
+          {/* Logo / Image Overlay Button */}
+          <button
+            onClick={() => setShowLogoTools(true)}
+            className="h-7 flex items-center gap-1.5 px-2.5 rounded-lg text-[11px] font-medium bg-[#181a20] hover:bg-[#22252e] text-zinc-300 hover:text-white border border-[#262933] hover:border-[#3b4050] transition-all cursor-pointer shrink-0"
+            title="Add Image or Brand Logo Watermark Overlay"
+          >
+            <ImageIcon className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+            <span>Logo</span>
+          </button>
+
           {/* Fullscreen */}
           <button
             onClick={toggleFullscreen}
-            className="p-1 rounded-md hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200"
+            className="h-7 w-7 rounded-lg bg-[#181a20] hover:bg-[#22252e] text-zinc-400 hover:text-white border border-[#262933] hover:border-[#3b4050] flex items-center justify-center transition-all cursor-pointer shrink-0"
             title="Fullscreen"
           >
             {isFullscreen ? <Minimize className="w-3.5 h-3.5" /> : <Maximize className="w-3.5 h-3.5" />}
@@ -1205,10 +1245,10 @@ export default function VideoPlayer({ videoRef }: Props) {
                     e.stopPropagation();
                     setActiveBlurShapeId(shape.id);
                   }}
-                  className={`absolute z-20 group/blur cursor-move transition-shadow ${
+                  className={`absolute z-20 group/blur cursor-move transition-shadow select-none ${
                     isSelected
-                      ? 'ring-2 ring-pink-500 shadow-xl shadow-pink-500/20'
-                      : 'border border-dashed border-white/40 hover:border-pink-400/80'
+                      ? 'ring-2 ring-pink-500 shadow-xl shadow-pink-500/30'
+                      : 'border border-dashed border-white/50 hover:border-pink-400/90'
                   }`}
                   style={{
                     left: `${shape.x}%`,
@@ -1219,91 +1259,259 @@ export default function VideoPlayer({ videoRef }: Props) {
                     backdropFilter: `blur(${shape.blurRadius}px)`,
                     WebkitBackdropFilter: `blur(${shape.blurRadius}px)`,
                     backgroundColor: `rgba(0, 0, 0, ${shape.opacity * 0.7})`,
-                    userSelect: 'none',
+                    touchAction: 'none',
                   }}
                   onMouseDown={(e) => {
+                    // Only initiate drag if clicking the box body, not resize handles
+                    if ((e.target as HTMLElement).dataset.resizeHandle) return;
+                    e.stopPropagation();
                     e.preventDefault();
                     setActiveBlurShapeId(shape.id);
                     const container = e.currentTarget.parentElement;
                     if (!container) return;
                     const rect = container.getBoundingClientRect();
-                    blurDragRef.current = {
-                      id: shape.id,
-                      startX: e.clientX,
-                      startY: e.clientY,
-                      origX: shape.x,
-                      origY: shape.y,
-                    };
+                    const startX = e.clientX;
+                    const startY = e.clientY;
+                    const origX = shape.x;
+                    const origY = shape.y;
+                    let lastX = origX;
+                    let lastY = origY;
+
                     const onMove = (me: MouseEvent) => {
-                      if (!blurDragRef.current || blurDragRef.current.id !== shape.id) return;
-                      const dx = ((me.clientX - blurDragRef.current.startX) / rect.width) * 100;
-                      const dy = ((me.clientY - blurDragRef.current.startY) / rect.height) * 100;
+                      const dx = ((me.clientX - startX) / rect.width) * 100;
+                      const dy = ((me.clientY - startY) / rect.height) * 100;
+                      lastX = Math.max(0, Math.min(100 - shape.width, origX + dx));
+                      lastY = Math.max(0, Math.min(100 - shape.height, origY + dy));
+
                       setBlurShapes((prev) =>
                         prev.map((s) =>
                           s.id === shape.id
                             ? {
                                 ...s,
-                                x: Math.max(0, Math.min(100 - s.width, blurDragRef.current!.origX + dx)),
-                                y: Math.max(0, Math.min(100 - s.height, blurDragRef.current!.origY + dy)),
+                                x: Math.round(lastX * 10) / 10,
+                                y: Math.round(lastY * 10) / 10,
                               }
                             : s
                         )
                       );
                     };
+
                     const onUp = () => {
-                      blurDragRef.current = null;
                       window.removeEventListener('mousemove', onMove);
                       window.removeEventListener('mouseup', onUp);
+                      setBlurShapes((prev) => {
+                        const finalUpdated = prev.map((s) =>
+                          s.id === shape.id
+                            ? {
+                                ...s,
+                                x: Math.round(lastX * 10) / 10,
+                                y: Math.round(lastY * 10) / 10,
+                              }
+                            : s
+                        );
+                        saveBlurShapes(finalUpdated);
+                        return finalUpdated;
+                      });
                     };
+
                     window.addEventListener('mousemove', onMove);
                     window.addEventListener('mouseup', onUp);
                   }}
                 >
-                  {/* Drag hint badge */}
-                  <div className="absolute top-1 left-2 px-1.5 py-0.5 rounded bg-black/80 text-[9px] text-zinc-200 font-mono opacity-0 group-hover/blur:opacity-100 transition-opacity pointer-events-none flex items-center gap-1 shadow">
-                    <Eraser className="w-2.5 h-2.5 text-pink-400" />
-                    <span>{shape.name} · Drag to move</span>
+                  {/* Drag hint badge + Quick Delete */}
+                  <div
+                    className={`absolute -top-6 left-0 px-2 py-0.5 rounded bg-black/90 text-[10px] text-zinc-200 font-mono flex items-center gap-1.5 shadow-lg z-30 transition-opacity ${
+                      isSelected ? 'opacity-100' : 'opacity-0 group-hover/blur:opacity-100'
+                    }`}
+                  >
+                    <Eraser className="w-3 h-3 text-pink-400" />
+                    <span>{shape.name}</span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        handleDeleteBlurShape(shape.id);
+                      }}
+                      className="ml-1 p-0.5 text-zinc-400 hover:text-red-400 rounded transition-colors cursor-pointer"
+                      title="Delete this blur box"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
                   </div>
 
-                  {/* Corner resize handle */}
-                  <div
-                    className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize flex items-center justify-center opacity-0 group-hover/blur:opacity-100 transition-opacity z-10"
-                    onMouseDown={(e) => {
-                      e.stopPropagation();
-                      e.preventDefault();
-                      setActiveBlurShapeId(shape.id);
-                      const container = e.currentTarget.parentElement?.parentElement;
-                      if (!container) return;
-                      const rect = container.getBoundingClientRect();
-                      const startX = e.clientX;
-                      const startY = e.clientY;
-                      const origW = shape.width;
-                      const origH = shape.height;
-                      const onResizeMove = (me: MouseEvent) => {
-                        const dw = ((me.clientX - startX) / rect.width) * 100;
-                        const dh = ((me.clientY - startY) / rect.height) * 100;
-                        setBlurShapes((prev) =>
-                          prev.map((s) =>
-                            s.id === shape.id
-                              ? {
-                                  ...s,
-                                  width: Math.max(4, Math.min(100 - s.x, origW + dw)),
-                                  height: Math.max(3, Math.min(100 - s.y, origH + dh)),
-                                }
-                              : s
-                          )
-                        );
-                      };
-                      const onResizeUp = () => {
-                        window.removeEventListener('mousemove', onResizeMove);
-                        window.removeEventListener('mouseup', onResizeUp);
-                      };
-                      window.addEventListener('mousemove', onResizeMove);
-                      window.addEventListener('mouseup', onResizeUp);
-                    }}
-                  >
-                    <div className="w-2.5 h-2.5 bg-pink-500 rounded-sm border border-white shadow-md" />
-                  </div>
+                  {/* Corner & Edge Resize Handles (Active / Hover) */}
+                  {isSelected && (
+                    <>
+                      {/* Bottom-Right Corner Handle */}
+                      <div
+                        data-resize-handle="se"
+                        className="absolute -bottom-1.5 -right-1.5 w-4 h-4 cursor-se-resize flex items-center justify-center z-30"
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          const container = (e.currentTarget.parentElement?.parentElement as HTMLElement) || null;
+                          if (!container) return;
+                          const rect = container.getBoundingClientRect();
+                          const startX = e.clientX;
+                          const startY = e.clientY;
+                          const origW = shape.width;
+                          const origH = shape.height;
+                          let lastW = origW;
+                          let lastH = origH;
+
+                          const onResizeMove = (me: MouseEvent) => {
+                            const dw = ((me.clientX - startX) / rect.width) * 100;
+                            const dh = ((me.clientY - startY) / rect.height) * 100;
+                            lastW = Math.max(4, Math.min(100 - shape.x, origW + dw));
+                            lastH = Math.max(2, Math.min(100 - shape.y, origH + dh));
+
+                            setBlurShapes((prev) =>
+                              prev.map((s) =>
+                                s.id === shape.id
+                                  ? {
+                                      ...s,
+                                      width: Math.round(lastW * 10) / 10,
+                                      height: Math.round(lastH * 10) / 10,
+                                    }
+                                  : s
+                              )
+                            );
+                          };
+
+                          const onResizeUp = () => {
+                            window.removeEventListener('mousemove', onResizeMove);
+                            window.removeEventListener('mouseup', onResizeUp);
+                            setBlurShapes((prev) => {
+                              const finalUpdated = prev.map((s) =>
+                                s.id === shape.id
+                                  ? {
+                                      ...s,
+                                      width: Math.round(lastW * 10) / 10,
+                                      height: Math.round(lastH * 10) / 10,
+                                    }
+                                  : s
+                              );
+                              saveBlurShapes(finalUpdated);
+                              return finalUpdated;
+                            });
+                          };
+
+                          window.addEventListener('mousemove', onResizeMove);
+                          window.addEventListener('mouseup', onResizeUp);
+                        }}
+                      >
+                        <div className="w-3 h-3 bg-pink-500 rounded-sm border border-white shadow-md hover:scale-125 transition-transform" />
+                      </div>
+
+                      {/* Bottom Edge Handle */}
+                      <div
+                        data-resize-handle="s"
+                        className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-8 h-3 cursor-s-resize flex items-center justify-center z-30"
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          const container = (e.currentTarget.parentElement?.parentElement as HTMLElement) || null;
+                          if (!container) return;
+                          const rect = container.getBoundingClientRect();
+                          const startY = e.clientY;
+                          const origH = shape.height;
+                          let lastH = origH;
+
+                          const onResizeMove = (me: MouseEvent) => {
+                            const dh = ((me.clientY - startY) / rect.height) * 100;
+                            lastH = Math.max(2, Math.min(100 - shape.y, origH + dh));
+
+                            setBlurShapes((prev) =>
+                              prev.map((s) =>
+                                s.id === shape.id
+                                  ? {
+                                      ...s,
+                                      height: Math.round(lastH * 10) / 10,
+                                    }
+                                  : s
+                              )
+                            );
+                          };
+
+                          const onResizeUp = () => {
+                            window.removeEventListener('mousemove', onResizeMove);
+                            window.removeEventListener('mouseup', onResizeUp);
+                            setBlurShapes((prev) => {
+                              const finalUpdated = prev.map((s) =>
+                                s.id === shape.id
+                                  ? {
+                                      ...s,
+                                      height: Math.round(lastH * 10) / 10,
+                                    }
+                                  : s
+                              );
+                              saveBlurShapes(finalUpdated);
+                              return finalUpdated;
+                            });
+                          };
+
+                          window.addEventListener('mousemove', onResizeMove);
+                          window.addEventListener('mouseup', onResizeUp);
+                        }}
+                      >
+                        <div className="w-6 h-1.5 bg-pink-500 rounded-full border border-white shadow-md" />
+                      </div>
+
+                      {/* Right Edge Handle */}
+                      <div
+                        data-resize-handle="e"
+                        className="absolute -right-1 top-1/2 -translate-y-1/2 w-3 h-8 cursor-e-resize flex items-center justify-center z-30"
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          const container = (e.currentTarget.parentElement?.parentElement as HTMLElement) || null;
+                          if (!container) return;
+                          const rect = container.getBoundingClientRect();
+                          const startX = e.clientX;
+                          const origW = shape.width;
+                          let lastW = origW;
+
+                          const onResizeMove = (me: MouseEvent) => {
+                            const dw = ((me.clientX - startX) / rect.width) * 100;
+                            lastW = Math.max(4, Math.min(100 - shape.x, origW + dw));
+
+                            setBlurShapes((prev) =>
+                              prev.map((s) =>
+                                s.id === shape.id
+                                  ? {
+                                      ...s,
+                                      width: Math.round(lastW * 10) / 10,
+                                    }
+                                  : s
+                              )
+                            );
+                          };
+
+                          const onResizeUp = () => {
+                            window.removeEventListener('mousemove', onResizeMove);
+                            window.removeEventListener('mouseup', onResizeUp);
+                            setBlurShapes((prev) => {
+                              const finalUpdated = prev.map((s) =>
+                                s.id === shape.id
+                                  ? {
+                                      ...s,
+                                      width: Math.round(lastW * 10) / 10,
+                                    }
+                                  : s
+                              );
+                              saveBlurShapes(finalUpdated);
+                              return finalUpdated;
+                            });
+                          };
+
+                          window.addEventListener('mousemove', onResizeMove);
+                          window.addEventListener('mouseup', onResizeUp);
+                        }}
+                      >
+                        <div className="w-1.5 h-6 bg-pink-500 rounded-full border border-white shadow-md" />
+                      </div>
+                    </>
+                  )}
                 </div>
               );
             })}
@@ -1414,136 +1622,10 @@ export default function VideoPlayer({ videoRef }: Props) {
           );
         })()}
 
-        {/* Controls Bar */}
-        <div className="flex items-center justify-between gap-2 px-2 py-1">
-          {/* Left: Time indicator */}
-          <div className="flex items-center gap-1.5 font-mono text-[11px] text-zinc-400">
-            <span className="text-pink-400 font-semibold">{formatTimecode(currentTime)}</span>
-            <span className="text-zinc-600">/</span>
-            <span>{formatTimecode(duration)}</span>
-          </div>
-
-          {/* Right: Speed, Volume, Loop */}
-          <div className="flex items-center gap-3 justify-end">
-            {/* Speed selector */}
-            <div className="relative">
-              <button
-                onClick={() => {
-                  setShowSpeedDropdown(!showSpeedDropdown);
-                  setShowFilterDropdown(false);
-                  setShowRatioDropdown(false);
-                  setShowCanvasZoomDropdown(false);
-                }}
-                className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors ${
-                  playbackRate !== 1.0
-                    ? 'bg-pink-500/20 text-pink-300 border border-pink-500/40 font-bold'
-                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800'
-                }`}
-                title="Playback Speed"
-              >
-                {playbackRate}x
-              </button>
-
-              {showSpeedDropdown && (
-                <div className="absolute right-0 bottom-full mb-1 w-52 bg-zinc-900/98 border border-zinc-800 rounded-xl shadow-2xl p-2.5 z-50 backdrop-blur-md">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-[11px] font-semibold text-zinc-300">Speed</span>
-                    <div className="flex items-center gap-1">
-                      <button
-                        onClick={() => handleSpeedChange(playbackRate - 0.05)}
-                        className="w-5 h-5 flex items-center justify-center rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-mono"
-                        title="-0.05x"
-                      >
-                        -
-                      </button>
-                      <span className="text-xs font-mono font-bold text-pink-400 min-w-[36px] text-center">
-                        {playbackRate.toFixed(2)}x
-                      </span>
-                      <button
-                        onClick={() => handleSpeedChange(playbackRate + 0.05)}
-                        className="w-5 h-5 flex items-center justify-center rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-mono"
-                        title="+0.05x"
-                      >
-                        +
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Slider */}
-                  <input
-                    type="range"
-                    min={0.25}
-                    max={2.0}
-                    step={0.05}
-                    value={playbackRate}
-                    onChange={(e) => handleSpeedChange(parseFloat(e.target.value))}
-                    className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-pink-500 mb-2"
-                  />
-
-                  {/* Presets Grid */}
-                  <div className="grid grid-cols-4 gap-1 pt-1 border-t border-zinc-800/80">
-                    {[0.5, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.25].map((spd) => (
-                      <button
-                        key={spd}
-                        onClick={() => {
-                          handleSpeedChange(spd);
-                          setShowSpeedDropdown(false);
-                        }}
-                        className={`py-1 rounded text-[10px] font-mono text-center transition-colors ${
-                          playbackRate === spd
-                            ? 'bg-pink-500 text-white font-bold'
-                            : 'bg-zinc-800/70 hover:bg-zinc-700 text-zinc-300'
-                        }`}
-                      >
-                        {spd}x
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Volume Control */}
-            <div className="flex items-center gap-1.5">
-              <button
-                onClick={toggleMute}
-                className="p-1 hover:bg-zinc-800 rounded text-zinc-400 hover:text-zinc-200 transition-colors"
-                title={muted || volume === 0 ? 'Unmute (M)' : 'Mute (M)'}
-              >
-                {muted || volume === 0 ? (
-                  <VolumeX className="w-4 h-4 text-red-400" />
-                ) : (
-                  <Volume2 className="w-4 h-4" />
-                )}
-              </button>
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.02}
-                value={muted ? 0 : volume}
-                onChange={(e) => handleVolumeChange(parseFloat(e.target.value))}
-                className="w-16 h-1.5 accent-pink-500 bg-zinc-800 rounded-lg appearance-none cursor-pointer"
-                title={`Volume: ${Math.round((muted ? 0 : volume) * 100)}%`}
-              />
-            </div>
-
-            {/* Loop */}
-            <button
-              onClick={() => {
-                if (videoRef.current) {
-                  videoRef.current.loop = !loop;
-                  setLoop(!loop);
-                }
-              }}
-              className={`p-1 rounded transition-colors ${loop ? 'text-pink-400 bg-pink-500/10' : 'text-zinc-500 hover:text-zinc-300'}`}
-              title="Loop Playback"
-            >
-              <Repeat className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
       </div>
+
+      {/* Dedicated Logo & Image Overlay Modal */}
+      <LogoOverlayModal open={showLogoTools} onClose={() => setShowLogoTools(false)} videoRef={videoRef} />
     </div>
   );
 }

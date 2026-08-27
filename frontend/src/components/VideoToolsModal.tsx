@@ -1,9 +1,10 @@
-import { useState, useEffect, RefObject } from 'react';
+import { useState, useEffect, useRef, RefObject } from 'react';
 import { useProjectStore } from '../stores/projectStore';
 import {
   flipVideo, resizeVideo, changeVideoSpeed, splitVideo,
   burnSubtitles, generateSelectedVideo,
   separateProjectAudio, checkAudioSeparation,
+  uploadProjectLogo, applyVideoLogo,
 } from '../api/client';
 import {
   X,
@@ -24,14 +25,17 @@ import {
   RefreshCw,
   Mic,
   Music,
+  Image as ImageIcon,
+  Upload,
 } from 'lucide-react';
 
-type Tab = 'flip' | 'resize' | 'speed' | 'text' | 'generate' | 'split' | 'isolate_vocal' | 'isolate_bgm';
+type Tab = 'flip' | 'resize' | 'speed' | 'text' | 'logo' | 'generate' | 'split' | 'isolate_vocal' | 'isolate_bgm';
 
 interface Props {
   open: boolean;
   onClose: () => void;
   videoRef: RefObject<HTMLVideoElement | null>;
+  initialTab?: Tab;
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -50,6 +54,7 @@ const TABS: { key: Tab; label: string; icon: React.ReactNode; color: string }[] 
   { key: 'resize', label: 'Resize', icon: <Maximize2 className="w-3.5 h-3.5" />, color: 'text-emerald-400' },
   { key: 'speed', label: 'Speed', icon: <Gauge className="w-3.5 h-3.5" />, color: 'text-amber-400' },
   { key: 'text', label: 'Subtitle', icon: <Type className="w-3.5 h-3.5" />, color: 'text-rose-400' },
+  { key: 'logo', label: 'Logo / Image', icon: <ImageIcon className="w-3.5 h-3.5" />, color: 'text-indigo-400' },
   { key: 'generate', label: 'Generate', icon: <Film className="w-3.5 h-3.5" />, color: 'text-blue-400' },
   { key: 'split', label: 'Split', icon: <SplitSquareVertical className="w-3.5 h-3.5" />, color: 'text-violet-400' },
   { key: 'isolate_vocal', label: 'Vocal', icon: <Mic className="w-3.5 h-3.5" />, color: 'text-purple-400' },
@@ -74,14 +79,20 @@ const FONT_COLORS = [
   { label: 'Black', value: 'black' },
 ];
 
-export default function VideoToolsModal({ open, onClose, videoRef }: Props) {
+export default function VideoToolsModal({ open, onClose, videoRef, initialTab = 'logo' }: Props) {
   const { currentProject, loadProject } = useProjectStore();
   const duration = currentProject?.duration || 0;
 
-  const [tab, setTab] = useState<Tab>('flip');
+  const [tab, setTab] = useState<Tab>(initialTab || 'logo');
   const [processing, setProcessing] = useState(false);
   const [done, setDone] = useState(false);
   const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (open && initialTab) {
+      setTab(initialTab);
+    }
+  }, [open, initialTab]);
 
   // Flip
   const [flipDir, setFlipDir] = useState<'horizontal' | 'vertical'>('horizontal');
@@ -114,6 +125,16 @@ export default function VideoToolsModal({ open, onClose, videoRef }: Props) {
   const [audioSeparated, setAudioSeparated] = useState(false);
   const [vocalsUrl, setVocalsUrl] = useState('');
   const [bgmUrl, setBgmUrl] = useState('');
+
+  // Logo / Watermark
+  const [logoUrl, setLogoUrl] = useState('');
+  const [logoPosition, setLogoPosition] = useState('top_right');
+  const [logoScalePct, setLogoScalePct] = useState(15);
+  const [logoOpacity, setLogoOpacity] = useState(1.0);
+  const [logoXPct, setLogoXPct] = useState(85);
+  const [logoYPct, setLogoYPct] = useState(5);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
+  const logoInputRef = useRef<HTMLInputElement>(null);
 
   const projectName = currentProject?.name?.replace(/\s+/g, '_') || 'video';
   const hasVideo = !!currentProject?.video_path;
@@ -294,6 +315,45 @@ export default function VideoToolsModal({ open, onClose, videoRef }: Props) {
     setProcessing(false);
   };
 
+  const handleUploadLogo = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !currentProject) return;
+    setUploadingLogo(true);
+    setError('');
+    try {
+      const res = await uploadProjectLogo(currentProject.id, file);
+      setLogoUrl(res.url);
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || err?.message || 'Failed to upload logo image');
+    }
+    setUploadingLogo(false);
+  };
+
+  const handleApplyLogo = async () => {
+    if (!currentProject) return;
+    if (!logoUrl) {
+      setError('Please upload a logo / image first');
+      return;
+    }
+    setProcessing(true); resetState();
+    try {
+      await applyVideoLogo(currentProject.id, {
+        logo_url: logoUrl,
+        position: logoPosition,
+        scale_pct: logoScalePct,
+        opacity: logoOpacity,
+        x_pct: logoPosition === 'custom' ? logoXPct : undefined,
+        y_pct: logoPosition === 'custom' ? logoYPct : undefined,
+      });
+      await reloadProject();
+      setDone(true);
+      setTimeout(() => setDone(false), 3000);
+    } catch (e: any) {
+      setError(e?.response?.data?.detail || e?.message || 'Failed to apply logo overlay');
+    }
+    setProcessing(false);
+  };
+
   // Split helpers
   const addSplitPoint = () => {
     const t = videoRef.current?.currentTime;
@@ -317,17 +377,18 @@ export default function VideoToolsModal({ open, onClose, videoRef }: Props) {
 
   const actionMap: Record<Tab, () => void> = {
     flip: handleFlip, resize: handleResize, speed: handleSpeed,
-    text: handleTextOverlay, generate: handleGenerate, split: handleSplit,
+    text: handleTextOverlay, logo: handleApplyLogo, generate: handleGenerate, split: handleSplit,
     isolate_vocal: handleIsolateVocal, isolate_bgm: handleIsolateBGM,
   };
 
-  const isInPlace = tab === 'flip' || tab === 'resize' || tab === 'speed' || tab === 'text';
+  const isInPlace = tab === 'flip' || tab === 'resize' || tab === 'speed' || tab === 'text' || tab === 'logo';
 
   const actionLabels: Record<Tab, string> = {
     flip: 'Apply Flip',
     resize: 'Apply Resize',
     speed: 'Apply Speed',
     text: 'Burn Subtitles',
+    logo: 'Burn Logo Overlay',
     generate: 'Generate & Download',
     split: 'Split & Download (.zip)',
     isolate_vocal: audioSeparated ? 'Download Vocals' : 'Isolate Vocal',
@@ -339,6 +400,7 @@ export default function VideoToolsModal({ open, onClose, videoRef }: Props) {
     resize: 'bg-emerald-700 hover:bg-emerald-600',
     speed: 'bg-amber-700 hover:bg-amber-600',
     text: 'bg-rose-700 hover:bg-rose-600',
+    logo: 'bg-indigo-700 hover:bg-indigo-600',
     generate: 'bg-blue-700 hover:bg-blue-600',
     split: 'bg-violet-700 hover:bg-violet-600',
     isolate_vocal: 'bg-purple-700 hover:bg-purple-600',
@@ -563,6 +625,182 @@ export default function VideoToolsModal({ open, onClose, videoRef }: Props) {
                     <div className="flex justify-between text-[10px] text-zinc-600">
                       <span>Transparent</span><span>{bgOpacity}</span><span>Opaque</span>
                     </div>
+                  </div>
+                </div>
+              )}
+
+              {/* ---- LOGO / IMAGE OVERLAY ---- */}
+              {tab === 'logo' && (
+                <div className="space-y-4">
+                  <p className="text-xs text-zinc-400">
+                    Add an image or brand logo watermark to your video with customizable scale, opacity, and positioning.
+                  </p>
+
+                  {/* Upload Image Section */}
+                  <div className="border border-dashed border-zinc-700 hover:border-indigo-500/70 bg-zinc-800/40 rounded-xl p-4 transition-colors">
+                    <input
+                      ref={logoInputRef}
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                      className="hidden"
+                      onChange={handleUploadLogo}
+                    />
+
+                    {logoUrl ? (
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                          <div className="w-12 h-12 rounded-lg bg-zinc-900 border border-zinc-700 flex items-center justify-center overflow-hidden p-1">
+                            <img src={logoUrl} alt="Logo" className="max-w-full max-h-full object-contain" />
+                          </div>
+                          <div>
+                            <p className="text-xs font-medium text-white">Logo Uploaded</p>
+                            <p className="text-[10px] text-zinc-400 truncate max-w-[200px]">{logoUrl.split('/').pop()}</p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => logoInputRef.current?.click()}
+                          disabled={uploadingLogo}
+                          className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg text-xs font-medium transition-colors"
+                        >
+                          Change Image
+                        </button>
+                      </div>
+                    ) : (
+                      <div
+                        onClick={() => logoInputRef.current?.click()}
+                        className="flex flex-col items-center justify-center py-4 cursor-pointer text-center"
+                      >
+                        <div className="w-10 h-10 rounded-full bg-indigo-500/10 flex items-center justify-center text-indigo-400 mb-2">
+                          {uploadingLogo ? <Loader2 className="w-5 h-5 animate-spin" /> : <Upload className="w-5 h-5" />}
+                        </div>
+                        <p className="text-xs font-medium text-zinc-200">
+                          {uploadingLogo ? 'Uploading logo...' : 'Click to upload Logo / Image (PNG, JPG, SVG, WebP)'}
+                        </p>
+                        <p className="text-[10px] text-zinc-500 mt-0.5">Supports transparent PNG watermarks & stickers</p>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Position & Appearance Controls */}
+                  <div className="space-y-3">
+                    <div>
+                      <label className="text-xs text-zinc-400 block mb-1.5 font-medium">Position on Video</label>
+                      <div className="grid grid-cols-3 gap-2">
+                        {[
+                          { id: 'top_left', label: 'Top-Left ↖' },
+                          { id: 'top_right', label: 'Top-Right ↗' },
+                          { id: 'bottom_left', label: 'Bottom-Left ↙' },
+                          { id: 'bottom_right', label: 'Bottom-Right ↘' },
+                          { id: 'center', label: 'Center 🎯' },
+                          { id: 'custom', label: 'Custom XY 🎛️' },
+                        ].map((pos) => (
+                          <button
+                            key={pos.id}
+                            type="button"
+                            onClick={() => setLogoPosition(pos.id)}
+                            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                              logoPosition === pos.id
+                                ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30'
+                                : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-white border border-zinc-700/60'
+                            }`}
+                          >
+                            {pos.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {logoPosition === 'custom' && (
+                      <div className="grid grid-cols-2 gap-3 bg-zinc-800/40 p-3 rounded-lg border border-zinc-700/40">
+                        <div>
+                          <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
+                            <span>X Position (Left-Right)</span>
+                            <span className="font-mono text-indigo-400">{logoXPct}%</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            value={logoXPct}
+                            onChange={(e) => setLogoXPct(Number(e.target.value))}
+                            className="w-full"
+                          />
+                        </div>
+                        <div>
+                          <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
+                            <span>Y Position (Top-Bottom)</span>
+                            <span className="font-mono text-indigo-400">{logoYPct}%</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            value={logoYPct}
+                            onChange={(e) => setLogoYPct(Number(e.target.value))}
+                            className="w-full"
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <div className="flex justify-between text-xs text-zinc-400 mb-1">
+                          <span>Size / Scale</span>
+                          <span className="font-mono text-indigo-400">{logoScalePct}% width</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={5}
+                          max={50}
+                          value={logoScalePct}
+                          onChange={(e) => setLogoScalePct(Number(e.target.value))}
+                          className="w-full"
+                        />
+                      </div>
+
+                      <div>
+                        <div className="flex justify-between text-xs text-zinc-400 mb-1">
+                          <span>Opacity</span>
+                          <span className="font-mono text-indigo-400">{Math.round(logoOpacity * 100)}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.1}
+                          max={1.0}
+                          step={0.05}
+                          value={logoOpacity}
+                          onChange={(e) => setLogoOpacity(Number(e.target.value))}
+                          className="w-full"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Interactive Visual Preview Box */}
+                    {logoUrl && (
+                      <div className="border border-zinc-700/60 rounded-xl p-2 bg-zinc-950/60">
+                        <span className="text-[10px] text-zinc-500 block mb-1">Live Placement Preview:</span>
+                        <div className="relative aspect-video w-full bg-zinc-900 rounded-lg overflow-hidden border border-zinc-800 flex items-center justify-center">
+                          <span className="text-[11px] text-zinc-600 select-none">Video Canvas Preview</span>
+                          <div
+                            className="absolute pointer-events-none transition-all duration-150"
+                            style={{
+                              width: `${logoScalePct}%`,
+                              opacity: logoOpacity,
+                              ...(logoPosition === 'top_left' ? { top: '6%', left: '4%' } :
+                                  logoPosition === 'top_right' ? { top: '6%', right: '4%' } :
+                                  logoPosition === 'bottom_left' ? { bottom: '8%', left: '4%' } :
+                                  logoPosition === 'bottom_right' ? { bottom: '8%', right: '4%' } :
+                                  logoPosition === 'center' ? { top: '50%', left: '50%', transform: 'translate(-50%, -50%)' } :
+                                  { top: `${logoYPct}%`, left: `${logoXPct}%`, transform: 'translate(-50%, -50%)' })
+                            }}
+                          >
+                            <img src={logoUrl} alt="Watermark" className="w-full h-auto object-contain drop-shadow" />
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

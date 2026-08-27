@@ -25,7 +25,11 @@ from backend.services.gemini_service import (
     generate_narration,
     run_ai_agent,
     generate_movie_titles,
+    generate_viral_metadata_package,
     generate_social_media_script,
+    generate_catchy_hooks,
+    _is_music_or_noise_segment,
+    _strip_inline_music_tags,
 )
 from backend.services.tts_service import assign_speaker_voices, generate_segment_audio, _probe_duration
 
@@ -497,7 +501,8 @@ def _parse_srt(content: str) -> list[dict]:
         start = int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2]) + int(g[3]) / 1000
         end = int(g[4]) * 3600 + int(g[5]) * 60 + int(g[6]) + int(g[7]) / 1000
         text = " ".join(lines[2:]).strip()
-        if text and end > start:
+        text = _strip_inline_music_tags(text)
+        if text and end > start and not _is_music_or_noise_segment(text):
             segments.append({"text": text, "start_time": start, "end_time": end})
     return segments
 
@@ -567,7 +572,8 @@ async def generate_transcript_stream(
 
         video_path = project.video_path
         full_duration = project.duration or 0.0
-        language = request.language or project.language
+        language = request.language or project.language or "km"
+        project_language = language
 
         # Load video clips to determine trim boundaries
         clip_result = await db.execute(
@@ -632,9 +638,39 @@ async def generate_transcript_stream(
                         seg_data = seg_data_list[0]
 
                 seg_id = str(uuid.uuid4())
-                speaker = str(seg_data.get("speaker", f"Speaker {segment_index + 1}")).strip()
                 voice_profile = seg_data.get("voice_profile", "female")
+                is_km = project_language == "km"
+                if is_km:
+                    if voice_profile == "grandpa":
+                        default_spk = "លោកតា (Grandpa)"
+                    elif voice_profile == "grandma":
+                        default_spk = "លោកយាយ (Grandma)"
+                    elif voice_profile == "child_boy":
+                        default_spk = "ក្មេងប្រុស (Boy)"
+                    elif voice_profile == "child_girl":
+                        default_spk = "ក្មេងស្រី (Girl)"
+                    elif voice_profile == "male":
+                        default_spk = "តួអង្គប្រុស (Male)"
+                    else:
+                        default_spk = "តួអង្គស្រី (Female)"
+                else:
+                    default_spk = "Speaker 1 (Male)" if voice_profile in ("male", "grandpa", "child_boy") else "Speaker 2 (Female)"
+                
+                raw_spk = str(seg_data.get("speaker") or "").strip()
+                if not raw_spk:
+                    speaker = default_spk
+                elif is_km and raw_spk in ("Speaker 1", "Speaker1", "Speaker 1 (Male)", "Speaker 1 (Female)"):
+                    speaker = "តួអង្គទី១ (ប្រុស)" if voice_profile in ("male", "grandpa", "child_boy") else "តួអង្គទី១ (ស្រី)"
+                elif is_km and raw_spk in ("Speaker 2", "Speaker2", "Speaker 2 (Male)", "Speaker 2 (Female)"):
+                    speaker = "តួអង្គទី២ (ស្រី)" if voice_profile in ("female", "grandma", "child_girl") else "តួអង្គទី២ (ប្រុស)"
+                elif is_km and re.search(r'[\u4E00-\u9FFF]', raw_spk):
+                    speaker = default_spk
+                else:
+                    speaker = raw_spk
+
                 voice_name = seg_data.get("voice_name", "")
+                if not voice_name:
+                    voice_name = "km-KH-PisethNeural" if voice_profile in ("male", "grandpa", "child_boy") else "km-KH-SreymomNeural"
                 emotion = seg_data.get("emotion", "neutral")
 
                 # Save segment to DB immediately
@@ -679,10 +715,10 @@ async def generate_transcript_stream(
             # Mark project completed
             async with async_session() as db:
                 result = await db.execute(select(Project).where(Project.id == project_id))
-                project = result.scalar_one_or_none()
-                if project:
-                    project.status = "completed"
-                    project.language = language
+                proj = result.scalar_one_or_none()
+                if proj:
+                    proj.status = "completed"
+                    proj.language = language
                     await db.commit()
 
             yield f"data: {json.dumps({'type': 'done', 'total_segments': segment_index})}\n\n"
@@ -691,9 +727,9 @@ async def generate_transcript_stream(
             # Mark project as error
             async with async_session() as db:
                 result = await db.execute(select(Project).where(Project.id == project_id))
-                project = result.scalar_one_or_none()
-                if project:
-                    project.status = "error"
+                proj = result.scalar_one_or_none()
+                if proj:
+                    proj.status = "error"
                     await db.commit()
 
             # Log the raw error for debugging
@@ -1095,7 +1131,7 @@ async def fill_missing_captions_endpoint(
     if not project.video_path or not os.path.exists(project.video_path):
         raise HTTPException(400, "No valid video file found for this project")
 
-    min_gap_sec = float((body or {}).get("min_gap", 1.5))
+    min_gap_sec = float((body or {}).get("min_gap", 2.5))
 
     # Fetch existing non-freeze segments
     result = await db.execute(
@@ -1163,10 +1199,11 @@ async def fill_missing_captions_endpoint(
     new_segments_created = []
 
     try:
-        for gap_idx, (g_start, g_end) in enumerate(gaps):
+        sem = asyncio.Semaphore(4)
+
+        async def _process_gap(gap_idx: int, g_start: float, g_end: float):
             g_dur = g_end - g_start
             clip_path = os.path.join(tmp_dir, f"gap_{gap_idx}.mp3")
-
             cmd = [
                 ffmpeg, "-y",
                 "-ss", str(g_start),
@@ -1174,29 +1211,39 @@ async def fill_missing_captions_endpoint(
                 "-t", str(g_dur),
                 "-vn",
                 "-ac", "1",
-                "-ar", "16000",
+                "-ar", "24000",
                 "-c:a", "libmp3lame",
-                "-b:a", "96k",
+                "-b:a", "128k",
                 clip_path,
             ]
             proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=30)
-            if proc.returncode != 0 or not os.path.exists(clip_path):
-                continue
+            if proc.returncode != 0 or not os.path.exists(clip_path) or os.path.getsize(clip_path) == 0:
+                return []
 
-            gap_segs = await transcribe_video(clip_path, language=language)
-            if not gap_segs:
-                continue
+            async with sem:
+                gap_segs = await transcribe_video(clip_path, language=language)
+                if not gap_segs:
+                    return []
+                return [(raw_s, g_start, g_end) for raw_s in gap_segs]
 
-            for raw_s in gap_segs:
-                s_txt = str(raw_s.get("text", "")).strip()
-                s_orig = str(raw_s.get("original_text", s_txt)).strip()
+        tasks = [_process_gap(idx, gs, ge) for idx, (gs, ge) in enumerate(gaps)]
+        gap_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for res in gap_results:
+            if not isinstance(res, list):
+                continue
+            for raw_s, g_start, g_end in res:
+                s_txt = _strip_inline_music_tags(str(raw_s.get("text", "")).strip())
+                s_orig = _strip_inline_music_tags(str(raw_s.get("original_text", s_txt)).strip())
                 if not s_txt and not s_orig:
+                    continue
+                if _is_music_or_noise_segment(s_txt, s_orig):
                     continue
                 if not re.search(r'[\w\u1780-\u17FF\u4E00-\u9FFF]', s_txt or s_orig):
                     continue
 
-                abs_start = round(min(g_end, max(g_start, g_start + raw_s["start_time"])), 2)
-                abs_end = round(min(g_end, max(abs_start + 0.5, g_start + raw_s["end_time"])), 2)
+                abs_start = round(min(g_end, max(g_start, g_start + float(raw_s.get("start_time", 0.0)))), 2)
+                abs_end = round(min(g_end, max(abs_start + 0.5, g_start + float(raw_s.get("end_time", 0.5)))), 2)
 
                 seg = Segment(
                     id=str(uuid.uuid4()),
@@ -1608,6 +1655,118 @@ async def suggest_titles_endpoint(
         language=language,
     )
     return {"original_title": original_title, "titles": titles}
+
+
+@router.post("/generate-titles")
+@router.post("/generate-titles/")
+async def generate_titles_endpoint(
+    project_id: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate viral, high-CTR titles for TikTok, YouTube, and Facebook."""
+    result = await db.execute(
+        select(Project)
+        .options(selectinload(Project.segments))
+        .where(Project.id == project_id)
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    original_title = body.get("original_title", "").strip() or project.name or ""
+    language = body.get("language", project.language or "km")
+
+    transcript_text = "\n".join([
+        f"[{s.start_time:.1f}s - {s.end_time:.1f}s] {s.speaker}: {s.text}"
+        for s in sorted(project.segments, key=lambda x: x.start_time)
+        if s.text and s.text.strip()
+    ])
+
+    titles = await generate_movie_titles(
+        original_title=original_title,
+        transcript_text=transcript_text,
+        video_path=project.video_path or "",
+        language=language,
+    )
+    return titles
+
+
+@router.post("/generate-viral-metadata")
+@router.post("/generate-viral-metadata/")
+async def generate_viral_metadata_endpoint(
+    project_id: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Ultra-fast, single-pass generation of viral titles, hook, descriptions, and hashtags."""
+    result = await db.execute(
+        select(Project)
+        .options(selectinload(Project.segments))
+        .where(Project.id == project_id)
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    original_title = body.get("original_title", "").strip() or project.name or ""
+    language = body.get("language", project.language or "km")
+    tone = body.get("tone", "viral")
+    platform = body.get("platform", "all")
+
+    transcript_text = "\n".join([
+        f"[{s.start_time:.1f}s - {s.end_time:.1f}s] {s.speaker}: {s.text}"
+        for s in sorted(project.segments, key=lambda x: x.start_time)
+        if s.text and s.text.strip()
+    ])
+
+    data = await generate_viral_metadata_package(
+        original_title=original_title,
+        transcript_text=transcript_text,
+        language=language,
+        tone=tone,
+        platform=platform,
+    )
+    return data
+
+
+@router.post("/generate-hooks")
+@router.post("/generate-hooks/")
+async def generate_hooks_endpoint(
+    project_id: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate high-retention opening hooks with specific seconds before dubbing."""
+    result = await db.execute(
+        select(Project)
+        .options(selectinload(Project.segments))
+        .where(Project.id == project_id)
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    original_title = body.get("original_title", "").strip() or project.name or ""
+    language = body.get("language", project.language or "km")
+    duration_seconds = float(body.get("duration_seconds", 4.0))
+    tone = body.get("tone", "viral")
+
+    transcript_text = "\n".join([
+        f"[{s.start_time:.1f}s - {s.end_time:.1f}s] {s.speaker}: {s.text}"
+        for s in sorted(project.segments, key=lambda x: x.start_time)
+        if s.text and s.text.strip()
+    ])
+
+    hooks = await generate_catchy_hooks(
+        original_title=original_title,
+        transcript_text=transcript_text,
+        video_path=project.video_path or "",
+        language=language,
+        duration_seconds=duration_seconds,
+        tone=tone,
+    )
+    return hooks
 
 
 @router.post("/generate-social-script")

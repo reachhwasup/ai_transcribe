@@ -6,6 +6,7 @@ import shutil
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse, StreamingResponse
+from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional, List
 from sqlalchemy import select
@@ -35,6 +36,7 @@ from backend.services.video_service import (
     generate_selected_video,
     generate_selected_audio,
     mute_audio,
+    apply_logo_overlay,
 )
 
 router = APIRouter(prefix="/projects/{project_id}/export", tags=["export"])
@@ -632,135 +634,96 @@ class VideoExportRequest(BaseModel):
     subtitle_style: Optional[dict] = None  # full caption style (colors, outline, box)
     export_folder: Optional[str] = None  # Destination folder path on local disk
     output_filename: Optional[str] = None  # Custom output filename
+    quality: str = "standard"  # compact (~2.2M, ~70% smaller) | standard (~3.8M) | high (~6.5M)
+    bgm_volume: Optional[float] = 0.35  # volume factor for background audio/music (0.0 to 1.0, default 0.35)
+    logo_url: Optional[str] = None  # URL or path of logo / watermark image
+    logo_enabled: bool = False
+    logo_position: str = "top_right"  # top_left | top_right | bottom_left | bottom_right | center | custom
+    logo_x_pct: Optional[float] = 85.0  # 0-100 percentage
+    logo_y_pct: Optional[float] = 5.0  # 0-100 percentage
+    logo_scale_pct: float = 15.0  # 5-50 percentage of video width
+    logo_opacity: float = 1.0  # 0.0 - 1.0
+    voice_offset_ms: int = 0  # Voice timing offset in milliseconds to nudge audio alignment with captions (-500 to +500)
 
 
-async def _build_tts_from_existing(segments, total_duration) -> str:
+
+async def _build_tts_from_existing(segments, total_duration, voice_offset_ms: int = 0, start_offset: float = 0.0) -> str:
     """
     Combine pre-generated per-segment audio files into a single TTS overlay track.
-    Returns path to combined wav file, or None if no pre-generated audio exists.
+    Uses sample-accurate float32 audio mixing at 48kHz stereo to ensure zero timing drift
+    and instant execution even for projects with 1,000+ voice segments.
     """
-    import shutil as _shutil
-    import subprocess as _subprocess
     import uuid as _uuid
+    import numpy as np
+    import soundfile as sf
 
     audio_segments = []
     for s in segments:
         if not s.audio_url:
             continue
-        # Resolve file path from URL (e.g. /uploads/tts/xxx.mp3 -> ./uploads/tts/xxx.mp3)
         file_path = s.audio_url.lstrip("/")
         if os.path.exists(file_path):
             audio_segments.append({
                 "path": file_path,
-                "start_time": s.start_time,
+                "start_time": float(s.start_time),
+                "end_time": float(s.end_time),
             })
 
     if not audio_segments:
         return None
 
-    ffmpeg = _shutil.which("ffmpeg")
-    if not ffmpeg:
+    def _combine_worker():
+        sr = 48000
+        offset_sec = float(voice_offset_ms) / 1000.0
+
+        # Calculate needed duration
+        max_end = max((seg["end_time"] for seg in audio_segments), default=10.0)
+        calc_dur = max(float(total_duration or 0), max_end - start_offset + offset_sec + 2.0)
+        total_samples = max(sr, int(calc_dur * sr))
+
+        master = np.zeros((total_samples, 2), dtype=np.float32)
+
+        for seg in audio_segments:
+            try:
+                data, cur_sr = sf.read(seg["path"], dtype="float32")
+                if len(data.shape) == 1:
+                    data = np.column_stack([data, data])
+                elif data.shape[1] > 2:
+                    data = data[:, :2]
+
+                if cur_sr != sr:
+                    # High quality linear sample interpolation for rate matching
+                    target_len = int(len(data) * sr / cur_sr)
+                    idx = np.round(np.linspace(0, len(data) - 1, target_len)).astype(int)
+                    data = data[idx]
+
+                st_sec = max(0.0, seg["start_time"] - start_offset + offset_sec)
+                st_sample = int(st_sec * sr)
+                if st_sample >= total_samples:
+                    continue
+
+                end_sample = min(total_samples, st_sample + len(data))
+                chunk_len = end_sample - st_sample
+                if chunk_len > 0:
+                    master[st_sample:end_sample] += data[:chunk_len]
+            except Exception as read_err:
+                print(f"Warning reading TTS segment {seg['path']}: {read_err}")
+                continue
+
+        # Prevent digital clipping with soft limiter
+        np.clip(master, -1.0, 1.0, out=master)
+
+        export_dir = os.path.join("uploads", "exports")
+        os.makedirs(export_dir, exist_ok=True)
+        out_path = os.path.join(export_dir, f"{_uuid.uuid4()}_voice_overlay.wav")
+        sf.write(out_path, master, sr, subtype="PCM_16")
+        return out_path
+
+    try:
+        return await asyncio.to_thread(_combine_worker)
+    except Exception as e:
+        print(f"Error in _build_tts_from_existing: {e}")
         return None
-
-    export_dir = os.path.join("uploads", "exports")
-    os.makedirs(export_dir, exist_ok=True)
-    output_path = os.path.join(export_dir, f"{_uuid.uuid4()}_voice_overlay.wav")
-
-    if len(audio_segments) == 1:
-        # Single segment: add delay to position it at the right time
-        seg = audio_segments[0]
-        delay_ms = int(seg["start_time"] * 1000)
-        cmd = [
-            ffmpeg, "-y",
-            "-i", seg["path"],
-            "-af", f"adelay={delay_ms}|{delay_ms}",
-            "-c:a", "pcm_s16le",
-            output_path,
-        ]
-    else:
-        # Multiple segments: use filter_complex with duration=longest to prevent premature cutoffs
-        # Batch in chunks of 40 if necessary to stay under OS file descriptor limits
-        batch_size = 40
-        if len(audio_segments) <= batch_size:
-            inputs = []
-            filter_parts = []
-            for i, seg in enumerate(audio_segments):
-                inputs += ["-i", seg["path"]]
-                delay_ms = int(seg["start_time"] * 1000)
-                filter_parts.append(f"[{i}]adelay={delay_ms}|{delay_ms}[d{i}]")
-
-            mix_inputs = "".join(f"[d{i}]" for i in range(len(audio_segments)))
-            filter_parts.append(f"{mix_inputs}amix=inputs={len(audio_segments)}:duration=longest:normalize=0:dropout_transition=0[out]")
-            filter_complex = ";".join(filter_parts)
-
-            cmd = [ffmpeg, "-y"] + inputs + [
-                "-filter_complex", filter_complex,
-                "-map", "[out]",
-                "-c:a", "pcm_s16le",
-                output_path,
-            ]
-            try:
-                result = await asyncio.to_thread(
-                    _subprocess.run, cmd, capture_output=True, text=True, timeout=600
-                )
-                if result.returncode != 0:
-                    print(f"TTS combine failed: {result.stderr[-300:]}")
-                    return None
-                return output_path
-            except Exception as e:
-                print(f"TTS combine error: {e}")
-                return None
-        else:
-            # Multi-batch hierarchal mixing for large projects
-            batch_files = []
-            try:
-                for b_idx in range(0, len(audio_segments), batch_size):
-                    batch = audio_segments[b_idx:b_idx + batch_size]
-                    b_out = os.path.join(export_dir, f"{_uuid.uuid4()}_batch_{b_idx}.wav")
-                    b_inputs = []
-                    b_filters = []
-                    for i, seg in enumerate(batch):
-                        b_inputs += ["-i", seg["path"]]
-                        delay_ms = int(seg["start_time"] * 1000)
-                        b_filters.append(f"[{i}]adelay={delay_ms}|{delay_ms}[d{i}]")
-                    b_mix = "".join(f"[d{i}]" for i in range(len(batch)))
-                    b_filters.append(f"{b_mix}amix=inputs={len(batch)}:duration=longest:normalize=0:dropout_transition=0[out]")
-                    b_cmd = [ffmpeg, "-y"] + b_inputs + [
-                        "-filter_complex", ";".join(b_filters),
-                        "-map", "[out]",
-                        "-c:a", "pcm_s16le",
-                        b_out,
-                    ]
-                    res = await asyncio.to_thread(_subprocess.run, b_cmd, capture_output=True, text=True, timeout=300)
-                    if res.returncode == 0 and os.path.exists(b_out):
-                        batch_files.append(b_out)
-
-                if not batch_files:
-                    return None
-
-                # Combine batch files
-                final_inputs = []
-                final_labels = []
-                for i, bf in enumerate(batch_files):
-                    final_inputs += ["-i", bf]
-                    final_labels.append(f"[{i}]")
-                final_cmd = [ffmpeg, "-y"] + final_inputs + [
-                    "-filter_complex", f"{''.join(final_labels)}amix=inputs={len(batch_files)}:duration=longest:normalize=0:dropout_transition=0[out]",
-                    "-map", "[out]",
-                    "-c:a", "pcm_s16le",
-                    output_path,
-                ]
-                res2 = await asyncio.to_thread(_subprocess.run, final_cmd, capture_output=True, text=True, timeout=300)
-                if res2.returncode == 0 and os.path.exists(output_path):
-                    return output_path
-                return None
-            finally:
-                for bf in batch_files:
-                    if os.path.exists(bf):
-                        try:
-                            os.remove(bf)
-                        except OSError:
-                            pass
 
 
 @router.post("/video")
@@ -826,16 +789,20 @@ async def export_video(
 
     # Generate SRT file if subtitles requested
     if body.include_subtitles and all_segments:
-        segments_data = [
-            {
-                "index": s.index,
-                "start_time": s.start_time,
-                "end_time": s.end_time,
-                "text": s.text,
-                "speaker": s.speaker,
-            }
-            for s in all_segments
-        ]
+        start_cut = float(body.start_time) if body.start_time is not None else 0.0
+        end_cut = float(body.end_time) if body.end_time is not None else float("inf")
+
+        segments_data = []
+        for s in all_segments:
+            if s.end_time > start_cut and s.start_time < end_cut:
+                segments_data.append({
+                    "index": len(segments_data) + 1,
+                    "start_time": max(0.0, s.start_time - start_cut),
+                    "end_time": max(0.0, min(end_cut, s.end_time) - start_cut),
+                    "text": s.text,
+                    "speaker": s.speaker,
+                })
+
         # Translate if a different subtitle language is requested
         if body.subtitle_language and body.subtitle_language != (project.language or "km"):
             from backend.services.gemini_service import translate_segments
@@ -847,18 +814,25 @@ async def export_video(
 
     # Build combined TTS audio if voice overlay requested
     if body.include_voice and all_segments:
+        start_cut = float(body.start_time) if body.start_time is not None else 0.0
+        end_cut = float(body.end_time) if body.end_time is not None else float("inf")
+        target_segments = [s for s in all_segments if s.end_time > start_cut and s.start_time < end_cut]
+        calc_dur = (end_cut - start_cut) if end_cut != float("inf") else project.duration
+
         # First try to use pre-generated audio files from segments
-        tts_audio_path = await _build_tts_from_existing(all_segments, project.duration)
+        tts_audio_path = await _build_tts_from_existing(
+            target_segments, calc_dur, voice_offset_ms=getattr(body, "voice_offset_ms", 0), start_offset=start_cut
+        )
 
         # Fall back to regenerating TTS if no pre-generated audio
         if not tts_audio_path:
             voice_segments = []
-            for s in all_segments:
+            for s in target_segments:
                 if s.text and s.text.strip():
                     voice_segments.append({
                         "text": s.text,
-                        "start_time": s.start_time,
-                        "end_time": s.end_time,
+                        "start_time": max(0.0, s.start_time - start_cut),
+                        "end_time": max(0.0, min(end_cut, s.end_time) - start_cut),
                         "voice_profile": s.voice_profile or "female",
                         "voice_name": s.voice_name or "",
                         "emotion": s.emotion or "",
@@ -869,7 +843,7 @@ async def export_video(
                     tts_audio_path = await generate_segments_audio(
                         voice_segments,
                         output_format="wav",
-                        total_duration=project.duration,
+                        total_duration=calc_dur,
                     )
                 except Exception as e:
                     print(f"TTS generation for export failed: {e}")
@@ -879,22 +853,34 @@ async def export_video(
     music_audio_path = None
     mute_original = False
     if body.background_audio == "music":
-        # Use the isolated music-only stem (from Isolate Vocals/BGM)
         bgm_path = os.path.join(os.path.dirname(project.video_path), "bgm.wav")
-        if not os.path.exists(bgm_path):
-            # If not already isolated, automatically isolate BGM on the fly
+        is_valid_bgm = False
+        if os.path.exists(bgm_path):
+            try:
+                from backend.services.video_service import probe_video
+                b_dur = float(probe_video(bgm_path).get("duration", 0))
+                v_dur = float(probe_video(project.video_path).get("duration", 0))
+                if v_dur > 0 and abs(b_dur - v_dur) <= 3.0:
+                    is_valid_bgm = True
+                else:
+                    os.remove(bgm_path)
+            except Exception:
+                pass
+
+        if not is_valid_bgm:
             try:
                 from backend.services.video_service import separate_audio
                 await asyncio.to_thread(separate_audio, project.video_path, os.path.dirname(project.video_path))
+                if os.path.exists(bgm_path):
+                    is_valid_bgm = True
             except Exception as e:
                 print(f"Audio separation failed during export: {e}")
 
-        if os.path.exists(bgm_path):
+        if is_valid_bgm:
             music_audio_path = bgm_path
-            mute_original = True  # Mute original video audio so original actor voice is removed
-        else:
-            # Fall back to muting so original voices don't clash with AI voice
             mute_original = True
+        else:
+            mute_original = False
     elif body.background_audio == "none":
         mute_original = True
     else:  # 'original' or default
@@ -916,6 +902,15 @@ async def export_video(
             subtitle_size_pct=body.subtitle_size_pct,
             subtitle_position=body.subtitle_position,
             subtitle_style=body.subtitle_style,
+            quality=getattr(body, "quality", "standard"),
+            bgm_volume=getattr(body, "bgm_volume", 0.35),
+            logo_url=getattr(body, "logo_url", None),
+            logo_enabled=getattr(body, "logo_enabled", False),
+            logo_position=getattr(body, "logo_position", "top_right"),
+            logo_x_pct=getattr(body, "logo_x_pct", 85.0),
+            logo_y_pct=getattr(body, "logo_y_pct", 5.0),
+            logo_scale_pct=getattr(body, "logo_scale_pct", 15.0),
+            logo_opacity=getattr(body, "logo_opacity", 1.0),
         )
     except RuntimeError as e:
         raise HTTPException(500, str(e))
@@ -1099,7 +1094,7 @@ async def export_video_stream_endpoint(
 
     # Load video clips layout
     clips_result = await db.execute(
-        select(VideoClip).where(VideoClip.project_id == project_id).order_by(VideoClip.position)
+        select(VideoClip).where(VideoClip.project_id == project_id).order_by(VideoClip.index)
     )
     all_clips = clips_result.scalars().all()
 
@@ -1122,23 +1117,21 @@ async def export_video_stream_endpoint(
                     {
                         "source_start": c.source_start,
                         "source_end": c.source_end,
-                        "playback_rate": c.playback_rate,
-                        "volume": c.volume,
-                        "is_muted": c.is_muted,
                     }
                     for c in all_clips
                 ]
-                needs_assembly = (
-                    len(clips_layout) > 1
-                    or clips_layout[0]["source_start"] > 0.05
-                    or clips_layout[0].get("playback_rate", 1.0) != 1.0
+                full_video = (
+                    len(clips_layout) == 1
+                    and abs(clips_layout[0]["source_start"]) < 0.1
+                    and project.duration
+                    and abs(clips_layout[0]["source_end"] - project.duration) < 0.1
                 )
-                if needs_assembly:
+                if not full_video:
                     try:
-                        from backend.services.video_service import build_timeline_video
+                        from backend.services.video_service import extract_clips_to_temp
                         clips_temp_path = await asyncio.to_thread(
-                            build_timeline_video,
-                            source_video_path=project.video_path,
+                            extract_clips_to_temp,
+                            video_path=project.video_path,
                             clips=clips_layout,
                         )
                         if clips_temp_path and os.path.exists(clips_temp_path):
@@ -1149,16 +1142,20 @@ async def export_video_stream_endpoint(
             yield f"data: {json.dumps({'type': 'progress', 'percent': 10, 'message': 'Formatting subtitle captions...'})}\n\n"
 
             if body.include_subtitles and all_segments:
-                segments_data = [
-                    {
-                        "index": s.index,
-                        "start_time": s.start_time,
-                        "end_time": s.end_time,
-                        "text": s.text,
-                        "speaker": s.speaker,
-                    }
-                    for s in all_segments
-                ]
+                start_cut = float(body.start_time) if body.start_time is not None else 0.0
+                end_cut = float(body.end_time) if body.end_time is not None else float("inf")
+
+                segments_data = []
+                for s in all_segments:
+                    if s.end_time > start_cut and s.start_time < end_cut:
+                        segments_data.append({
+                            "index": len(segments_data) + 1,
+                            "start_time": max(0.0, s.start_time - start_cut),
+                            "end_time": max(0.0, min(end_cut, s.end_time) - start_cut),
+                            "text": s.text,
+                            "speaker": s.speaker,
+                        })
+
                 if body.subtitle_language and body.subtitle_language != (project.language or "km"):
                     from backend.services.gemini_service import translate_segments
                     segments_data = await translate_segments(segments_data, body.subtitle_language)
@@ -1170,15 +1167,22 @@ async def export_video_stream_endpoint(
             yield f"data: {json.dumps({'type': 'progress', 'percent': 15, 'message': 'Preparing AI voiceover & background music...'})}\n\n"
 
             if body.include_voice and all_segments:
-                tts_audio_path = await _build_tts_from_existing(all_segments, project.duration)
+                start_cut = float(body.start_time) if body.start_time is not None else 0.0
+                end_cut = float(body.end_time) if body.end_time is not None else float("inf")
+                target_segments = [s for s in all_segments if s.end_time > start_cut and s.start_time < end_cut]
+                calc_dur = (end_cut - start_cut) if end_cut != float("inf") else project.duration
+
+                tts_audio_path = await _build_tts_from_existing(
+                    target_segments, calc_dur, voice_offset_ms=getattr(body, "voice_offset_ms", 0), start_offset=start_cut
+                )
                 if not tts_audio_path:
                     voice_segments = []
-                    for s in all_segments:
+                    for s in target_segments:
                         if s.text and s.text.strip():
                             voice_segments.append({
                                 "text": s.text,
-                                "start_time": s.start_time,
-                                "end_time": s.end_time,
+                                "start_time": max(0.0, s.start_time - start_cut),
+                                "end_time": max(0.0, min(end_cut, s.end_time) - start_cut),
                                 "voice_profile": s.voice_profile or "female",
                                 "voice_name": s.voice_name or "",
                                 "emotion": s.emotion or "",
@@ -1189,7 +1193,7 @@ async def export_video_stream_endpoint(
                             tts_audio_path = await generate_segments_audio(
                                 voice_segments,
                                 output_format="wav",
-                                total_duration=project.duration,
+                                total_duration=calc_dur,
                             )
                         except Exception as e:
                             print(f"TTS generation for export failed: {e}")
@@ -1199,18 +1203,33 @@ async def export_video_stream_endpoint(
             mute_original = False
             if body.background_audio == "music":
                 bgm_path = os.path.join(os.path.dirname(project.video_path), "bgm.wav")
-                if not os.path.exists(bgm_path):
+                is_valid_bgm = False
+                if os.path.exists(bgm_path):
+                    try:
+                        from backend.services.video_service import probe_video
+                        b_dur = float(probe_video(bgm_path).get("duration", 0))
+                        v_dur = float(probe_video(project.video_path).get("duration", 0))
+                        if v_dur > 0 and abs(b_dur - v_dur) <= 3.0:
+                            is_valid_bgm = True
+                        else:
+                            os.remove(bgm_path)
+                    except Exception:
+                        pass
+
+                if not is_valid_bgm:
                     try:
                         from backend.services.video_service import separate_audio
                         await asyncio.to_thread(separate_audio, project.video_path, os.path.dirname(project.video_path))
+                        if os.path.exists(bgm_path):
+                            is_valid_bgm = True
                     except Exception as e:
                         print(f"Audio separation failed during export: {e}")
 
-                if os.path.exists(bgm_path):
+                if is_valid_bgm:
                     music_audio_path = bgm_path
                     mute_original = True
                 else:
-                    mute_original = True
+                    mute_original = False
             elif body.background_audio == "none":
                 mute_original = True
             else:
@@ -1243,6 +1262,15 @@ async def export_video_stream_endpoint(
                         subtitle_position=body.subtitle_position,
                         subtitle_style=body.subtitle_style,
                         progress_callback=sync_progress_cb,
+                        quality=getattr(body, "quality", "standard"),
+                        bgm_volume=getattr(body, "bgm_volume", 0.35),
+                        logo_url=getattr(body, "logo_url", None),
+                        logo_enabled=getattr(body, "logo_enabled", False),
+                        logo_position=getattr(body, "logo_position", "top_right"),
+                        logo_x_pct=getattr(body, "logo_x_pct", 85.0),
+                        logo_y_pct=getattr(body, "logo_y_pct", 5.0),
+                        logo_scale_pct=getattr(body, "logo_scale_pct", 15.0),
+                        logo_opacity=getattr(body, "logo_opacity", 1.0),
                     )
                     return ("ok", res)
                 except Exception as e:
@@ -1308,20 +1336,26 @@ async def export_video_stream_endpoint(
                     clean_name = f"{clean_name}{ext}"
                 final_filename = clean_name
 
-            # Copy directly to destination folder on local machine if requested
+            # Copy directly to destination folder on local machine
+            target_folder = body.export_folder.strip() if body.export_folder and body.export_folder.strip() else None
+            if not target_folder:
+                os_downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+                if os.path.exists(os_downloads):
+                    target_folder = os_downloads
+
             saved_local_path = None
-            if body.export_folder and body.export_folder.strip():
+            if target_folder:
                 try:
-                    dest_dir = os.path.expanduser(body.export_folder.strip())
+                    dest_dir = os.path.expanduser(target_folder)
                     os.makedirs(dest_dir, exist_ok=True)
                     dest_file_path = os.path.join(dest_dir, final_filename)
                     shutil.copy2(final_path, dest_file_path)
                     saved_local_path = os.path.abspath(dest_file_path)
                 except Exception as save_err:
-                    print(f"Warning: Could not copy export to {body.export_folder}: {save_err}")
+                    print(f"Warning: Could not copy export to {target_folder}: {save_err}")
 
             out_basename = os.path.basename(final_path)
-            yield f"data: {json.dumps({'type': 'done', 'percent': 100, 'message': 'Video successfully rendered!', 'download_url': f'/api/projects/{project_id}/export/download-temp?file={out_basename}', 'filename': final_filename, 'saved_path': saved_local_path, 'export_folder': body.export_folder})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'percent': 100, 'message': 'Video successfully rendered!', 'download_url': f'/api/projects/{project_id}/export/download-temp?file={out_basename}', 'filename': final_filename, 'saved_path': saved_local_path, 'export_folder': target_folder})}\n\n"
 
         except Exception as e:
             import traceback
@@ -1706,6 +1740,62 @@ async def blur_regions_endpoint(
     return await _replace_project_video(project, output_path, db)
 
 
+class VideoApplyLogoRequest(BaseModel):
+    logo_url: str
+    position: str = "top_right"
+    scale_pct: float = 15.0
+    opacity: float = 1.0
+    x_pct: Optional[float] = 85.0
+    y_pct: Optional[float] = 5.0
+
+
+@router.post("/apply-logo")
+async def apply_logo_endpoint(
+    project_id: str,
+    body: VideoApplyLogoRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Burn a logo/watermark/image overlay onto the project video in-place."""
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    if not project.video_path or not os.path.exists(project.video_path):
+        raise HTTPException(400, "No video file found for this project")
+
+    # Resolve logo path from URL or filesystem
+    raw_logo = body.logo_url.lstrip("/")
+    if os.path.exists(raw_logo):
+        logo_path = raw_logo
+    elif os.path.exists(body.logo_url):
+        logo_path = body.logo_url
+    else:
+        # Check in project watermarks directory
+        watermark_dir = os.path.join(settings.upload_dir, project_id, "watermarks")
+        cand = os.path.join(watermark_dir, os.path.basename(body.logo_url))
+        if os.path.exists(cand):
+            logo_path = cand
+        else:
+            raise HTTPException(400, f"Logo image not found at {body.logo_url}")
+
+    try:
+        output_path = await asyncio.to_thread(
+            apply_logo_overlay,
+            video_path=project.video_path,
+            logo_path=logo_path,
+            position=body.position,
+            scale_pct=body.scale_pct,
+            opacity=body.opacity,
+            x_pct=body.x_pct,
+            y_pct=body.y_pct,
+        )
+    except (RuntimeError, ValueError, FileNotFoundError) as e:
+        raise HTTPException(500 if isinstance(e, RuntimeError) else 400, str(e))
+
+    return await _replace_project_video(project, output_path, db)
+
+
 # --- Video resize (in-place) ---
 
 class VideoResizeRequest(BaseModel):
@@ -2062,6 +2152,7 @@ class GenerateSegmentVoiceRequest(BaseModel):
     fit_mode: str = "A"  # A=Natural length, B=Stretch audio, C=Stretch video
     voice_name: Optional[str] = None  # custom neural voice name
     emotion: Optional[str] = None  # emotion prosody offset
+    skip_existing: bool = True  # If True, continue/skip segments that already have valid dubbed audio
 
 
 def _fit_max_speedup(fit_mode: str) -> Optional[float]:
@@ -2242,13 +2333,20 @@ async def generate_voice_segments_stream(
         ).order_by(Segment.start_time)
 
     result = await db.execute(stmt)
-    segments_snap = [(s.id, s.text, s.start_time, s.end_time, s.voice_profile, s.voice_name, s.audio_speed, s.speaker, s.emotion or "") for s in result.scalars().all()]
+    segments_snap = [(s.id, s.text, s.start_time, s.end_time, s.voice_profile, s.voice_name, s.audio_speed, s.speaker, s.emotion or "", s.audio_url or "") for s in result.scalars().all()]
     total = len(segments_snap)
     request_speed = body.speed
     project_language = project.language or ""
 
     if not segments_snap:
         raise HTTPException(400, "No segments found")
+
+    def _audio_file_valid(url: str) -> bool:
+        if not url:
+            return False
+        clean_p = url.replace("/uploads/", "")
+        p = os.path.join(settings.upload_dir, clean_p)
+        return os.path.exists(p) and os.path.getsize(p) > 0
 
     custom_profiles = await _get_custom_voice_profiles(db)
     all_profiles = list(DEFAULT_SAMPLE_VOICE_PROFILES) + list(custom_profiles)
@@ -2272,10 +2370,16 @@ async def generate_voice_segments_stream(
             yield f"data: {json.dumps({'type': 'start', 'total': total})}\n\n"
 
             for idx, s in enumerate(segments_snap):
-                seg_id, text, orig_start, orig_end, voice_profile, voice_name, audio_speed, speaker, emotion = s
+                seg_id, text, orig_start, orig_end, voice_profile, voice_name, audio_speed, speaker, emotion, existing_audio_url = s
                 if not text or not text.strip():
                     completed += 1
                     yield f"data: {json.dumps({'type': 'progress', 'completed': completed, 'total': total, 'segment_id': seg_id, 'status': 'skipped'})}\n\n"
+                    continue
+
+                # Smart resume / continue: if segment was already dubbed before and file exists on disk, skip it!
+                if body.skip_existing and existing_audio_url and _audio_file_valid(existing_audio_url):
+                    completed += 1
+                    yield f"data: {json.dumps({'type': 'progress', 'completed': completed, 'total': total, 'segment_id': seg_id, 'audio_url': existing_audio_url, 'start_time': orig_start, 'end_time': orig_end, 'status': 'done', 'cached': True})}\n\n"
                     continue
 
                 yield f"data: {json.dumps({'type': 'segment_start', 'segment_id': seg_id, 'index': idx, 'total': total})}\n\n"

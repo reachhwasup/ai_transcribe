@@ -265,6 +265,11 @@ CRITICAL DUAL-FIELD SPECIFICATION:
 5. 100% COMPLETE & EXHAUSTIVE COVERAGE:
    - Transcribe EVERY SINGLE spoken utterance from 0.0s to the very end of the media without skipping any line.
 
+6. STRICTLY IGNORE & NEVER TRANSCRIBE BACKGROUND MUSIC OR SOUND EFFECTS:
+   - ABSOLUTELY NEVER transcribe background music, soundtrack, intro/outro melodies, instrumental breaks, or ambient noise as subtitles (e.g. NEVER output "[ភ្លេង]", "[តន្ត្រី]", "[ភ្លេងកំដរ]", "[តន្ត្រីកំដរ]", "[បទភ្លេង]", "[ចម្រៀង]", "[ចម្រៀងកំដរ]", "[Music]", "[BGM]", "[Instrumental]", "[Sound Effect]", "🎵", "🎶").
+   - If a section contains only background music, theme song, or instruments without human speech, DO NOT create a subtitle segment for it. Completely skip purely musical sections.
+   - ONLY transcribe genuine human dialogue and spoken words.
+
 Return a JSON array of granular segment objects:
 [
   {{"start_time": 0.0, "end_time": 2.2, "original_text": "唐兄，好久不见！", "text": "បងថាង! មិនបានជួបគ្នាយូរហើយ!", "speaker": "Autumn Fragrance", "gender": "female", "emotion": "happy"}},
@@ -273,6 +278,7 @@ Return a JSON array of granular segment objects:
 
 Rules:
 - CONTINUOUS SECONDS: start_time and end_time MUST be continuous numbers in seconds (e.g. 5.2, 62.5, 78.0, 89.2).
+- NO MUSIC / NOISE TAGS: NEVER output [ភ្លេង], [តន្ត្រី], [ភ្លេងកំដរ], [តន្ត្រីកំដរ], [បទភ្លេង], [ចម្រៀង], [Music], [BGM], or sound effect segments. If there is no human speech, produce NO segment.
 - NO PREFIXES: Neither "original_text" nor "text" should contain speaker prefixes like "Speaker:".
 - JSON ONLY: Return ONLY the raw JSON array. No markdown formatting, no explanations."""
 
@@ -477,6 +483,95 @@ def _clean_khmer_spacing(text: str) -> str:
     return text.strip()
 
 
+# Comprehensive set of music, instrumental, noise, and non-speech sound keywords
+_MUSIC_NOISE_TERMS = {
+    # Khmer terms (both spellings សម្លេង and សំឡេង, and common compound terms)
+    'ភ្លេង', 'តន្ត្រី', 'បទភ្លេង', 'ភ្លេងកំដរ', 'តន្ត្រីកំដរ', 'ចម្រៀង', 'ចម្រៀងកំដរ',
+    'សម្លេងភ្លេង', 'សំឡេងភ្លេង', 'សម្លេងតន្ត្រី', 'សំឡេងតន្ត្រី', 'សម្លេងកំដរ', 'សំឡេងកំដរ',
+    'សម្លេងចម្រៀង', 'សំឡេងចម្រៀង', 'ចង្វាក់ភ្លេង', 'ចង្វាក់តន្ត្រី', 'ភ្លេងរោទ៍', 'សំឡេងរោទ៍',
+    'សម្លេងរោទ៍', 'សំឡេងទះដៃ', 'សម្លេងទះដៃ', 'សំឡេងហ៊ោ', 'សម្លេងហ៊ោ', 'សំឡេងហ៊ោកញ្ជ្រៀវ',
+    'សំឡេងសើច', 'សម្លេងសើច', 'សំឡេងយំ', 'សម្លេងយំ', 'សើច', 'យំ', 'ទះដៃ', 'ហ៊ោ', 'កញ្ជ្រៀវ',
+    'សំឡេងខ្សឹប', 'សម្លេងខ្សឹប', 'សំឡេងដកដង្ហើម', 'សម្លេងដកដង្ហើម',
+    # English terms & compounds
+    'music', 'bgm', 'backgroundmusic', 'melody', 'instrumental', 'soundeffect', 'soundeffects',
+    'sfx', 'applause', 'cheer', 'cheers', 'cheering', 'tune', 'guitar', 'piano', 'drum', 'drums',
+    'beat', 'beats', 'singing', 'song', 'whistling', 'humming', 'laughter', 'laughing', 'crying',
+    'musicplaying', 'upbeatmusic', 'dramaticmusic', 'sadmusic', 'instrumentalmusic',
+    'bgmusic', 'ost', 'soundtrack', 'theme', 'thememusic', 'audionoise', 'ambientnoise',
+    'silence', 'nodialogue', 'actionmusic', 'softmusic', 'intensemusic', 'suspensemusic',
+    'intro', 'outro', 'intromusic', 'outromusic', 'sound', 'noise', 'audio',
+    # Chinese terms
+    '音乐', '背景音乐', '配乐', '乐声', '伴奏', '掌声', '欢呼声', '笑声', '哭声', '尖叫', '叹气', '无声',
+}
+
+_MUSIC_REGEX_KEYWORDS = (
+    r'ភ្លេង|តន្ត្រី|បទភ្លេង|ភ្លេងកំដរ|តន្ត្រីកំដរ|ចម្រៀង|ចម្រៀងកំដរ|សម្លេងភ្លេង|សំឡេងភ្លេង|'
+    r'សម្លេងតន្ត្រី|សំឡេងតន្ត្រី|សម្លេងកំដរ|សំឡេងកំដរ|សម្លេងចម្រៀង|សំឡេងចម្រៀង|ចង្វាក់ភ្លេង|ចង្វាក់តន្ត្រី|'
+    r'ភ្លេងរោទ៍|សំឡេងរោទ៍|សម្លេងរោទ៍|សំឡេងទះដៃ|សម្លេងទះដៃ|សំឡេងហ៊ោ|សម្លេងហ៊ោ|'
+    r'music|bgm|background\s*music|melody|instrumental|sound\s*effects?|sfx|applause|cheers?|cheering|'
+    r'tune|guitar|piano|drum|beat|singing|song|whistling|humming|laughter|laughing|crying|ost|soundtrack|'
+    r'theme\s*music|ambient|audio\s*noise|no\s*dialogue|silence|'
+    r'音乐|背景音乐|配乐|乐声|伴奏|掌声|欢呼声|笑声|哭声|尖叫|叹气|无声'
+)
+
+
+def _is_music_or_noise_segment(text: str, orig_text: str = "") -> bool:
+    """Check if text is purely a background music, instrumental melody, or non-speech noise tag (e.g. [ភ្លេង], [តន្ត្រី], [Music])."""
+    for t in (text, orig_text):
+        if not t:
+            continue
+        cleaned = str(t).strip()
+        if not cleaned:
+            continue
+
+        # 1. Check if entirely music notes / audio emoji symbols / noise punctuation
+        if re.fullmatch(r'[\s🎵🎶🎼🔊🔉🔈🔔🎸🎹🎺🎻🥁🎤🎧.,!?:;\-–—~`\'"“”«»\[\]\(\)（）【】「」『』《》⟨⟩‹›]+', cleaned):
+            return True
+
+        # 2. Check explicitly bracketed tags: [ភ្លេង], (តន្ត្រី), 【Music】, [Upbeat Music Playing], (ភ្លេងកំដរ...), etc.
+        # Must have an explicit opening bracket at start and closing bracket at end
+        bracket_match = re.match(
+            r'^\s*[\[\(（【「『《⟨\{](?P<inner>.+?)[\]\)）】」』》⟩\}][\s.,!?:;\-–—~`\'"“”«»]*$',
+            cleaned,
+            flags=re.IGNORECASE
+        )
+        if bracket_match:
+            inner = bracket_match.group("inner").strip()
+            inner_stripped = re.sub(r'[\s.,!?:;\-–—~`\'"“”«»🎵🎶🎼]+', '', inner).lower()
+            if (
+                inner_stripped in _MUSIC_NOISE_TERMS
+                or re.search(r'(?:' + _MUSIC_REGEX_KEYWORDS + r')', inner, flags=re.IGNORECASE)
+            ):
+                return True
+
+        # 3. Check standalone exact music terms (with or without trailing punctuation)
+        stripped_all = re.sub(r'[\[\]\(\)（）【】「」『』《》⟨⟩‹›\{\}\s.,!?:;\-–—~`\'"“”«»🎵🎶🎼]+', '', cleaned).lower()
+        if stripped_all in _MUSIC_NOISE_TERMS:
+            return True
+
+        # 4. Check standalone regex match for exact phrase
+        if re.fullmatch(r'[\s.,!?:;\-–—~`\'"“”«»🎵🎶🎼]*(?:' + _MUSIC_REGEX_KEYWORDS + r')[\s.,!?:;\-–—~`\'"“”«»🎵🎶🎼]*', cleaned, flags=re.IGNORECASE):
+            return True
+
+    return False
+
+
+def _strip_inline_music_tags(text: str) -> str:
+    """Remove inline music / noise bracket tags from within dialogue sentences."""
+    if not text:
+        return ""
+    # Strip bracketed tags containing music/noise keywords
+    cleaned = re.sub(
+        r'[\[\(（【「『《⟨\{]\s*[^\]\)）】」』》⟩\}]*?(?:' + _MUSIC_REGEX_KEYWORDS + r')[^\]\)）】」』》⟩\}]*?\s*[\]\)）】」』》⟩\}]',
+        '',
+        str(text),
+        flags=re.IGNORECASE
+    )
+    # Strip isolated music emojis
+    cleaned = re.sub(r'[🎵🎶🎼]', '', cleaned)
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
+
 def _split_segment_into_subsegments(seg: dict) -> list[dict]:
     """Split segments longer than 3.2 seconds at natural sentence, clause, or conjunction boundaries.
     Preserves whole words, keeps punctuation bound to sentences, and avoids orphan punctuation chunks."""
@@ -615,6 +710,11 @@ def sanitize_segments(segments: list) -> list:
     prev_start = 0.0
     fixed = []
     for s in segments:
+        s_text = s.get("text", "") or ""
+        s_orig = s.get("original_text", "") or ""
+        if _is_music_or_noise_segment(s_text, s_orig):
+            continue
+
         start = _parse_timestamp(s.get("start_time", 0), prev_ref=prev_start)
         end = _parse_timestamp(s.get("end_time", 0), prev_ref=start)
 
@@ -758,6 +858,14 @@ def _parse_segments(text: str) -> list:
         seg_text = re.sub(r"^(?:male|female|child|speaker\s*\d*)\s*:\s*", "", seg_text, flags=re.IGNORECASE).strip()
         orig_text = re.sub(r"^(?:male|female|child|speaker\s*\d*)\s*:\s*", "", orig_text, flags=re.IGNORECASE).strip()
 
+        # Strip inline background music / sound effect tags
+        seg_text = _strip_inline_music_tags(seg_text)
+        orig_text = _strip_inline_music_tags(orig_text)
+
+        # Discard segments that are purely background music or noise tags (e.g. [ភ្លេង], [តន្ត្រី], [Music])
+        if _is_music_or_noise_segment(seg_text, orig_text):
+            continue
+
         # Robust bidirectional fallback so neither text nor original_text is ever empty
         if not orig_text and seg_text:
             orig_text = seg_text
@@ -778,6 +886,9 @@ def _parse_segments(text: str) -> list:
         seg_text = _clean_repetitive_text(_clean_khmer_spacing(seg_text))
         if not seg_text and orig_text:
             seg_text = _clean_repetitive_text(orig_text)
+
+        if not seg_text or _is_music_or_noise_segment(seg_text, orig_text):
+            continue
 
         s_time = _parse_timestamp(seg.get("start_time", 0), prev_ref=prev_start)
         e_time = _parse_timestamp(seg.get("end_time", 0), prev_ref=s_time)
@@ -1971,6 +2082,146 @@ Provide a comprehensive, professional, and actionable response for the video cre
         }
 
 
+def _normalize_title_items(raw_data, original_title: str = "", language: str = "km") -> list[dict]:
+    """Robustly normalize various JSON output formats from Gemini into standard title objects."""
+    categories_meta = {
+        "youtube_long": "ចំណងជើង YouTube កម្រិតខ្ពស់ & SEO (YouTube Standard)",
+        "youtube_shorts": "YouTube Shorts ខ្លីខ្លឹម & Emojis",
+        "viral_hook": "ចំណងជើងទាក់ទាញ (Viral Hook)",
+        "comedy_nickname": "កំប្លុកកំប្លែង & ឈ្មោះតួអង្គ (Comedy)",
+        "action_battle": "វាយប្រហារ & ក្បាច់គុន (Action & Battle)",
+        "drama_mystery": "មនោសញ្ចេតនា & អាថ៌កំបាំង (Drama & Mystery)",
+        "tiktok_short": "ខ្លីខ្លឹមបែប TikTok (TikTok / Reels Short)",
+        "suspense": "រន្ធត់ & ភ្ញាក់ផ្អើល (Suspense)",
+    }
+
+    items = []
+    if isinstance(raw_data, list):
+        items = raw_data
+    elif isinstance(raw_data, dict):
+        if "titles" in raw_data and isinstance(raw_data["titles"], list):
+            items = raw_data["titles"]
+        elif "movie_titles" in raw_data and isinstance(raw_data["movie_titles"], list):
+            items = raw_data["movie_titles"]
+        elif "data" in raw_data and isinstance(raw_data["data"], list):
+            items = raw_data["data"]
+        elif "results" in raw_data and isinstance(raw_data["results"], list):
+            items = raw_data["results"]
+        else:
+            for k, v in raw_data.items():
+                if isinstance(v, str) and v.strip():
+                    items.append({"category": k, "title": v.strip()})
+                elif isinstance(v, dict) and "title" in v:
+                    items.append(v)
+                elif isinstance(v, list):
+                    for sub in v:
+                        if isinstance(sub, (str, dict)):
+                            items.append(sub)
+
+    normalized = []
+    cat_keys = list(categories_meta.keys())
+    for i, it in enumerate(items):
+        if isinstance(it, str) and it.strip():
+            cat = cat_keys[i % len(cat_keys)]
+            normalized.append({
+                "category": cat,
+                "category_label": categories_meta.get(cat, "ចំណងជើងទាក់ទាញ"),
+                "title": it.strip(),
+                "description": "ចំណងជើងទាក់ទាញបង្កើតការចង់ដឹងចង់ឃើញខ្ពស់"
+            })
+        elif isinstance(it, dict):
+            title = it.get("title") or it.get("text") or it.get("headline") or it.get("name") or ""
+            if not title or not str(title).strip():
+                continue
+            cat = str(it.get("category") or cat_keys[i % len(cat_keys)]).strip()
+            cat_label = str(it.get("category_label") or categories_meta.get(cat) or cat).strip()
+            desc = str(it.get("description") or it.get("reason") or "ចំណងជើងទាក់ទាញសម្រាប់ការចែករំលែក").strip()
+            normalized.append({
+                "category": cat,
+                "category_label": cat_label,
+                "title": str(title).strip(),
+                "description": desc
+            })
+
+    if normalized:
+        return normalized
+
+    # Contextual Fallback if no valid titles parsed
+    topic = original_title.strip() if original_title else "វីដេអូ"
+    if language in ("km", "auto", ""):
+        return [
+            {
+                "category": "youtube_long",
+                "category_label": "ចំណងជើង YouTube ស្តង់ដារ & SEO",
+                "title": f"សម្រាយរឿង {topic} ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តពីដើមដល់ចប់ (Full Movie Recap)",
+                "description": "ចំណងជើងស្តង់ដារ YouTube Long-form មានពាក្យគន្លឹះ SEO ពេញលេញ បង្កើនការស្វែងរក"
+            },
+            {
+                "category": "viral_hook",
+                "category_label": "ចំណងជើងទាក់ទាញ (Viral Headline)",
+                "title": f"សម្រាយរឿង៖ {topic} - ការពិតដ៏រន្ធត់ដែលលាក់ទុកអស់ជាច្រើនឆ្នាំ!",
+                "description": "ចំណងជើងបែបភ្ញាក់ផ្អើល បង្កើតការចង់ដឹងចង់ឃើញខ្ពស់ និងជំរុញឱ្យចុចទស្សនាភ្លាមៗ"
+            },
+            {
+                "category": "action_battle",
+                "category_label": "ចំណងជើងបែបវាយប្រហារ & ក្បាច់គុន",
+                "title": f"កំពូលក្បាច់គុនកក្រើកពិភពគុណ | សម្រាយរឿង {topic} ភាគបញ្ចប់",
+                "description": "ចំណងជើងបែបវាយប្រហារ ក្បាច់គុន និងសកម្មភាពប្រយុទ្ធស្វិតស្វាញ"
+            },
+            {
+                "category": "comedy_nickname",
+                "category_label": "ចំណងជើងបែបកំប្លែង & សម្មតិនាមតួអង្គ",
+                "title": f"អាប្រុសខូចប៉ះស្រីស្អាតចិត្តដាច់ | សម្រាយរឿងកំប្លែង {topic}",
+                "description": "ចំណងជើងបែបកំប្លែង សើចសប្បាយ ប្រើសម្មតិនាមតួអង្គទាក់ទាញ"
+            },
+            {
+                "category": "drama_mystery",
+                "category_label": "ចំណងជើងបែបអាថ៌កំបាំង & មនោសញ្ចេតនា",
+                "title": f"រឿង៖ {topic} - ការក្បត់ដែលនឹកស្មានមិនដល់ និងការលះបង់ដ៏ធំធេង",
+                "description": "ចំណងជើងបែបអាថ៌កំបាំង រឿងរ៉ាវពិត និងមនោសញ្ចេតនាជ្រាលជ្រៅ"
+            },
+            {
+                "category": "youtube_shorts",
+                "category_label": "ចំណងជើង YouTube Shorts & Reels",
+                "title": f"សម្រាយរឿងខ្លី | {topic} ភាគ១ #shorts #movierecap",
+                "description": "ចំណងជើងខ្លីខ្លឹម ស័ក្តិសមសម្រាប់ YouTube Shorts និង Facebook Reels"
+            },
+            {
+                "category": "suspense",
+                "category_label": "ចំណងជើងបែបតក់ស្លុត & Climax",
+                "title": f"វិនាទីចុងក្រោយដែលគ្មានអ្នកណាដឹង! | សម្រាយរឿង {topic}",
+                "description": "ចំណងជើងបែបតក់ស្លុត និងទាក់ទាញការចែករំលែកខ្ពស់"
+            }
+        ]
+    else:
+        return [
+            {
+                "category": "youtube_long",
+                "category_label": "YouTube Standard & SEO",
+                "title": f"{topic} Full Movie Recap & Ending Explained (2024)",
+                "description": "High-CTR search-optimized YouTube video headline"
+            },
+            {
+                "category": "viral_hook",
+                "category_label": "Viral Headline",
+                "title": f"The Dark Secret Behind {topic} That Everyone Missed!",
+                "description": "High-suspense curiosity gap video title"
+            },
+            {
+                "category": "action_battle",
+                "category_label": "Action & Climax",
+                "title": f"Ultimate Battle & Climax | {topic} Full Breakdown",
+                "description": "Action-packed, adrenaline-filled headline"
+            },
+            {
+                "category": "youtube_shorts",
+                "category_label": "YouTube Shorts",
+                "title": f"{topic} Best Scene Recap #shorts #movierecap",
+                "description": "Punchy short-form title optimized for Shorts and Reels"
+            }
+        ]
+
+
 async def generate_movie_titles(
     original_title: str = "",
     transcript_text: str = "",
@@ -1978,77 +2229,58 @@ async def generate_movie_titles(
     language: str = "km",
 ) -> list[dict]:
     """Generate viral, high-CTR movie recap titles in multiple popular styles."""
-    keys = await _get_active_keys()
-    if not keys:
-        if not settings.gemini_api_key or settings.gemini_api_key == "your_gemini_api_key_here":
-            raise RuntimeError("No active Gemini API keys configured. Please add an API key in Settings.")
-        keys = [settings.gemini_api_key]
+    prompt = f"""You are an elite YouTube growth strategist and viral video metadata specialist.
 
-    system_instruction = f"""You are a master movie recap creator and social media video editor specialized in viral TikTok, Facebook Reels, and YouTube titles.
+Target Language: {language} (use authentic Cambodian Khmer for 'km', or English for 'en').
+Movie / Video Topic: {original_title or 'Untitled Video'}
 
-Language: {language} (use natural conversational Khmer with standard continuous script if language is 'km').
+Dialogue Transcript Summary:
+{transcript_text[:5000] if transcript_text else 'No dialogue available'}
 
-Generate a structured set of 5-8 extremely catchy, viral movie recap titles across distinct popular categories:
-1. "viral_hook": High-suspense / curiosity clickbait hook (ចំណងជើងទាក់ទាញ)
-2. "comedy_nickname": Humorous & Cambodian character nicknames e.g., អាប្រុសខូច, បុរសអាវខ្មៅ, មេបក្សចាស់វស្សា (កំប្លុកកំប្លែង)
-3. "action_battle": High-stakes action, martial arts & epic battle (វាយប្រហារ & ក្បាច់គុន)
-4. "drama_mystery": Emotional drama & deep secret (មនោសញ្ចេតនា & អាថ៌កំបាំង)
-5. "tiktok_short": Ultra-short, punchy title with emojis for TikTok / Reels (ខ្លីខ្លឹមបែប TikTok)
+CRITICAL DISTINCTION BETWEEN VIDEO TITLES AND SPOKEN HOOKS:
+- DO NOT generate spoken narrator voiceover sentences (e.g. do not write "Don't look down on this guy...").
+- YOU MUST generate actual VIDEO HEADLINES (the title text that appears under the YouTube thumbnail, Facebook post title, or TikTok caption).
 
-Output ONLY a JSON array of objects:
+Standard Title Formats to Follow (Khmer):
+1. YouTube Standard & SEO: `សម្រាយរឿង [Title] ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តពីដើមដល់ចប់ (Full Movie Recap)`
+2. High-CTR Viral Title: `សម្រាយរឿង៖ [Title] - [Shocking Climax / Hidden Secret]!`
+3. Action & Battle Title: `កំពូលក្បាច់គុនកក្រើកពិភពគុណ | សម្រាយរឿង [Title] ភាគបញ្ចប់`
+4. Comedy & Nicknames: `អាប្រុសខូចប៉ះស្រីស្អាតចិត្តដាច់ | សម្រាយរឿងកំប្លែង [Title]`
+5. Drama & Mystery: `រឿង៖ [Title] - ការក្បត់ដែលនឹកស្មានមិនដល់ និងការលះបង់ដ៏ធំធេង`
+6. YouTube Shorts / TikTok: `សម្រាយរឿងខ្លី | [Title] #shorts #movierecap`
+7. Suspense & Shock: `វិនាទីចុងក្រោយដែលគ្មានអ្នកណាដឹង! | សម្រាយរឿង [Title]`
+
+Return ONLY a valid JSON array of objects matching this exact schema:
 [
   {{
-    "category": "viral_hook",
-    "category_label": "ចំណងជើងទាក់ទាញ (Viral Hook)",
-    "title": "កុំមើលងាយបុរសម្នាក់នេះឱ្យសោះ បើមិនចង់ស្តាយក្រោយ!",
-    "description": "ចំណងជើងបែបភ្ញាក់ផ្អើល បង្កើតការចង់ដឹងចង់ឃើញខ្ពស់"
+    "category": "youtube_long",
+    "category_label": "ចំណងជើង YouTube ស្តង់ដារ & SEO",
+    "title": "សម្រាយរឿង {original_title or 'វីដេអូ'} ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តពីដើមដល់ចប់ (Full Movie Recap)",
+    "description": "ចំណងជើងស្តង់ដារ YouTube Long-form មានពាក្យគន្លឹះ SEO ពេញលេញ"
   }}
 ]"""
 
-    user_content = f"Original Movie Title / Topic: {original_title or 'Untitled Movie / Video'}\n\n"
-    if transcript_text:
-        user_content += f"Subtitles / Dialogue Transcript Content:\n{transcript_text[:6000]}\n"
+    try:
+        response = await _generate_with_fallback(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.85,
+                response_mime_type="application/json",
+            )
+        )
+        if response and response.text:
+            text = response.text.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\n?", "", text)
+                text = re.sub(r"\n?```$", "", text)
+            parsed = _safe_json_loads(text)
+            titles = _normalize_title_items(parsed, original_title=original_title, language=language)
+            if titles:
+                return titles
+    except Exception as e:
+        print(f"[generate_movie_titles] Gemini call failed: {e}", flush=True)
 
-    models_to_try = [
-        settings.gemini_model or "gemini-2.5-flash",
-        "gemini-2.5-flash",
-        "gemini-flash-latest",
-        "gemini-3.6-flash",
-        "gemini-flash-lite-latest",
-        "gemini-3.7-flash",
-    ]
-    seen = set()
-    models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
-
-    last_err = None
-    for api_key in keys:
-        for model_name in models_to_try:
-            try:
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel(
-                    model_name=model_name,
-                    system_instruction=system_instruction,
-                    generation_config=genai.GenerationConfig(
-                        temperature=0.8,
-                        response_mime_type="application/json",
-                    ),
-                )
-                response = await asyncio.to_thread(model.generate_content, user_content)
-                if response and response.text:
-                    text = response.text.strip()
-                    if text.startswith("```"):
-                        text = re.sub(r"^```(?:json)?\n?", "", text)
-                        text = re.sub(r"\n?```$", "", text)
-                    titles = _safe_json_loads(text)
-                    if isinstance(titles, list) and len(titles) > 0:
-                        return titles
-            except Exception as e:
-                last_err = e
-                continue
-
-    if last_err:
-        raise RuntimeError(f"Title generation failed: {last_err}")
-    return []
+    return _normalize_title_items(None, original_title=original_title, language=language)
 
 
 async def generate_social_media_script(
@@ -2362,4 +2594,245 @@ Output ONLY the raw JSON object."""
         "full_post": f"The untold truth behind {fallback_title}! 🔥\n\nFollow and share your thoughts below!\n\n#fyp #viral #movierecap #trending #cinema",
         "full_script_markdown": f"# {fallback_title} - Short-Form Cue Sheet\n\nPlatform: {platform} | Tone: {tone_guide}\n"
     }
+
+
+async def generate_viral_metadata_package(
+    original_title: str,
+    transcript_text: str,
+    language: str = "km",
+    tone: str = "viral",
+    platform: str = "all",
+) -> dict:
+    """Generate high-CTR viral titles, descriptions, hashtags, and social metadata."""
+    prompt = f"""You are a top-tier viral YouTube growth specialist and movie recap metadata copywriter.
+Analyze this video content and generate an ultra-high-converting, professional metadata package.
+
+Title/Topic: {original_title or 'Untitled Video'}
+Language: {language} (use authentic Cambodian Khmer if 'km', or English if 'en')
+Tone: {tone}
+Platform: {platform}
+
+Dialogue Transcript:
+{transcript_text[:5000] if transcript_text else 'No dialogue available'}
+
+Generate a structured JSON object with:
+{{
+  "titles": [
+    "🔥 [High-CTR Clickable Title 1]",
+    "⚡ [Suspense Hook Title 2]",
+    "💥 [Curiosity Gap Title 3]",
+    "🎬 [Story / Dramatic Title 4]",
+    "🌟 [Short Punchy Title 5]"
+  ],
+  "description": "Comprehensive, professional YouTube video description formatted in 3-4 sections:\\n\\n1. Hook & Introduction (1-2 punchy sentences)\\n2. Synopsis & Story Highlights (2 natural paragraphs detailing key conflict, character struggle, and turning points)\\n3. Call To Action (Like, Share, Subscribe, and leave your thoughts in comments)\\n4. Disclaimer & Hashtags: ⚠️ ការរក្សាសិទ្ធិ (Copyright Disclaimer under Fair Use) & #សម្រាយរឿង #MovieRecap #KhmerMovie #Cinema",
+  "short_caption": "1-2 sentence TikTok/Reels caption with emoji hooks and viral hashtags.",
+  "hashtags": [
+    "#សម្រាយរឿង", "#សម្រាយរឿងពេញ", "#សម្រាយរឿងចិន", "#សម្រាយរឿងថៃ", "#សម្រាយសាច់រឿង",
+    "#រឿងពេញ", "#ភាពយន្ត", "#ភាពយន្តភាគ", "#movierecap", "#filmrecap",
+    "#movieexplained", "#cinemakhmer", "#khmermovie", "#endingexplained", "#fullmovierecap",
+    "#fyp", "#viral", "#trending", "#reels", "#shorts", "#tiktokkhmer", "#youtubeshorts"
+  ],
+  "seo_keywords": [
+    "សម្រាយរឿង", "សម្រាយរឿងពេញ", "{original_title or 'វីដេអូ'}", "សម្រាយរឿង {original_title or 'វីដេអូ'} ភាគបញ្ចប់",
+    "{original_title or 'វីដេអូ'} full movie", "movie recap khmer", "{original_title or 'វីដេអូ'} recap",
+    "រឿងចិននិយាយខ្មែរ", "ភាពយន្តភាគចិន", "ក្បាច់គុនបុរាណ", "film review khmer",
+    "cinema khmer", "រឿងពេញ 2024", "movie recap 2024", "ending explained khmer"
+  ],
+  "pinned_comment": "Curiosity debate question to pin in the comments section to boost viewer comments.",
+  "thumbnail_text_ideas": [
+    "នឹកស្មានមិនដល់! 😱",
+    "ការពិតត្រូវបានទម្លាយ! 💥",
+    "កុំមើលរំលងឱ្យសោះ! 🔥",
+    "ស្ដេចសង្គ្រាមត្រឡប់មកវិញ! ⚔️"
+  ]
+}}
+
+Return ONLY valid JSON."""
+
+    try:
+        response = await _generate_with_fallback(prompt)
+        if response and response.text:
+            text = response.text.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\n?", "", text)
+                text = re.sub(r"\n?```$", "", text)
+            data = _safe_json_loads(text)
+            if isinstance(data, dict):
+                # Ensure every hashtag strictly has a leading '#' and no spaces
+                raw_tags = data.get("hashtags", [])
+                if isinstance(raw_tags, list):
+                    clean_tags = []
+                    for t in raw_tags:
+                        c = str(t).strip().lstrip("#").replace(" ", "")
+                        if c:
+                            clean_tags.append(f"#{c}")
+                    if clean_tags:
+                        data["hashtags"] = clean_tags
+                return data
+    except Exception as e:
+        print(f"Error generating viral metadata: {e}")
+
+    fallback_t = original_title or "វីដេអូសម្រាយរឿង"
+    tag_clean = fallback_t.replace(" ", "")
+    return {
+        "titles": [
+          f"សម្រាយរឿង {fallback_t} ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តពីដើមដល់ចប់ (Full Movie Recap)",
+          f"🔥 ការពិតដែលអ្នកមិនធ្លាប់ដឹងពី {fallback_t}!",
+          f"⚡ ឈុតឆាកដ៏ភ្ញាក់ផ្អើលបំផុតនៅក្នុង {fallback_t}",
+          f"🎬 សម្រាយរឿង៖ {fallback_t} - កំពូលឈុតឆាកជក់ចិត្ត",
+          f"🌟 {fallback_t} - រឿងរ៉ាវនឹកស្មានមិនដល់!"
+        ],
+        "description": (
+            f"🎬 សូមស្វាគមន៍មកកាន់ការសម្រាយរឿងពេញនៃខ្សែភាពយន្ត៖ {fallback_t}\n\n"
+            f"📖 សាច់រឿងសង្ខេប៖\n"
+            f"ខ្សែភាពយន្តនេះរៀបរាប់ពីរឿងរ៉ាវដ៏អស្ចារ្យ និងការតស៊ូដ៏ស្វិតស្វាញរបស់តួអង្គសំខាន់ ក្នុងការជម្នះឧបសគ្គ "
+            f"ព្រមទាំងការលាតត្រដាងការពិតដ៏អាថ៌កំបាំងដែលលាក់ទុកជាយូរមកហើយ។ រាល់ឈុតឆាកពោរពេញដោយភាពរំជួលចិត្ត "
+            f"ការក្បត់ និងការប្រយុទ្ធដ៏រំភើបញាប់ញ័រដែលមិនគួររំលង!\n\n"
+            f"🔔 កុំភ្លេចចុច Like, Share និង Subscribe រួចចុចសញ្ញាកណ្ដឹង ដើម្បីទទួលបានវីដេអូសម្រាយរឿងថ្មីៗជារៀងរាល់ថ្ងៃ!\n\n"
+            f"⚠️ Copyright Disclaimer:\n"
+            f"This video is created for movie review, recap, and educational commentary purposes under the Fair Use guidelines.\n\n"
+            f"#សម្រាយរឿង #{tag_clean} #movierecap #khmermovie #cinema #trending"
+        ),
+        "short_caption": f"ឈុតឆាកដ៏អស្ចារ្យដែលអ្នកមិនគួររំលង! 🔥✨ #{tag_clean} #សម្រាយរឿង #movierecap #viral #fyp",
+        "hashtags": [
+            "#សម្រាយរឿង", f"#{tag_clean}", "#សម្រាយរឿងពេញ", "#សម្រាយរឿងចិន", "#សម្រាយរឿងថៃ",
+            "#សម្រាយរឿងហូលីវូដ", "#សម្រាយសាច់រឿង", "#រឿងពេញ", "#ភាពយន្ត", "#ភាពយន្តភាគ",
+            "#movierecap", "#filmrecap", "#movieexplained", "#cinemakhmer", "#khmermovie",
+            "#endingexplained", "#fullmovierecap", "#fyp", "#viral", "#trending",
+            "#reels", "#shorts", "#tiktokkhmer", "#fbreels", "#youtubeshorts"
+        ],
+        "seo_keywords": [
+            "សម្រាយរឿង",
+            f"សម្រាយរឿង {fallback_t}",
+            f"សម្រាយរឿង {fallback_t} ភាគបញ្ចប់",
+            "សម្រាយរឿងពេញ",
+            fallback_t,
+            f"{fallback_t} full movie recap",
+            f"{fallback_t} ending explained",
+            f"{fallback_t} និយាយខ្មែរ",
+            "movie recap khmer",
+            "រឿងចិននិយាយខ្មែរ",
+            "ភាពយន្តភាគចិន",
+            "ក្បាច់គុនបុរាណ",
+            "cinema khmer",
+            "film recap khmer",
+            "សម្រាយរឿងល្អមើល",
+            "រឿងពេញ 2024",
+            "viral movie recap"
+        ],
+        "pinned_comment": f"តើអ្នកយល់យ៉ាងណាដែរចំពោះសាច់រឿង {fallback_t} មួយនេះ? ចែករំលែកមតិរបស់អ្នកនៅខាងក្រោម! 👇",
+        "thumbnail_text_ideas": [
+            "នឹកស្មានមិនដល់! 😱",
+            "ការពិតត្រូវបានទម្លាយ! 💥",
+            "កុំមើលរំលងឱ្យសោះ! 🔥",
+            "ស្ដេចសង្គ្រាមត្រឡប់មកវិញ! ⚔️"
+        ]
+    }
+
+
+async def generate_catchy_hooks(
+    original_title: str,
+    transcript_text: str,
+    language: str = "km",
+    duration_seconds: float = 4.0,
+    tone: str = "viral",
+) -> list[dict]:
+    """Generate high-retention viral opening hook scripts (~3-8s) before starting a video."""
+    prompt = f"""You are a master viral video hook creator for TikTok, YouTube Shorts, and Reels.
+Create 5 distinctly styled, viral opening hooks (length ~{duration_seconds:.1f}s) designed to stop viewers from scrolling in the first 3-5 seconds.
+
+Title/Topic: {original_title or 'Video'}
+Target Duration: ~{duration_seconds:.1f} seconds (around {max(8, int(duration_seconds * 3.5))} to {max(12, int(duration_seconds * 5.5))} Khmer words)
+Language: {language} (Authentic, natural, expressive spoken Cambodian Khmer)
+Tone: {tone}
+
+Content Context:
+{transcript_text[:3500] if transcript_text else 'Exciting movie scene / story'}
+
+Generate a JSON array with 5 hook variations:
+[
+  {{
+    "hook_id": "hook_1",
+    "category": "curiosity_gap",
+    "category_label": "Viral Curiosity Hook",
+    "text": "តើអ្នកដឹងទេថា ហេតុអ្វីបានជា...",
+    "estimated_seconds": {duration_seconds:.1f},
+    "why_it_works": "Piques immediate curiosity by asking an unexpected question."
+  }},
+  {{
+    "hook_id": "hook_2",
+    "category": "action_shock",
+    "category_label": "Action Shock Hook",
+    "text": "ត្រឹមតែមួយពព្រិចភ្នែក អ្វីៗទាំងអស់ត្រូវបានផ្លាស់ប្តូរទាំងស្រុង!",
+    "estimated_seconds": {duration_seconds:.1f},
+    "why_it_works": "Creates high stakes and sudden tension."
+  }},
+  {{
+    "hook_id": "hook_3",
+    "category": "drama_rage",
+    "category_label": "Drama & Mystery Hook",
+    "text": "គ្មានអ្នកណាស្មានដល់ថា រឿងនេះនឹងកើតឡើងនោះទេ!",
+    "estimated_seconds": {duration_seconds:.1f},
+    "why_it_works": "Emotional appeal that triggers intrigue."
+  }},
+  {{
+    "hook_id": "hook_4",
+    "category": "world_building",
+    "category_label": "World-Building Question",
+    "text": "តើមានអ្វីកើតឡើង នៅពេលដែល...",
+    "estimated_seconds": {duration_seconds:.1f},
+    "why_it_works": "Immerses viewer into the scene instantly."
+  }},
+  {{
+    "hook_id": "hook_5",
+    "category": "cliffhanger",
+    "category_label": "Suspense Cliffhanger",
+    "text": "មុនពេលដែលអ្នកសម្រេចចិត្ត សូមមើលឈុតនេះសិន!",
+    "estimated_seconds": {duration_seconds:.1f},
+    "why_it_works": "Commands attention and delays drop-off."
+  }}
+]
+
+Return ONLY the raw JSON array."""
+
+    try:
+        response = await _generate_with_fallback(prompt)
+        if response and response.text:
+            text = response.text.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\n?", "", text)
+                text = re.sub(r"\n?```$", "", text)
+            data = _safe_json_loads(text)
+            if isinstance(data, list) and len(data) > 0:
+                return data
+    except Exception as e:
+        print(f"Error generating catchy hooks: {e}")
+
+    # Fallback hooks
+    return [
+        {
+            "hook_id": "hook_1",
+            "category": "curiosity_gap",
+            "category_label": "Viral Curiosity Hook",
+            "text": f"តើអ្នកដឹងទេថា ហេតុអ្វីបានជារឿងរ៉ាវក្នុង {original_title or 'រឿងនេះ'} ធ្វើឱ្យមនុស្សគ្រប់គ្នាភ្ញាក់ផ្អើល?",
+            "estimated_seconds": duration_seconds,
+            "why_it_works": "Piques instant viewer curiosity."
+        },
+        {
+            "hook_id": "hook_2",
+            "category": "action_shock",
+            "category_label": "Action Shock Hook",
+            "text": "ត្រឹមតែមួយពព្រិចភ្នែក អ្វីៗទាំងអស់ត្រូវបានផ្លាស់ប្តូរទាំងស្រុង!",
+            "estimated_seconds": duration_seconds,
+            "why_it_works": "High energy opening hook."
+        },
+        {
+            "hook_id": "hook_3",
+            "category": "drama_rage",
+            "category_label": "Drama & Mystery Hook",
+            "text": "រឿងរ៉ាវអាថ៌កំបាំងដែលគ្មាននរណាដឹង ត្រូវបានលាតត្រដាងនៅទីនេះ!",
+            "estimated_seconds": duration_seconds,
+            "why_it_works": "Deep curiosity hook."
+        }
+    ]
 

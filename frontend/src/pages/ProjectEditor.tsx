@@ -8,6 +8,7 @@ import TimelineEditorPro from '../components/TimelineEditorPro';
 import StatusBar from '../components/StatusBar';
 import SettingsModal from '../components/SettingsModal';
 import ExportModal from '../components/ExportModal';
+import VideoToolsModal from '../components/VideoToolsModal';
 
 import MediaPool from '../components/MediaPool';
 import Sidebar from '../components/Sidebar';
@@ -32,8 +33,11 @@ import {
   PanelLeftOpen,
   Loader2,
   Smile,
+  Download,
+  Sparkles,
   User,
   Settings,
+  Image as ImageIcon,
 } from 'lucide-react';
 import { useThemeStore } from '../stores/themeStore';
 
@@ -71,6 +75,7 @@ export default function ProjectEditor() {
   // Modals state
   const [showSettings, setShowSettings] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
+  const [showVideoTools, setShowVideoTools] = useState(false);
 
   // Tabs
   const [leftTab, setLeftTab] = useState<MeatikaLeftTab>('tts');
@@ -126,6 +131,8 @@ export default function ProjectEditor() {
   }, [leftPanelWidth, timelineHeight]);
 
   useEffect(() => {
+    if (vocalsRef.current) { vocalsRef.current.pause(); vocalsRef.current.src = ''; }
+    if (bgmRef.current) { bgmRef.current.pause(); bgmRef.current.src = ''; }
     if (id) loadProject(id);
   }, [id]);
 
@@ -291,47 +298,6 @@ export default function ProjectEditor() {
     await loadProject(currentProject.id);
   };
 
-  if (isLoading && !currentProject) {
-    return (
-      <div className="h-screen flex items-center justify-center bg-[#0d0e11]">
-        <div className="flex flex-col items-center gap-3">
-          <Loader2 className="w-10 h-10 text-white animate-spin" />
-          <p className="text-xs text-zinc-400 font-medium tracking-wide">Opening Meatika Editor...</p>
-          <button
-            onClick={() => id && loadProject(id)}
-            className="mt-4 px-4 py-1.5 text-xs text-zinc-400 hover:text-white bg-white/5 hover:bg-white/10 rounded-lg border border-white/10 transition-all"
-          >
-            Click to Retry Connection
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (!currentProject) {
-    return (
-      <div className="h-screen flex items-center justify-center bg-[#0d0e11]">
-        <div className="text-center">
-          <p className="text-zinc-400 mb-4">{error || 'Project not found or server reconnecting...'}</p>
-          <div className="flex items-center justify-center gap-3">
-            <button
-              onClick={() => id && loadProject(id)}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg shadow-lg transition-all"
-            >
-              Retry Loading
-            </button>
-            <button
-              onClick={() => navigate('/')}
-              className="text-zinc-400 hover:text-white text-xs font-medium px-3 py-2"
-            >
-              Back to Projects
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="h-screen flex flex-col overflow-hidden bg-[#0d0e11] text-[#e1e3e6] select-none font-sans">
       {/* Global Error Toast */}
@@ -344,7 +310,7 @@ export default function ProjectEditor() {
         </div>
       )}
 
-      {/* Top Header Bar — Multi-Tab Video Project Workspace */}
+      {/* Top Header Bar — Multi-Tab Video Project Workspace (Always Fixed & Mounted) */}
       <header className="h-12 border-b border-[#1c1e24] bg-[#121316] px-4 flex items-center justify-between shrink-0 z-30">
         {/* Left: Meatika Menu & Panel Toggle */}
         <div className="flex items-center gap-1.5 shrink-0">
@@ -381,14 +347,17 @@ export default function ProjectEditor() {
         {/* Center: Multi-Project Tabs */}
         <ProjectTabBar />
 
-        {/* Right Actions: Export Video & Avatar */}
+        {/* Right Actions: Export Video & Settings */}
         <div className="flex items-center gap-2 shrink-0">
           <button
             onClick={() => setShowExportModal(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gradient-to-r from-white to-zinc-200 hover:from-white hover:to-white text-black font-bold text-xs shadow-sm active:scale-95 transition-all"
+            className="relative overflow-hidden group flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-pink-600 via-purple-600 to-indigo-600 hover:from-pink-500 hover:via-purple-500 hover:to-indigo-500 text-white font-bold text-xs shadow-lg shadow-purple-950/40 border border-white/15 active:scale-95 transition-all cursor-pointer"
+            title="Export Video, Audio, Subtitles & AI Viral Titles"
           >
-            <Smile className="w-3.5 h-3.5 text-black" />
-            <span className="hidden sm:inline">Export Video</span>
+            <span className="absolute inset-0 bg-gradient-to-r from-white/0 via-white/20 to-white/0 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-700 pointer-events-none" />
+            <Download className="w-3.5 h-3.5 text-white group-hover:translate-y-[-1px] transition-transform" />
+            <span className="hidden sm:inline tracking-wide">Export Video</span>
+            <Sparkles className="w-3 h-3 text-yellow-300 animate-pulse hidden md:inline" />
           </button>
 
           {/* Settings Button */}
@@ -403,7 +372,37 @@ export default function ProjectEditor() {
       </header>
 
       {/* Main Workspace Body */}
-      <div className="flex-1 flex overflow-hidden">
+      {isLoading && !currentProject ? (
+        <div className="flex-1 flex items-center justify-center bg-[#0d0e11]">
+          <div className="flex flex-col items-center gap-3">
+            <Loader2 className="w-8 h-8 text-teal-400 animate-spin" />
+            <p className="text-xs text-zinc-400 font-medium tracking-wide">Loading project...</p>
+          </div>
+        </div>
+      ) : !currentProject ? (
+        <div className="flex-1 flex items-center justify-center bg-[#0d0e11]">
+          <div className="text-center">
+            <p className="text-zinc-400 mb-4">{error || 'Project not found or server reconnecting...'}</p>
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={() => id && loadProject(id)}
+                className="px-4 py-2 bg-teal-600 hover:bg-teal-500 text-white text-xs font-semibold rounded-lg shadow-lg transition-all"
+              >
+                Retry Loading
+              </button>
+              <button
+                onClick={() => navigate('/')}
+                className="text-zinc-400 hover:text-white text-xs font-medium px-3 py-2"
+              >
+                Back to Projects
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <>
+          {/* Main Workspace Body — keyed by id so project switch cleanly remounts all panels */}
+          <div key={id} className="flex-1 flex overflow-hidden">
         {/* Left Tool Panel (TTS & AI, collapsible) */}
         <div
           className={`shrink-0 border-r border-[#1c1e24] bg-[#121316] flex flex-col overflow-hidden transition-all duration-150 ${
@@ -589,8 +588,8 @@ export default function ProjectEditor() {
         </div>
       </div>
 
-      {/* Bottom Multi-Track Timeline */}
-      <div className="border-t border-[#1c1e24] shrink-0" style={{ height: timelineHeight }}>
+      {/* Bottom Multi-Track Timeline — keyed by id so video tracks and clips re-initialize per project */}
+      <div key={`timeline-${id}`} className="border-t border-[#1c1e24] shrink-0" style={{ height: timelineHeight }}>
         <TimelineEditorPro
           videoRef={videoRef}
           vocalsRef={vocalsRef}
@@ -601,12 +600,15 @@ export default function ProjectEditor() {
         />
       </div>
 
-      {/* Status Bar */}
-      <StatusBar />
+          {/* Status Bar */}
+          <StatusBar />
+        </>
+      )}
 
       {/* Modals */}
       <SettingsModal open={showSettings} onClose={() => setShowSettings(false)} />
       <ExportModal open={showExportModal} onClose={() => setShowExportModal(false)} />
+      <VideoToolsModal open={showVideoTools} onClose={() => setShowVideoTools(false)} videoRef={videoRef} />
 
       {/* Hidden Audio Elements for Separated Stems */}
       <audio ref={vocalsRef} src={vocalsUrl || undefined} preload="auto" style={{ display: 'none' }} />
