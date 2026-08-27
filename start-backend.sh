@@ -18,4 +18,4 @@ fi
 # Enable Apple Silicon MPS for VoxCPM (faster inference on M-series chips)
 export VOXCPM_MPS_DTYPE=float16
 
-uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 1 --timeout-keep-alive 5
