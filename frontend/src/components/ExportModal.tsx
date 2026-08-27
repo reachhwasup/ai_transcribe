@@ -390,11 +390,19 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         setCurrentSourceTime(initialTime);
 
         setEndTime(String(Math.floor(currentProject.duration || 60)));
-        const base = (currentProject.video_filename || currentProject.name || 'meatika_export').replace(
-          /\.[^.]+$/,
-          ''
-        );
-        setExportName(base);
+        // Load custom export filename from localStorage if saved by user previously
+        const savedCustomName = currentProject?.id
+          ? localStorage.getItem(`meatika_export_name_${currentProject.id}`)
+          : null;
+        if (savedCustomName && savedCustomName.trim()) {
+          setExportName(savedCustomName.trim());
+        } else {
+          const base = (currentProject.video_filename || currentProject.name || 'meatika_export').replace(
+            /\.[^.]+$/,
+            ''
+          );
+          setExportName(base);
+        }
       }
     } else if (!open) {
       initializedOpenRef.current = false;
@@ -2068,14 +2076,50 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                 <div className="p-4 rounded-2xl bg-[#14161d] border border-white/5 space-y-3 shadow-sm">
                   {/* File Name */}
                   <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
-                      Output File Name
-                    </label>
+                    <div className="flex items-center justify-between">
+                      <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5 font-khmer">
+                        <FileText className="w-3.5 h-3.5 text-pink-400" />
+                        <span>Output File Name (ឈ្មោះឯកសារទាញយក)</span>
+                      </label>
+                      <div className="flex items-center gap-2">
+                        {currentProject?.id && localStorage.getItem(`meatika_export_name_${currentProject.id}`) && (
+                          <span className="text-[9.5px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-1.5 py-0.5 rounded flex items-center gap-1">
+                            <span>✓ Auto-saved</span>
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!currentProject) return;
+                            const base = (currentProject.video_filename || currentProject.name || 'meatika_export').replace(
+                              /\.[^.]+$/,
+                              ''
+                            );
+                            setExportName(base);
+                            localStorage.removeItem(`meatika_export_name_${currentProject.id}`);
+                          }}
+                          className="text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer hover:underline"
+                          title="Reset to default project filename"
+                        >
+                          ↺ Reset default
+                        </button>
+                      </div>
+                    </div>
                     <div className="flex items-center gap-2">
                       <input
                         type="text"
                         value={exportName}
-                        onChange={(e) => setExportName(e.target.value)}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setExportName(val);
+                          if (currentProject?.id) {
+                            if (val.trim()) {
+                              localStorage.setItem(`meatika_export_name_${currentProject.id}`, val.trim());
+                            } else {
+                              localStorage.removeItem(`meatika_export_name_${currentProject.id}`);
+                            }
+                          }
+                        }}
                         className="flex-1 bg-[#181a22] border border-white/10 focus:border-pink-500 rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-none transition-colors"
                         placeholder="export_video_name"
                       />
