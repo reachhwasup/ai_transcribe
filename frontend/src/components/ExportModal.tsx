@@ -720,6 +720,7 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
             full_description: (data as any).description || (data as any)?.captions?.full_description || (data as any)?.captions?.youtube_shorts || '',
             youtube_shorts: (data as any).description || (data as any)?.captions?.youtube_shorts || (data as any)?.captions?.full_description || '',
             tiktok: (data as any).short_caption || (data as any)?.captions?.tiktok || '',
+            facebook_reels: (data as any).facebook_caption || (data as any)?.captions?.facebook_reels || '',
           },
           hashtags: data.hashtags || [],
           seo_keywords: (data as any).seo_keywords || (data as any)?.seo_tags || [
@@ -1176,13 +1177,13 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                     Video Description & Caption (ការពិពណ៌នាវីដេអូ)
                   </h4>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                     {socialScriptData.captions.tiktok && (
                       <div className="p-3.5 rounded-xl bg-[#181a1f] border border-[#26282e] space-y-2 flex flex-col justify-between">
                         <div>
                           <div className="flex items-center justify-between mb-1.5">
                             <span className="text-[10px] font-bold text-pink-300 uppercase tracking-wider">
-                              📱 TikTok / Reels Caption
+                              📱 TikTok / Shorts
                             </span>
                             <button
                               onClick={() => copyToClipboard(socialScriptData?.captions?.tiktok || '', 'desc-tiktok')}
@@ -1199,12 +1200,34 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                       </div>
                     )}
 
+                    {(socialScriptData.captions.facebook_reels || (socialScriptData as any).facebook_caption) && (
+                      <div className="p-3.5 rounded-xl bg-[#181a1f] border border-[#26282e] space-y-2 flex flex-col justify-between">
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-[10px] font-bold text-blue-400 uppercase tracking-wider">
+                              📘 Facebook Post & Reels
+                            </span>
+                            <button
+                              onClick={() => copyToClipboard(socialScriptData?.captions?.facebook_reels || (socialScriptData as any)?.facebook_caption || '', 'desc-fb')}
+                              className="text-[10px] text-zinc-400 hover:text-white font-semibold flex items-center gap-1 cursor-pointer"
+                            >
+                              {copiedKey === 'desc-fb' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                              <span>{copiedKey === 'desc-fb' ? 'Copied' : 'Copy'}</span>
+                            </button>
+                          </div>
+                          <p className="text-[11px] text-zinc-300 whitespace-pre-line select-text line-clamp-6">
+                            {socialScriptData.captions.facebook_reels || (socialScriptData as any).facebook_caption}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
                     {(socialScriptData.captions.youtube_shorts || socialScriptData.captions.full_description) && (
                       <div className="p-3.5 rounded-xl bg-[#181a1f] border border-[#26282e] space-y-2 flex flex-col justify-between">
                         <div>
                           <div className="flex items-center justify-between mb-1.5">
                             <span className="text-[10px] font-bold text-red-300 uppercase tracking-wider">
-                              ▶️ YouTube / Full Description
+                              ▶️ YouTube Description
                             </span>
                             <button
                               onClick={() => copyToClipboard(socialScriptData?.captions?.youtube_shorts || socialScriptData?.captions?.full_description || '', 'desc-yt')}

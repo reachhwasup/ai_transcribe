@@ -2181,10 +2181,16 @@ def _normalize_title_items(raw_data, original_title: str = "", language: str = "
                 "description": "ចំណងជើងបែបអាថ៌កំបាំង រឿងរ៉ាវពិត និងមនោសញ្ចេតនាជ្រាលជ្រៅ"
             },
             {
+                "category": "facebook_post",
+                "category_label": "ចំណងជើង Facebook Watch & Reels",
+                "title": f"🔥 {topic} ភាគបញ្ចប់ | ឈុតឆាកកក្រើកដែលកំពុងផ្ទុះការគាំទ្រខ្លាំងលើ Facebook 🎬",
+                "description": "ចំណងជើងស្តង់ដារ Facebook Watch និង Facebook Reels មាន Emojis ទាក់ទាញ"
+            },
+            {
                 "category": "youtube_shorts",
-                "category_label": "ចំណងជើង YouTube Shorts & Reels",
+                "category_label": "ចំណងជើង YouTube Shorts & TikTok",
                 "title": f"សម្រាយរឿងខ្លី | {topic} ភាគ១ #shorts #movierecap",
-                "description": "ចំណងជើងខ្លីខ្លឹម ស័ក្តិសមសម្រាប់ YouTube Shorts និង Facebook Reels"
+                "description": "ចំណងជើងខ្លីខ្លឹម ស័ក្តិសមសម្រាប់ YouTube Shorts និង TikTok"
             },
             {
                 "category": "suspense",
@@ -2200,6 +2206,12 @@ def _normalize_title_items(raw_data, original_title: str = "", language: str = "
                 "category_label": "YouTube Standard & SEO",
                 "title": f"{topic} Full Movie Recap & Ending Explained (2024)",
                 "description": "High-CTR search-optimized YouTube video headline"
+            },
+            {
+                "category": "facebook_post",
+                "category_label": "Facebook Watch & Reels",
+                "title": f"🔥 {topic} - The full breakdown everyone is talking about! 🎬",
+                "description": "Engaging Facebook video post headline"
             },
             {
                 "category": "viral_hook",
@@ -2229,7 +2241,7 @@ async def generate_movie_titles(
     language: str = "km",
 ) -> list[dict]:
     """Generate viral, high-CTR movie recap titles in multiple popular styles."""
-    prompt = f"""You are an elite YouTube growth strategist and viral video metadata specialist.
+    prompt = f"""You are an elite YouTube & Facebook growth strategist and viral video metadata specialist.
 
 Target Language: {language} (use authentic Cambodian Khmer for 'km', or English for 'en').
 Movie / Video Topic: {original_title or 'Untitled Video'}
@@ -2243,12 +2255,13 @@ CRITICAL DISTINCTION BETWEEN VIDEO TITLES AND SPOKEN HOOKS:
 
 Standard Title Formats to Follow (Khmer):
 1. YouTube Standard & SEO: `សម្រាយរឿង [Title] ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តពីដើមដល់ចប់ (Full Movie Recap)`
-2. High-CTR Viral Title: `សម្រាយរឿង៖ [Title] - [Shocking Climax / Hidden Secret]!`
-3. Action & Battle Title: `កំពូលក្បាច់គុនកក្រើកពិភពគុណ | សម្រាយរឿង [Title] ភាគបញ្ចប់`
-4. Comedy & Nicknames: `អាប្រុសខូចប៉ះស្រីស្អាតចិត្តដាច់ | សម្រាយរឿងកំប្លែង [Title]`
-5. Drama & Mystery: `រឿង៖ [Title] - ការក្បត់ដែលនឹកស្មានមិនដល់ និងការលះបង់ដ៏ធំធេង`
-6. YouTube Shorts / TikTok: `សម្រាយរឿងខ្លី | [Title] #shorts #movierecap`
-7. Suspense & Shock: `វិនាទីចុងក្រោយដែលគ្មានអ្នកណាដឹង! | សម្រាយរឿង [Title]`
+2. Facebook Watch & Reels: `🔥 [Title] ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តដែលកំពុងល្បីខ្លាំងលើ Facebook 🎬`
+3. High-CTR Viral Title: `សម្រាយរឿង៖ [Title] - [Shocking Climax / Hidden Secret]!`
+4. Action & Battle Title: `កំពូលក្បាច់គុនកក្រើកពិភពគុណ | សម្រាយរឿង [Title] ភាគបញ្ចប់`
+5. Comedy & Nicknames: `អាប្រុសខូចប៉ះស្រីស្អាតចិត្តដាច់ | សម្រាយរឿងកំប្លែង [Title]`
+6. Drama & Mystery: `រឿង៖ [Title] - ការក្បត់ដែលនឹកស្មានមិនដល់ និងការលះបង់ដ៏ធំធេង`
+7. YouTube Shorts / TikTok: `សម្រាយរឿងខ្លី | [Title] #shorts #movierecap`
+8. Suspense & Shock: `វិនាទីចុងក្រោយដែលគ្មានអ្នកណាដឹង! | សម្រាយរឿង [Title]`
 
 Return ONLY a valid JSON array of objects matching this exact schema:
 [
@@ -2257,6 +2270,12 @@ Return ONLY a valid JSON array of objects matching this exact schema:
     "category_label": "ចំណងជើង YouTube ស្តង់ដារ & SEO",
     "title": "សម្រាយរឿង {original_title or 'វីដេអូ'} ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តពីដើមដល់ចប់ (Full Movie Recap)",
     "description": "ចំណងជើងស្តង់ដារ YouTube Long-form មានពាក្យគន្លឹះ SEO ពេញលេញ"
+  }},
+  {{
+    "category": "facebook_post",
+    "category_label": "ចំណងជើង Facebook Watch & Reels",
+    "title": "🔥 {original_title or 'វីដេអូ'} ភាគបញ្ចប់ | ឈុតឆាកកក្រើកដែលកំពុងផ្ទុះការគាំទ្រខ្លាំងលើ Facebook 🎬",
+    "description": "ចំណងជើង Facebook Watch និង Reels ទាក់ទាញការចុចទស្សនា និងចែករំលែក"
   }}
 ]"""
 
@@ -2626,11 +2645,12 @@ Generate a structured JSON object with:
   ],
   "description": "Comprehensive, professional YouTube video description formatted in 3-4 sections:\\n\\n1. Hook & Introduction (1-2 punchy sentences)\\n2. Synopsis & Story Highlights (2 natural paragraphs detailing key conflict, character struggle, and turning points)\\n3. Call To Action (Like, Share, Subscribe, and leave your thoughts in comments)\\n4. Disclaimer & Hashtags: ⚠️ ការរក្សាសិទ្ធិ (Copyright Disclaimer under Fair Use) & #សម្រាយរឿង #MovieRecap #KhmerMovie #Cinema",
   "short_caption": "1-2 sentence TikTok/Reels caption with emoji hooks and viral hashtags.",
+  "facebook_caption": "Engaging 2-paragraph Facebook Watch / Reels caption with movie hook, emojis, follow call-to-action, and hashtags.",
   "hashtags": [
     "#សម្រាយរឿង", "#សម្រាយរឿងពេញ", "#សម្រាយរឿងចិន", "#សម្រាយរឿងថៃ", "#សម្រាយសាច់រឿង",
     "#រឿងពេញ", "#ភាពយន្ត", "#ភាពយន្តភាគ", "#movierecap", "#filmrecap",
     "#movieexplained", "#cinemakhmer", "#khmermovie", "#endingexplained", "#fullmovierecap",
-    "#fyp", "#viral", "#trending", "#reels", "#shorts", "#tiktokkhmer", "#youtubeshorts"
+    "#fyp", "#viral", "#trending", "#reels", "#shorts", "#tiktokkhmer", "#fbreels", "#facebookwatch", "#youtubeshorts"
   ],
   "seo_keywords": [
     "សម្រាយរឿង", "សម្រាយរឿងពេញ", "{original_title or 'វីដេអូ'}", "សម្រាយរឿង {original_title or 'វីដេអូ'} ភាគបញ្ចប់",
@@ -2677,7 +2697,7 @@ Return ONLY valid JSON."""
     return {
         "titles": [
           f"សម្រាយរឿង {fallback_t} ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តពីដើមដល់ចប់ (Full Movie Recap)",
-          f"🔥 ការពិតដែលអ្នកមិនធ្លាប់ដឹងពី {fallback_t}!",
+          f"🔥 {fallback_t} ភាគបញ្ចប់ | ឈុតឆាកកក្រើកដែលកំពុងផ្ទុះការគាំទ្រខ្លាំងលើ Facebook 🎬",
           f"⚡ ឈុតឆាកដ៏ភ្ញាក់ផ្អើលបំផុតនៅក្នុង {fallback_t}",
           f"🎬 សម្រាយរឿង៖ {fallback_t} - កំពូលឈុតឆាកជក់ចិត្ត",
           f"🌟 {fallback_t} - រឿងរ៉ាវនឹកស្មានមិនដល់!"
@@ -2694,12 +2714,19 @@ Return ONLY valid JSON."""
             f"#សម្រាយរឿង #{tag_clean} #movierecap #khmermovie #cinema #trending"
         ),
         "short_caption": f"ឈុតឆាកដ៏អស្ចារ្យដែលអ្នកមិនគួររំលង! 🔥✨ #{tag_clean} #សម្រាយរឿង #movierecap #viral #fyp",
+        "facebook_caption": (
+            f"🔥 សម្រាយរឿងពេញ៖ {fallback_t} ភាគបញ្ចប់ 🎬\n\n"
+            f"ឈុតឆាកប្រយុទ្ធដ៏ស្វិតស្វាញ និងអាថ៌កំបាំងដ៏រន្ធត់ដែលមិនធ្លាប់ដឹងពីមុនមក! "
+            f"តើចុងបញ្ចប់នឹងទៅជាយ៉ាងណា? ទស្សនាទាំងអស់គ្នា!\n\n"
+            f"👉 ចុច Like & Follow Page ដើម្បីកុំឱ្យរំលងវីដេអូសម្រាយរឿងល្អៗជាច្រើនទៀត! 🍿✨\n\n"
+            f"#សម្រាយរឿង #{tag_clean} #fbreels #facebookwatch #movierecap #viral #trending"
+        ),
         "hashtags": [
             "#សម្រាយរឿង", f"#{tag_clean}", "#សម្រាយរឿងពេញ", "#សម្រាយរឿងចិន", "#សម្រាយរឿងថៃ",
             "#សម្រាយរឿងហូលីវូដ", "#សម្រាយសាច់រឿង", "#រឿងពេញ", "#ភាពយន្ត", "#ភាពយន្តភាគ",
             "#movierecap", "#filmrecap", "#movieexplained", "#cinemakhmer", "#khmermovie",
             "#endingexplained", "#fullmovierecap", "#fyp", "#viral", "#trending",
-            "#reels", "#shorts", "#tiktokkhmer", "#fbreels", "#youtubeshorts"
+            "#reels", "#shorts", "#tiktokkhmer", "#fbreels", "#facebookwatch", "#youtubeshorts"
         ],
         "seo_keywords": [
             "សម្រាយរឿង",
