@@ -1,64 +1,60 @@
-import { useRef, useState, useCallback, useEffect, useMemo, RefObject } from 'react';
+import { useShallow } from 'zustand/react/shallow';
+import VoicePlaybackAudio from './timeline/VoicePlaybackAudio';
+import { useRef, useState, useCallback, useEffect, useLayoutEffect, useMemo, RefObject, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { useProjectStore } from '../stores/projectStore';
 import type { Segment, VideoClip } from '../types';
-import { getVideoClips, splitClipAtPlayhead, deleteVideoClip, restoreVideoClips, updateVideoClip, reorderVideoClips, updateProject, flipVideo, rotateVideo, changeVideoSpeed, cropVideo, blurVideoRegion, appendVideoFileToTimeline, addVideoClip, separateProjectAudio, sanitizeProjectTimeline, removeProjectVideo } from '../api/client';
+import { getVideoClips, splitClipAtPlayhead, deleteVideoClip, restoreVideoClips, updateVideoClip, reorderVideoClips, updateProject, flipVideo, rotateVideo, cropVideo, appendVideoFileToTimeline, addVideoClip, separateProjectAudio, checkAudioSeparation, fetchStemPeaks, cleanBgm, type BgmCleanLevel, snapCaptionsToSpeech, addToPipeline, tidyCaptions, restoreSegments, autoFitAudioToSubtitles, fetchGapPlan, applyVoiceFx, previewVoiceFx, spreadIntoSilence, normalizeSpeakingRate, splitLongCaptions, saveTextOverlays, TEXT_OVERLAYS_CHANGED, type TextOverlay, type CaptionGap, proposeShorterLines, applyShortened } from '../api/client';
 import { buildClipLayout, totalTimelineDuration, timelineToSource, sourceToTimeline, sourceRangeToTimeline } from '../utils/clipTimemap';
+import { StemTrackLabel, StemTrackLane } from './timeline/StemTrack';
+import { OverlayTrackLabel, OverlayTrackLane, useOverlayTrackPosition, useTextOverlays } from './timeline/OverlayTrack';
+import { LogoTrackLabel, LogoTrackLane, useLogoSettings } from './timeline/LogoTrack';
+import { saveLogoSettings, type LogoSettings } from './player/LogoTools';
+import VoiceCaptureModal from './timeline/VoiceCaptureModal';
+import { offerSplitIfLong } from '../utils/offerSplit';
+import { PROJECT_SETTINGS_SYNCED, saveProjectSetting } from '../utils/projectSettings';
+import CropModal from './timeline/CropModal';
+import FillGapsModal from './FillGapsModal';
+import { VOICE_EFFECTS, VOICE_EFFECT_GROUPS, applyEffectToLines } from '../utils/voiceEffects';
 import {
   Volume2,
   Volume1,
   VolumeX,
-  Languages,
   Sparkles,
-  AudioLines,
   ChevronDown,
   Music,
   Mic,
   Loader2,
-  Check,
+  AlertCircle,
+  StretchHorizontal,
+  Gauge,
+  Split,
   X,
   Scissors,
   Trash2,
-  Film,
-  MousePointer2,
   Undo2,
   Redo2,
-  Lock,
-  Unlock,
   Eye,
   EyeOff,
-  MoreHorizontal,
   FlipHorizontal,
-  Gauge,
   Plus,
-  ZoomIn,
-  ZoomOut,
-  FlipVertical,
   RotateCw,
   RotateCcw,
+  FlipVertical,
   Crop,
-  Eraser,
-  Copy,
-  Type,
   Snowflake,
   Bookmark,
-  TrendingUp,
-  Play,
-  Pause,
-  Magnet,
   MoveHorizontal,
-  ChevronLeft,
-  ChevronRight,
-  ArrowUpDown,
-  Shuffle,
-  GripHorizontal,
-  ArrowLeftRight,
-  Keyboard,
-  SkipBack,
-  SkipForward,
+  Magnet,
+  Timer,
   Maximize2,
-  Wand2,
-  Zap,
   Upload,
+  Check,
+  Wand2,
+  Users,
+  Play,
+  RefreshCw,
+  Minimize2,
 } from 'lucide-react';
 
 interface Props {
@@ -68,58 +64,264 @@ interface Props {
   audioSeparated?: boolean;
   onAudioSeparated?: (vocalsUrl: string, bgmUrl: string) => void;
   onRemoveAudioSeparation?: () => void;
+  /** Height the timeline needs to show every track without scrolling. */
+  onContentHeight?: (height: number) => void;
 }
+
+// Fixed rows above the tracks: toolbar, minimap, time ruler
+const TIMELINE_CHROME_HEIGHT = 36 + 12 + 28;
+
+/** A readable clip name: no extension and no trailing #hashtags from a download title. */
+const clipTitle = (filename: string) => {
+  const name = filename.replace(/\.[a-z0-9]{2,4}$/i, '').replace(/#[^\s#]+/g, '').replace(/\s{2,}/g, ' ').trim();
+  return name || filename;
+};
+
 
 const COLORS = [
   '#3d8eff', '#8b5cf6', '#10b981', '#f59e0b', '#ef4444',
   '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#6366f1',
-];
+]; // speed is now per-segment in SubtitleDataPanel
 
-const _UNUSED_SPEED = 0; // speed is now per-segment in SubtitleDataPanel
+const VOICE_TRACK_NAMES: Record<string, string> = {
+  female: 'Voice · female',
+  male: 'Voice · male',
+  child: 'Voice · child',
+  child_boy: 'Voice · boy',
+  child_girl: 'Voice · girl',
+  grandma: 'Voice · grandma',
+  grandpa: 'Voice · grandpa',
+};
 
-export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSeparated, onAudioSeparated, onRemoveAudioSeparation }: Props) {
+/** Track code chip plus a human-readable track name, for the timeline's label column. */
+function TrackTag({ code, name }: { code: string; name: string }) {
+  return (
+    <span className="flex items-center gap-1.5 min-w-0">
+      <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 border border-blue-500/30 font-mono shrink-0">
+        {code}
+      </span>
+      <span className="text-[11px] text-zinc-400 truncate">{name}</span>
+    </span>
+  );
+}
+
+const MINIMAP_BUCKETS = 240;
+
+function IconButton({ onClick, disabled, title, active, label, children }: {
+  onClick: () => void;
+  disabled?: boolean;
+  title: string;
+  active?: boolean;
+  /** Shown beside the icon. Without it the button stays icon-only. */
+  label?: string;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      className={`flex items-center gap-1.5 rounded-md transition-colors cursor-pointer whitespace-nowrap disabled:opacity-30 disabled:cursor-not-allowed ${
+        label ? 'px-2 h-7 text-[11px] font-medium' : 'p-1.5'
+      } ${active ? 'bg-blue-600/30 text-blue-200' : 'text-zinc-400 hover:text-white hover:bg-white/10'}`}
+    >
+      {children}
+      {label && <span>{label}</span>}
+    </button>
+  );
+}
+
+export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSeparated, onAudioSeparated, onRemoveAudioSeparation, onContentHeight }: Props) {
   const {
     currentProject,
     currentTime,
     isPlaying,
     activeSegmentId,
     isTranscribing,
-    transcribeProgress,
     transcribePercent,
     setActiveSegment,
     setCurrentTime,
     updateSegment,
-    addSegment,
-    generateTranscript,
-    cancelTranscription,
     generateVoiceForSegments,
     videoClips,
     setVideoClips,
     loadProject,
     selectedSegmentIds,
+    setSelectedSegmentIds,
     deleteSegment,
     deleteMultipleSegments,
-    deleteAllSegments,
     videoMuted: a2Muted,
     setVideoMuted: setA2Muted,
     subtitlesVisible,
     videoVisible,
     hiddenTracks,
-    toggleSubtitlesVisible,
-    toggleVideoVisible,
     toggleTrackVisibility,
-    aspectRatio,
-    setAspectRatio,
-    canvasZoom,
-    setCanvasZoom,
     isGeneratingAudio,
-    audioGenProgress,
-    audioGenTotal,
-  } = useProjectStore();
+  } = useProjectStore(useShallow(state => ({ currentProject: state.currentProject, currentTime: state.currentTime, isPlaying: state.isPlaying, activeSegmentId: state.activeSegmentId, isTranscribing: state.isTranscribing, transcribePercent: state.transcribePercent, setActiveSegment: state.setActiveSegment, setCurrentTime: state.setCurrentTime, updateSegment: state.updateSegment, generateVoiceForSegments: state.generateVoiceForSegments, videoClips: state.videoClips, setVideoClips: state.setVideoClips, loadProject: state.loadProject, selectedSegmentIds: state.selectedSegmentIds, setSelectedSegmentIds: state.setSelectedSegmentIds, deleteSegment: state.deleteSegment, deleteMultipleSegments: state.deleteMultipleSegments, videoMuted: state.videoMuted, setVideoMuted: state.setVideoMuted, subtitlesVisible: state.subtitlesVisible, videoVisible: state.videoVisible, hiddenTracks: state.hiddenTracks, toggleTrackVisibility: state.toggleTrackVisibility, isGeneratingAudio: state.isGeneratingAudio })));
+
+  // Right-click menu on a voice clip. Opened where the click landed, so the timeline never
+  // shifts to make room for it.
+  const [voiceMenu, setVoiceMenu] = useState<{ segmentId: string; x: number; y: number } | null>(null);
+  // Apply the chosen effect to just this clip, or to every voiced line by the same speaker
+  const [voiceMenuScope, setVoiceMenuScope] = useState<'line' | 'selected' | 'speaker'>('line');
+  const [regeneratingVoice, setRegeneratingVoice] = useState(false);
+  const [previewingFx, setPreviewingFx] = useState<string | null>(null);
+  const linePreviewRef = useRef<HTMLAudioElement | null>(null);
+  const [applyingVoiceEffect, setApplyingVoiceEffect] = useState<string | null>(null);
+  const [voiceEffectError, setVoiceEffectError] = useState('');
+  const voiceMenuRef = useRef<HTMLDivElement>(null);
+  const voiceMenuSeg = voiceMenu ? currentProject?.segments.find(s => s.id === voiceMenu.segmentId) : undefined;
+  // Voiced lines in the current multi-selection, when the right-clicked clip is one of them
+  const selectedVoiceIds = useMemo(() => {
+    if (!voiceMenuSeg || !selectedSegmentIds.has(voiceMenuSeg.id)) return [];
+    return (currentProject?.segments || []).filter(s => s.audio_url && selectedSegmentIds.has(s.id)).map(s => s.id);
+  }, [voiceMenuSeg, selectedSegmentIds, currentProject?.segments]);
+  const speakerVoiceIds = useMemo(() => {
+    if (!voiceMenuSeg?.speaker) return [];
+    return (currentProject?.segments || [])
+      .filter(s => s.audio_url && s.speaker === voiceMenuSeg.speaker)
+      .map(s => s.id);
+  }, [voiceMenuSeg?.speaker, currentProject?.segments]);
+  const closeVoiceMenu = useCallback(() => {
+    setVoiceMenu(null);
+    setVoiceEffectError('');
+  }, []);
+  useEffect(() => {
+    closeVoiceMenu();
+  }, [currentProject?.id, closeVoiceMenu]);
+  useEffect(() => {
+    if (!voiceMenu) return;
+    const onDown = (e: MouseEvent) => {
+      if (!voiceMenuRef.current?.contains(e.target as Node)) closeVoiceMenu();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeVoiceMenu();
+    };
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('resize', closeVoiceMenu);
+    return () => {
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('resize', closeVoiceMenu);
+    };
+  }, [voiceMenu, closeVoiceMenu]);
+  // A caption clip and its voice clip are the same line, so a selection is a set of lines.
+  // What Delete should take depends on where the selection was made: in the voice lane it
+  // removes the voices and keeps the captions. It used to delete the whole line either way.
+  const [selectionLane, setSelectionLane] = useState<'caption' | 'voice'>('caption');
+
+  /** Take the dubbed audio off these lines, leaving their captions. The files stay on disk,
+   *  so undo brings the voices back. */
+  const removeVoices = async (ids: string[]) => {
+    const voiced = ids.filter((id) => currentProject?.segments.find((s) => s.id === id)?.audio_url);
+    if (!voiced.length) return 0;
+    pushUndo();
+    for (const id of voiced) await updateSegment(id, { audio_url: '' });
+    return voiced.length;
+  };
+
+  const removeMenuVoice = async () => {
+    const seg = voiceMenuSeg;
+    if (!seg || isGeneratingAudio) return;
+    const ids =
+      voiceMenuScope === 'speaker' && speakerVoiceIds.length > 1
+        ? speakerVoiceIds
+        : voiceMenuScope === 'selected' && selectedVoiceIds.length > 1
+        ? selectedVoiceIds
+        : [seg.id];
+    closeVoiceMenu();
+    await removeVoices(ids);
+  };
+
+  const applyTimelineVoiceEffect = async (fx: string) => {
+    const seg = voiceMenuSeg;
+    if (!seg || !currentProject || isGeneratingAudio || applyingVoiceEffect) return;
+    const ids =
+      voiceMenuScope === 'speaker' && speakerVoiceIds.length > 1
+        ? speakerVoiceIds
+        : voiceMenuScope === 'selected' && selectedVoiceIds.length > 1
+        ? selectedVoiceIds
+        : [seg.id];
+    if (ids.length === 1 && fx === (seg.voice_fx || 'normal')) return closeVoiceMenu();
+    setApplyingVoiceEffect(fx);
+    setVoiceEffectError('');
+    try {
+      pushUndo(); // so Ctrl+Z puts the previous effect back
+      // Effects are filters on the finished voice, so this is ffmpeg only — no new TTS
+      await applyEffectToLines(ids, fx);
+      closeVoiceMenu();
+    } catch (error: any) {
+      // Stay open on failure so the message can be read
+      setVoiceEffectError(error?.response?.data?.detail || (error instanceof Error ? error.message : 'Could not apply voice effect'));
+    } finally {
+      setApplyingVoiceEffect(null);
+    }
+  };
+  const regenerateMenuVoice = async () => {
+    const seg = voiceMenuSeg;
+    if (!seg || !currentProject || isGeneratingAudio || regeneratingVoice) return;
+    const projectId = currentProject.id;
+    setRegeneratingVoice(true);
+    setVoiceEffectError('');
+    try {
+      await generateVoiceForSegments([seg.id], seg.audio_speed || 1, 'B', undefined, undefined, false, 'normal');
+      const genError = useProjectStore.getState().error;
+      if (genError) throw new Error(genError);
+      // Keep the clip's effect: regenerate clean, then restyle
+      if (seg.voice_fx && seg.voice_fx !== 'normal') await applyVoiceFx(projectId, [seg.id], seg.voice_fx);
+      if (useProjectStore.getState().currentProject?.id === projectId) await loadProject(projectId);
+      closeVoiceMenu();
+    } catch (error: any) {
+      setVoiceEffectError(error?.response?.data?.detail || (error instanceof Error ? error.message : 'Could not regenerate the voice'));
+    } finally {
+      setRegeneratingVoice(false);
+    }
+  };
+  /** Hear this line with an effect, without applying it. */
+  const previewMenuEffect = async (fx: string) => {
+    const seg = voiceMenuSeg;
+    if (!seg || !currentProject || previewingFx) return;
+    setPreviewingFx(fx);
+    setVoiceEffectError('');
+    try {
+      const res = await previewVoiceFx(currentProject.id, [seg.id], fx);
+      const url = res.previews[seg.id];
+      if (!url) {
+        setVoiceEffectError('This voice was made with its effect built in — use Regenerate voice first to preview others.');
+        return;
+      }
+      linePreviewRef.current?.pause();
+      videoRef.current?.pause();
+      useProjectStore.getState().setIsPlaying(false);
+      const audio = new Audio(url);
+      linePreviewRef.current = audio;
+      await audio.play();
+    } catch (error: any) {
+      setVoiceEffectError(error?.response?.data?.detail || 'Could not preview this effect');
+    } finally {
+      setPreviewingFx(null);
+    }
+  };
+  /** Hear just this clip, without starting the whole timeline. */
+  const playMenuLine = () => {
+    if (!voiceMenuSeg?.audio_url) return;
+    linePreviewRef.current?.pause();
+    videoRef.current?.pause();
+    useProjectStore.getState().setIsPlaying(false);
+    const audio = new Audio(voiceMenuSeg.audio_url);
+    linePreviewRef.current = audio;
+    void audio.play().catch(() => setVoiceEffectError('Could not play this clip'));
+    closeVoiceMenu();
+  };
+  useEffect(() => () => linePreviewRef.current?.pause(), []);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const trackLabelsRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(3);
+  // While on, the timeline keeps the whole video in view: it re-fits when the video's length
+  // changes and when the panel is resized. Zooming by hand turns it off; Fit turns it back on.
+  const [fitMode, setFitMode] = useState(true);
   const [dragging, setDragging] = useState<{
     segmentId: string;
     type: 'move' | 'resize-start' | 'resize-end';
@@ -220,6 +422,22 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     return () => window.removeEventListener('master-volume-change', onMasterVol);
   }, []);
 
+  // The mutes are kept with the project on the server too. Once the server's copy has arrived
+  // it is read in, and only from then on are changes sent back — so the defaults a fresh
+  // browser starts with never overwrite what was saved.
+  const [mutesFromServer, setMutesFromServer] = useState(0);
+  const mutesSyncedRef = useRef(false);
+  useEffect(() => {
+    mutesSyncedRef.current = false;
+    const onSynced = (e: Event) => {
+      if ((e as CustomEvent).detail?.projectId !== currentProject?.id) return;
+      mutesSyncedRef.current = true;
+      setMutesFromServer((n) => n + 1);
+    };
+    window.addEventListener(PROJECT_SETTINGS_SYNCED, onSynced);
+    return () => window.removeEventListener(PROJECT_SETTINGS_SYNCED, onSynced);
+  }, [currentProject?.id]);
+
   // Restore this project's saved mute choices (so they survive refresh)
   const mutesLoadedRef = useRef(false);
   useEffect(() => {
@@ -238,60 +456,48 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
       // corrupted entry — ignore
     }
     mutesLoadedRef.current = true;
+  }, [currentProject?.id, mutesFromServer]);
+
+  // "Mute the original voices in all" in the progress panel reaches the open project here
+  useEffect(() => {
+    const follow = (e: Event) => {
+      const { muted, projectIds } = (e as CustomEvent).detail || {};
+      if (currentProject?.id && (projectIds || []).includes(currentProject.id)) setV1Muted(!!muted);
+    };
+    window.addEventListener('vocals-mute-changed', follow);
+    return () => window.removeEventListener('vocals-mute-changed', follow);
   }, [currentProject?.id]);
 
   // Persist mute choices and volumes per project
   useEffect(() => {
     if (!currentProject?.id) return;
-    localStorage.setItem(
-      `timeline-mutes-${currentProject.id}`,
-      JSON.stringify({
-        tracks: Array.from(mutedTracks),
-        ai: Array.from(aiMutedProfiles),
-        b1: b1Muted,
-        v1: v1Muted,
-        a2: a2Muted,
-      })
-    );
+    const mutes = {
+      tracks: Array.from(mutedTracks),
+      ai: Array.from(aiMutedProfiles),
+      b1: b1Muted,
+      v1: v1Muted,
+      a2: a2Muted,
+    };
+    localStorage.setItem(`timeline-mutes-${currentProject.id}`, JSON.stringify(mutes));
+    if (mutesSyncedRef.current) saveProjectSetting(currentProject.id, 'track_mutes', mutes);
     localStorage.setItem(`timeline-video-volume-${currentProject.id}`, String(videoVolume));
     localStorage.setItem(`timeline-bgm-volume-${currentProject.id}`, String(bgmVolume));
     localStorage.setItem(`timeline-vocals-volume-${currentProject.id}`, String(vocalsVolume));
   }, [currentProject?.id, mutedTracks, aiMutedProfiles, b1Muted, v1Muted, a2Muted, videoVolume, bgmVolume, vocalsVolume]);
 
   // Generate Voice Audio state
-  const [audioGenerating, setAudioGenerating] = useState(false);
-  const [audioGenerated, setAudioGenerated] = useState(false);
+  const [isAutoFitting, setIsAutoFitting] = useState(false);
 
   // Editing tools state
-  const [showFlipPanel, setShowFlipPanel] = useState(false);
-  const [showSpeedPanel, setShowSpeedPanel] = useState(false);
   const [isFlipping, setIsFlipping] = useState(false);
   const [isRotating, setIsRotating] = useState(false);
-  const [showRotatePanel, setShowRotatePanel] = useState(false);
-  const [isChangingSpeed, setIsChangingSpeed] = useState(false);
   const [showCropModal, setShowCropModal] = useState(false);
+  const [captureTime, setCaptureTime] = useState<number | null>(null);
   const [isCropping, setIsCropping] = useState(false);
   const [cropX, setCropX] = useState(0);
   const [cropY, setCropY] = useState(0);
   const [cropW, setCropW] = useState(0);
   const [cropH, setCropH] = useState(0);
-  const [showBlurModal, setShowBlurModal] = useState(false);
-  const [isBlurring, setIsBlurring] = useState(false);
-  const [blurSnapshot, setBlurSnapshot] = useState<string | null>(null);
-  const [blurNatural, setBlurNatural] = useState({ w: 0, h: 0 });
-  const [blurRegion, setBlurRegion] = useState({ x: 0, y: 0, width: 0, height: 0 });
-  const [blurDrag, setBlurDrag] = useState<{
-    mode: 'move' | 'tl' | 'tr' | 'bl' | 'br';
-    startX: number;
-    startY: number;
-    orig: { x: number; y: number; width: number; height: number };
-  } | null>(null);
-  const blurImgRef = useRef<HTMLImageElement>(null);
-  const flipPanelRef = useRef<HTMLDivElement>(null);
-  const rotatePanelRef = useRef<HTMLDivElement>(null);
-  const speedPanelRef = useRef<HTMLDivElement>(null);
-  const moreToolsPanelRef = useRef<HTMLDivElement>(null);
-  const [showMoreToolsPanel, setShowMoreToolsPanel] = useState(false);
   const zoomDropdownRef = useRef<HTMLDivElement>(null);
   const [showZoomDropdown, setShowZoomDropdown] = useState(false);
 
@@ -319,8 +525,372 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
   });
 
   // Voice recording
-  const [isRecordingVoice, setIsRecordingVoice] = useState(false);
   const [isSeparatingAudio, setIsSeparatingAudio] = useState(false);
+  const [separationProgress, setSeparationProgress] = useState<{ percent: number; eta: number | null } | null>(null);
+  const [stemPeaks, setStemPeaks] = useState<{ vocals?: number[]; bgm?: number[] }>({});
+
+  // Leftover source dialogue removed from the BGM: off / light / strong
+  const [bgmClean, setBgmClean] = useState<BgmCleanLevel>('off');
+  const [bgmCleaning, setBgmCleaning] = useState<BgmCleanLevel | null>(null);
+  const [bgmKeepEffects, setBgmKeepEffects] = useState(false);
+  const [effectsBusy, setEffectsBusy] = useState(false);
+  const storeBgmUrl = useProjectStore((s) => s.bgmUrl);
+  useEffect(() => {
+    const projectId = currentProject?.id;
+    if (!audioSeparated || !projectId) return;
+    checkAudioSeparation(projectId)
+      .then((s) => {
+        setBgmClean(s.bgm_clean ?? 'off');
+        setBgmKeepEffects(!!s.bgm_keep_effects);
+      })
+      .catch(() => {});
+  }, [audioSeparated, currentProject?.id]);
+  const handleBgmClean = async (level: BgmCleanLevel) => {
+    const projectId = currentProject?.id;
+    if (!projectId || bgmCleaning || effectsBusy || level === bgmClean) return;
+    setBgmCleaning(level);
+    try {
+      const res = await cleanBgm(projectId, level);
+      setBgmClean(res.level);
+      setBgmKeepEffects(res.keep_effects);
+      const { vocalsUrl } = useProjectStore.getState();
+      onAudioSeparated?.(vocalsUrl || '', res.bgm_url);
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || 'Could not clean the BGM');
+    } finally {
+      setBgmCleaning(null);
+    }
+  };
+
+  const handleKeepEffects = async (on: boolean) => {
+    const projectId = currentProject?.id;
+    if (!projectId || effectsBusy || bgmCleaning) return;
+    setEffectsBusy(true);
+    try {
+      const res = await cleanBgm(projectId, bgmClean, on);
+      setBgmKeepEffects(res.keep_effects);
+      const { vocalsUrl } = useProjectStore.getState();
+      onAudioSeparated?.(vocalsUrl || '', res.bgm_url);
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || 'Could not update the BGM');
+    } finally {
+      setEffectsBusy(false);
+    }
+  };
+
+  // Waveform data for the isolated tracks (computed and cached by the backend)
+  useEffect(() => {
+    const projectId = currentProject?.id;
+    if (!audioSeparated || !projectId) {
+      setStemPeaks({});
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const [vocals, bgm] = await Promise.all([
+          fetchStemPeaks(projectId, 'vocals'),
+          fetchStemPeaks(projectId, 'bgm'),
+        ]);
+        if (!cancelled) setStemPeaks({ vocals, bgm });
+      } catch {
+        if (!cancelled) setStemPeaks({});
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // storeBgmUrl changes when the BGM is cleaned, which reshapes its waveform
+  }, [audioSeparated, currentProject?.id, storeBgmUrl]);
+
+  // Poll backend progress while isolating (it can take minutes on long videos)
+  useEffect(() => {
+    if (!isSeparatingAudio || !currentProject?.id) {
+      setSeparationProgress(null);
+      return;
+    }
+    const projectId = currentProject.id;
+    const timer = setInterval(async () => {
+      try {
+        const s = await checkAudioSeparation(projectId);
+        if (s.separating) setSeparationProgress({ percent: s.percent ?? 0, eta: s.eta_seconds ?? null });
+      } catch {
+        // transient; keep polling
+      }
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [isSeparatingAudio, currentProject?.id]);
+
+  const separationLabel = separationProgress
+    ? `Isolating audio… ${separationProgress.percent}%${
+        separationProgress.eta != null ? ` · ~${Math.max(1, Math.round(separationProgress.eta / 60))} min left` : ''
+      }`
+    : 'Isolating audio…';
+
+  const [isSnapping, setIsSnapping] = useState(false);
+
+  const handleSnapToSpeech = async () => {
+    if (!currentProject?.id || isSnapping) return;
+    setIsSnapping(true);
+    try {
+      pushUndo();  // so Ctrl+Z brings the old captions back
+      const res = await snapCaptionsToSpeech(currentProject.id);
+      await loadProject(currentProject.id);
+      alert(
+        res.moved
+          ? `Moved ${res.moved} of ${res.total} captions onto the nearest speech (typical move ${res.median_shift}s).`
+          : 'Captions already line up with the speech — nothing moved.'
+      );
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || 'Could not align captions to speech');
+    } finally {
+      setIsSnapping(false);
+    }
+  };
+
+  // Lip timing: the same move as Snap, and then the dub follows — a line whose time changed
+  // enough to hear is voiced again to fit the time the actor's mouth is moving
+  const [isLipTiming, setIsLipTiming] = useState(false);
+  const handleLipTiming = async () => {
+    if (!currentProject?.id || isLipTiming) return;
+    if (!confirm('Match this video\'s dub to the actors\' mouths?\n\nEach line is moved to where the original actor starts and stops speaking. Lines whose time changes are dubbed again to fit. A version is saved first.')) return;
+    setIsLipTiming(true);
+    try {
+      pushUndo();
+      const res = await snapCaptionsToSpeech(currentProject.id, true);
+      if (res.to_revoice) await addToPipeline(currentProject.id, { language: currentProject.language || 'km', captions: false, dub: true });
+      await loadProject(currentProject.id);
+      alert(
+        res.moved
+          ? `Moved ${res.moved} of ${res.total} lines onto the actors' speech. ${res.to_revoice || 0} ${res.to_revoice === 1 ? 'is' : 'are'} being dubbed again to fit — follow it in the Dubbing tab.`
+          : 'Every line already sits on its speech — nothing moved.'
+      );
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || 'Could not match the dub to the speech');
+    } finally {
+      setIsLipTiming(false);
+    }
+  };
+
+  const [isSplitting, setIsSplittingCaptions] = useState(false);
+
+  /** A caption holding more text than a box can ever show has to become several lines —
+   *  no amount of resizing helps it. Splitting divides the time that exists, so lines with
+   *  nowhere near enough room are left alone and reported instead. */
+  const handleSplitLongCaptions = async () => {
+    if (!currentProject?.id || isSplitting) return;
+    setIsSplittingCaptions(true);
+    try {
+      const preview = await splitLongCaptions(currentProject.id, { dryRun: true });
+      if (!preview.split && !preview.needs_retranscribe) {
+        alert('No caption is carrying more text than it can show.');
+        return;
+      }
+      const ok = confirm(
+        `Split ${preview.split} over-long captions into ${preview.split + preview.new_lines} lines?\n\n` +
+          (preview.needs_retranscribe
+            ? `${preview.needs_retranscribe} more hold far more text than their slot could ever show — ` +
+              `splitting cannot help those, they need re-transcribing. They are left untouched.\n\n`
+            : '') +
+          `The voice of a split line covered the whole line, so it is cleared and those lines need re-dubbing.`,
+      );
+      if (!ok) return;
+      pushUndo();  // so Ctrl+Z brings the old captions back
+      const res = await splitLongCaptions(currentProject.id);
+      await loadProject(currentProject.id);
+      alert(
+        `Split ${res.split} captions into ${res.split + res.new_lines} lines ` +
+          `(${res.total_before} → ${res.total_after} segments).\n` +
+          `${res.voices_cleared} voices cleared for re-dubbing, ${res.overlaps_trimmed} overlaps tidied.` +
+          (res.needs_retranscribe ? `\n${res.needs_retranscribe} lines still need re-transcribing.` : ''),
+      );
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || 'Could not split the captions');
+    } finally {
+      setIsSplittingCaptions(false);
+    }
+  };
+
+  const [isEvening, setIsEvening] = useState(false);
+
+  /** Some lines race and others drawl because their caption boxes bear little relation to how
+   *  much text they hold. This resizes each box towards the length its text takes to say. */
+  const handleNormalizeRate = async () => {
+    if (!currentProject?.id || isEvening) return;
+    setIsEvening(true);
+    try {
+      const preview = await normalizeSpeakingRate(currentProject.id, { dryRun: true });
+      if (!preview.adjusted) {
+        alert('Every caption already matches the length of its text.');
+        return;
+      }
+      const b = preview.rate_before;
+      const a = preview.rate_after;
+      const ok = confirm(
+        `Resize ${preview.adjusted} of ${preview.total} caption boxes to match their text?\n\n` +
+          `Speaking rate spread: ${b.ratio}x → ${a.ratio}x\n` +
+          `  slowest ${b.p10} → ${a.p10} chars/sec, fastest ${b.p90} → ${a.p90}\n\n` +
+          (preview.needs_redub
+            ? `${preview.needs_redub} lines were compressed so hard their voice can't be recovered by re-fitting — re-dub those afterwards.\n\n`
+            : '') +
+          `Only the caption timings change here; run auto-fit afterwards to match the voices.`,
+      );
+      if (!ok) return;
+      pushUndo();  // so Ctrl+Z brings the old timings back
+      const res = await normalizeSpeakingRate(currentProject.id);
+      await loadProject(currentProject.id);
+      alert(
+        `Resized ${res.adjusted} caption boxes. Speaking rate spread ${res.rate_before.ratio}x → ${res.rate_after.ratio}x.` +
+          (res.needs_redub ? `\n${res.needs_redub} lines still need re-dubbing.` : ''),
+      );
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || 'Could not even out the speaking rate');
+    } finally {
+      setIsEvening(false);
+    }
+  };
+
+  const [isShortening, setIsShortening] = useState(false);
+
+  /** A voice can only be sped up so far. Lines with more words than their time are offered
+   *  shorter wording instead; nothing changes until the proposals are accepted. */
+  const handleShortenToFit = async () => {
+    if (!currentProject?.id || isShortening) return;
+    setIsShortening(true);
+    try {
+      const targetIds = selectedSegmentIds.size > 0 ? Array.from(selectedSegmentIds) : undefined;
+      const plan = await proposeShorterLines(currentProject.id, targetIds);
+      if (!plan.candidates) {
+        alert(targetIds ? 'The selected lines can be said in the time they have.' : 'Every line can be said in the time it has.');
+        return;
+      }
+      if (!plan.proposals.length) {
+        alert(`${plan.candidates} lines are too long for their time, but none could be worded any shorter without losing meaning. Give them more room on the timeline, or edit them by hand.`);
+        return;
+      }
+      const stillLong = plan.proposals.filter((line) => !line.fits).length;
+      const voiced = plan.proposals.filter((line) => line.had_voice).length;
+      const sample = plan.proposals
+        .slice(0, 6)
+        .map((line) => `${line.chars_before} → ${line.chars_after} characters (${line.seconds}s)\n   ${line.before}\n → ${line.after}`)
+        .join('\n\n');
+      const ok = confirm(
+        `Shorten ${plan.proposals.length} lines so they can be said in their time?\n\n${sample}` +
+          (plan.proposals.length > 6 ? `\n\n…and ${plan.proposals.length - 6} more` : '') +
+          (stillLong ? `\n\n${stillLong} will still be a little long after shortening.` : '') +
+          (plan.unchanged ? `\n${plan.unchanged} could not be shortened and stay as they are.` : '') +
+          (voiced ? `\n\n${voiced} of these already have a voice, which will need dubbing again.` : '') +
+          `\n\nA version is saved first, and Ctrl+Z undoes it.`,
+      );
+      if (!ok) return;
+      pushUndo();
+      const res = await applyShortened(currentProject.id, plan.proposals.map((line) => ({ id: line.id, text: line.after })));
+      await loadProject(currentProject.id);
+      alert(`Shortened ${res.applied} lines${res.voices_cleared ? ` — ${res.voices_cleared} need dubbing again` : ''}.`);
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || 'Could not shorten the lines');
+    } finally {
+      setIsShortening(false);
+    }
+  };
+
+  const [isSpreading, setIsSpreading] = useState(false);
+
+  /** Dubbed lines often finish before the acting does, leaving the scene playing in silence.
+   *  This grows each line into the silence after it and slows its voice to match. */
+  const handleSpreadIntoSilence = async () => {
+    if (!currentProject?.id || isSpreading) return;
+    setIsSpreading(true);
+    try {
+      const preview = await spreadIntoSilence(currentProject.id, { dryRun: true });
+      if (!preview.stretched) {
+        alert('No usable silence after the captions — nothing to stretch.');
+        return;
+      }
+      const ok = confirm(
+        `Stretch ${preview.stretched} lines into the silence that follows them?\n\n` +
+          `Dead air: ${preview.silence_before}s → ${preview.silence_after}s ` +
+          `(${preview.seconds_reclaimed}s reclaimed)\n` +
+          `Each voice is slowed to match, never by more than 30%, so short lines stay natural.\n\n` +
+          `Their generated voices are re-fitted, which replaces those audio files.`,
+      );
+      if (!ok) return;
+      pushUndo();  // so Ctrl+Z brings the old timings back
+      const res = await spreadIntoSilence(currentProject.id);
+      await loadProject(currentProject.id);
+      alert(
+        `Stretched ${res.stretched} lines (+${res.seconds_reclaimed}s), re-fitted ${res.refitted_voices} voices.\n` +
+          `Dead air: ${res.silence_before}s → ${res.silence_after}s.`,
+      );
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || 'Could not stretch the captions');
+    } finally {
+      setIsSpreading(false);
+    }
+  };
+
+  const [isFixingReading, setIsFixingReading] = useState(false);
+
+  // Speech with no caption, drawn straight onto the timeline so the holes are visible
+  // where the captions are, instead of only as a number in a panel.
+  const [showMissing, setShowMissing] = useState(false);
+  // Opens the same review list the captions panel uses, on the dead-air tab: the stretches
+  // where nobody speaks are the ones a recap cuts out.
+  const [showCutPanel, setShowCutPanel] = useState(false);
+  const [missingGaps, setMissingGaps] = useState<CaptionGap[]>([]);
+  const [loadingMissing, setLoadingMissing] = useState(false);
+  const [missingError, setMissingError] = useState<string | null>(null);
+  const missingRequest = useRef(0);
+
+  const loadMissingGaps = useCallback(async () => {
+    if (!currentProject?.id) return;
+    const request = ++missingRequest.current;
+    setLoadingMissing(true);
+    setMissingError(null);
+    try {
+      const plan = await fetchGapPlan(currentProject.id);
+      if (request !== missingRequest.current) return;
+      setMissingGaps(plan.gaps);
+      if (!plan.vocals_available) {
+        setMissingError('Isolate vocals first to detect speech without captions');
+      }
+    } catch (e) {
+      if (request !== missingRequest.current) return;
+      setMissingGaps([]);
+      setMissingError(e instanceof Error ? e.message : 'Could not scan for missing captions');
+    } finally {
+      if (request === missingRequest.current) setLoadingMissing(false);
+    }
+  }, [currentProject?.id]);
+
+  const toggleMissing = useCallback(() => {
+    setShowMissing((on) => !on);
+  }, []);
+
+
+  const handleTidyCaptions = async () => {
+    if (!currentProject?.id || isFixingReading) return;
+    setIsFixingReading(true);
+    try {
+      const plan = await tidyCaptions(currentProject.id, true);
+      const lines = [
+        `Merge ${plan.merged_away} short captions into ${plan.merged_into ?? 0} longer ones`,
+        `Trim ${plan.trimmed} overlapping captions`,
+        'Hold short captions on screen longer',
+      ];
+      if (plan.dubbed_cleared) lines.push(`${plan.dubbed_cleared} merged lines lose their dubbed audio and need re-dubbing`);
+      if (plan.kept_dubbed) lines.push(`${plan.kept_dubbed} short lines stay separate because they are already dubbed`);
+      if (!confirm(`Tidy captions for this project?\n\n• ${lines.join('\n• ')}`)) return;
+      pushUndo();  // so Ctrl+Z brings the old captions back
+      const res = await tidyCaptions(currentProject.id);
+      await loadProject(currentProject.id);
+      alert(`${res.total} captions now (merged ${res.merged_away}, trimmed ${res.trimmed}, held ${res.extended ?? 0} longer).`);
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || 'Could not tidy captions');
+    } finally {
+      setIsFixingReading(false);
+    }
+  };
 
   const handleSeparateAudioClick = async () => {
     if (!currentProject?.id || isSeparatingAudio) return;
@@ -341,28 +911,33 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
       setIsSeparatingAudio(false);
     }
   };
-  const [recordingSeconds, setRecordingSeconds] = useState(0);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const recordingTimerRef = useRef<any>(null);
 
-  // Undo/Redo history for video clips
-  const undoStackRef = useRef<{ source_start: number; source_end: number }[][]>([]);
-  const redoStackRef = useRef<{ source_start: number; source_end: number }[][]>([]);
-
-  // Undo/Redo history for segment deletions
-  type SegmentUndoAction = { type: 'delete-segment'; segment: Segment };
-  const segmentUndoStackRef = useRef<SegmentUndoAction[]>([]);
-
-  const snapshotClips = useCallback(() => {
-    return videoClips.map(c => ({ source_start: c.source_start, source_end: c.source_end }));
-  }, [videoClips]);
+  // Unified Undo/Redo project history (tracks subtitle segments + video clips)
+  type HistorySnapshot = {
+    segments: Segment[];
+    videoClips: { source_start: number; source_end: number }[];
+  };
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  const undoStackRef = useRef<HistorySnapshot[]>([]);
+  const redoStackRef = useRef<HistorySnapshot[]>([]);
 
   const pushUndo = useCallback(() => {
-    undoStackRef.current.push(snapshotClips());
-    // Clear redo on new action
+    const project = useProjectStore.getState().currentProject;
+    if (!project) return;
+    const snap: HistorySnapshot = {
+      segments: JSON.parse(JSON.stringify(project.segments || [])),
+      videoClips: videoClips.map((c) => ({ source_start: c.source_start, source_end: c.source_end })),
+    };
+    undoStackRef.current.push(snap);
+    if (undoStackRef.current.length > 50) {
+      undoStackRef.current.shift();
+    }
     redoStackRef.current = [];
-  }, [snapshotClips]);
+    undoLogRef.current.push({ kind: 'core' });
+    setCanUndo(true);
+    setCanRedo(false);
+  }, [videoClips]);
 
   // AI audio playback refs
   const aiAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
@@ -373,7 +948,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
   const rulerWasPlayingRef = useRef(false);
 
   // Track lock state
-  const [lockedTracks, setLockedTracks] = useState<Set<string>>(new Set());
+  const [lockedTracks] = useState<Set<string>>(new Set());
 
   // Video thumbnails — extracted from video element
   const [thumbnails, setThumbnails] = useState<string[]>([]);
@@ -419,7 +994,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     }
   }, [audioSeparated, videoRef, setA2Muted]);
 
-  // Generate video thumbnails for the timeline strip
+  // Generate video thumbnails for the timeline strip (showing 1 representative frame per clip)
   useEffect(() => {
     if (!currentProject?.video_path || !currentProject?.duration || thumbGenRef.current) return;
     const dur = currentProject.duration;
@@ -428,7 +1003,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
 
     const videoFilename = currentProject.video_path.split('/').pop();
     const videoSrc = `/uploads/${currentProject.id}/${videoFilename}`;
-    const thumbCount = Math.min(Math.max(Math.ceil(dur / 3), 8), 60);
+    const thumbCount = Math.min(Math.max(Math.ceil(dur / 5), 4), 20);
     const interval = dur / thumbCount;
 
     const vid = document.createElement('video');
@@ -439,8 +1014,8 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
 
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d')!;
-    canvas.width = 80;
-    canvas.height = 50;
+    canvas.width = 120;
+    canvas.height = 68;
 
     const thumbs: string[] = [];
     let idx = 0;
@@ -452,12 +1027,16 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
           vid.remove();
           return;
         }
-        vid.currentTime = idx * interval + interval / 2;
+        vid.currentTime = Math.max(0.05, idx * interval + 0.1);
       };
 
       vid.addEventListener('seeked', () => {
         ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-        thumbs.push(canvas.toDataURL('image/jpeg', 0.5));
+        thumbs.push(canvas.toDataURL('image/jpeg', 0.6));
+        // Instantly display first captured frame to UI without waiting
+        if (thumbs.length === 1) {
+          setThumbnails([...thumbs]);
+        }
         idx++;
         captureNext();
       });
@@ -504,6 +1083,12 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     return arr.length > 1 ? arr : ['_all']; // '_all' = single combined track
   }, [currentProject?.segments]);
 
+  // Memoized sorted segments to avoid re-allocating and re-sorting on every 60fps frame update
+  const sortedSegments = useMemo(
+    () => [...(currentProject?.segments || [])].sort((a, b) => a.start_time - b.start_time),
+    [currentProject?.segments]
+  );
+
   const toggleAiTrackMute = useCallback((profile: string) => {
     setAiMutedProfiles((prev) => {
       const next = new Set(prev);
@@ -513,9 +1098,23 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     });
   }, []);
 
+  // Browser media players are a limited resource. Keep a small look-ahead window
+  // instead of mounting thousands of audio elements for a fully dubbed movie.
+  const playbackSegments = useMemo(() => sortedSegments.filter(seg => {
+    if (!seg.audio_url) return false;
+    const range = clipLayout.length > 0
+      ? sourceRangeToTimeline(clipLayout, seg.start_time, seg.end_time)
+      : { timelineStart: seg.start_time, timelineEnd: seg.end_time, isVisible: true };
+    if (!range.isVisible) return false;
+    const audio = aiAudioRefs.current.get(seg.id);
+    const audioEnd = range.timelineStart + (Number.isFinite(audio?.duration) ? audio!.duration : 0);
+    return range.timelineStart <= currentTime + 10
+      && Math.max(range.timelineEnd, audioEnd) >= currentTime - 2;
+  }).slice(0, 32), [sortedSegments, clipLayout, currentTime]);
+
   // AI audio playback: sync with timeline time
   useEffect(() => {
-    const segs = [...(currentProject?.segments || [])].sort((a, b) => a.start_time - b.start_time);
+    const segs = playbackSegments;
 
     if (!isPlaying) {
       // When paused or stopped, pause all audios and clear initiation state
@@ -560,29 +1159,36 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
       const clipDuration = Math.max(rawClipDur, range.timelineEnd - range.timelineStart);
 
       const offset = currentTime - range.timelineStart;
-      const isWithinWindow = offset >= -0.25 && offset < (clipDuration + 0.35);
+      const isWithinWindow = offset >= 0.0 && offset < (clipDuration + 0.35);
 
       if (isWithinWindow) {
         audio.volume = isMuted ? 0 : 1;
         audio.muted = isMuted;
 
         const isInitiated = audioInitiatedRef.current.get(seg.id);
-        if (!isInitiated) {
+        if (!isInitiated && offset >= rawClipDur - 0.05) {
+          // the playhead is already past the end of this voice (its caption runs longer):
+          // starting it here would only play its last moment, or the whole line late
           audioInitiatedRef.current.set(seg.id, true);
-          // If starting near segment boundary (offset <= 0.25s), start cleanly from 0 so the first word is never skipped
-          const startSeek = offset <= 0.25 ? 0 : Math.min(clipDuration - 0.1, offset);
+        } else if (!isInitiated) {
+          audioInitiatedRef.current.set(seg.id, true);
+          // If starting near segment boundary (offset <= 0.05s), start cleanly from 0 so the first word is never skipped
+          const startSeek = offset <= 0.05 ? 0 : Math.min(clipDuration - 0.1, offset);
           try {
             audio.currentTime = startSeek;
           } catch {}
           audio.play().catch(() => {});
         } else {
-          // If paused (e.g. user unmuted/resumed), ensure it keeps playing
-          if (audio.paused) {
+          // If paused (e.g. user unmuted/resumed), ensure it keeps playing — but not once it
+          // has played to its end: play() on a finished clip starts it again from the top, and
+          // a voice shorter than its caption was heard twice.
+          const finished = audio.ended || offset >= rawClipDur - 0.05;
+          if (audio.paused && !finished) {
             audio.play().catch(() => {});
           }
           // Only re-sync on extreme manual scrub/seek drift (> 1.2s) to avoid buffer stutter
           const expectedTime = Math.max(0, offset);
-          if (Math.abs(audio.currentTime - expectedTime) > 1.2) {
+          if (!finished && Math.abs(audio.currentTime - expectedTime) > 1.2) {
             try {
               audio.currentTime = expectedTime;
             } catch {}
@@ -603,7 +1209,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
         }
       }
     });
-  }, [currentTime, isPlaying, aiMutedProfiles, aiTrackProfiles, currentProject?.segments, clipLayout, videoRef]);
+  }, [currentTime, isPlaying, aiMutedProfiles, aiTrackProfiles, playbackSegments, clipLayout, videoRef]);
 
   // Split clip at playhead
   const handleSplitAtPlayhead = useCallback(async () => {
@@ -636,6 +1242,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     if (!currentProject) return;
     setIsUploadingClip(true);
     pushUndo();
+    const timelineWasEmpty = useProjectStore.getState().videoClips.length === 0;
     try {
       const updatedClips = await appendVideoFileToTimeline(currentProject.id, file);
       setVideoClips(updatedClips);
@@ -643,6 +1250,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
       if (videoRef.current) {
         videoRef.current.load();
       }
+      offerSplitIfLong(timelineWasEmpty);
     } catch (err: any) {
       console.error('Failed to append video file to timeline:', err);
       alert(`Failed to append video: ${err?.response?.data?.detail || err.message || err}`);
@@ -671,6 +1279,11 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
         setVideoClips(result.clips);
       } else {
         setVideoClips([]);
+        // the last clip is gone: the player goes empty too (it comes back with undo)
+        const project = useProjectStore.getState().currentProject;
+        if (project?.id === currentProject.id) {
+          useProjectStore.setState({ currentProject: { ...project, timeline_cleared: true } });
+        }
       }
       setSelectedClipId(null);
     } catch (err: any) {
@@ -682,64 +1295,94 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     }
   }, [currentProject, videoClips, setVideoClips, pushUndo, onRemoveAudioSeparation]);
 
-  // Delete a segment with undo support
+  // Delete a segment with full undo support
   const handleDeleteSegment = useCallback(async (segmentId: string) => {
     if (!currentProject) return;
-    const segment = currentProject.segments.find(s => s.id === segmentId);
-    if (!segment) return;
-    // Save to segment undo stack before deleting
-    segmentUndoStackRef.current.push({ type: 'delete-segment', segment: { ...segment } });
+    pushUndo();
     await deleteSegment(segmentId);
-  }, [currentProject, deleteSegment]);
+  }, [currentProject, pushUndo, deleteSegment]);
 
-  // Undo
+  // Undo (Restores previous full project state)
   const handleUndo = useCallback(async () => {
-    if (!currentProject) return;
+    const project = useProjectStore.getState().currentProject;
+    if (!project || undoStackRef.current.length === 0) return;
 
-    // Segment undo takes priority (most recent user action)
-    if (segmentUndoStackRef.current.length > 0) {
-      const action = segmentUndoStackRef.current.pop()!;
-      if (action.type === 'delete-segment') {
-        const { id, project_id, created_at, updated_at, ...segData } = action.segment;
-        await addSegment(segData);
+    // 1. Snapshot current state to redo
+    const currentSnap: HistorySnapshot = {
+      segments: JSON.parse(JSON.stringify(project.segments || [])),
+      videoClips: videoClips.map((c) => ({ source_start: c.source_start, source_end: c.source_end })),
+    };
+    redoStackRef.current.push(currentSnap);
+    if (redoStackRef.current.length > 50) {
+      redoStackRef.current.shift();
+    }
+
+    // 2. Pop target state from undo stack
+    const targetSnap = undoStackRef.current.pop()!;
+    setCanUndo(undoStackRef.current.length > 0);
+    setCanRedo(true);
+
+    // 3. Instant local memory update (0ms latency)
+    useProjectStore.setState({
+      currentProject: {
+        ...project,
+        segments: targetSnap.segments,
+      },
+    });
+
+    // 4. Sync restored state to backend
+    try {
+      const clipsChanged = JSON.stringify(targetSnap.videoClips) !== JSON.stringify(currentSnap.videoClips);
+      if (clipsChanged && targetSnap.videoClips.length > 0) {
+        const restoredClips = await restoreVideoClips(project.id, targetSnap.videoClips);
+        setVideoClips(restoredClips);
       }
-      return;
-    }
-
-    // Otherwise, undo video clip action
-    if (undoStackRef.current.length === 0) return;
-    const snapshot = undoStackRef.current.pop()!;
-    // Save current state to redo
-    redoStackRef.current.push(snapshotClips());
-    try {
-      const clips = await restoreVideoClips(currentProject.id, snapshot);
-      setVideoClips(clips);
-      setSelectedClipId(null);
+      await restoreSegments(project.id, targetSnap.segments);
     } catch (err: any) {
-      console.error('Undo failed:', err?.response?.data?.detail || err?.message);
-      // Put snapshot back on failure
-      undoStackRef.current.push(snapshot);
-      redoStackRef.current.pop();
+      console.error('Undo sync failed:', err);
     }
-  }, [currentProject, snapshotClips, setVideoClips, addSegment]);
+  }, [videoClips, setVideoClips]);
 
-  // Redo
+  // Redo (Restores next full project state)
   const handleRedo = useCallback(async () => {
-    if (!currentProject || redoStackRef.current.length === 0) return;
-    const snapshot = redoStackRef.current.pop()!;
-    // Save current state to undo
-    undoStackRef.current.push(snapshotClips());
-    try {
-      const clips = await restoreVideoClips(currentProject.id, snapshot);
-      setVideoClips(clips);
-      setSelectedClipId(null);
-    } catch (err: any) {
-      console.error('Redo failed:', err?.response?.data?.detail || err?.message);
-      // Revert on failure
-      redoStackRef.current.push(snapshot);
-      undoStackRef.current.pop();
+    const project = useProjectStore.getState().currentProject;
+    if (!project || redoStackRef.current.length === 0) return;
+
+    // 1. Snapshot current state to undo
+    const currentSnap: HistorySnapshot = {
+      segments: JSON.parse(JSON.stringify(project.segments || [])),
+      videoClips: videoClips.map((c) => ({ source_start: c.source_start, source_end: c.source_end })),
+    };
+    undoStackRef.current.push(currentSnap);
+    if (undoStackRef.current.length > 50) {
+      undoStackRef.current.shift();
     }
-  }, [currentProject, snapshotClips, setVideoClips]);
+
+    // 2. Pop target state from redo stack
+    const targetSnap = redoStackRef.current.pop()!;
+    setCanUndo(true);
+    setCanRedo(redoStackRef.current.length > 0);
+
+    // 3. Instant local memory update (0ms latency)
+    useProjectStore.setState({
+      currentProject: {
+        ...project,
+        segments: targetSnap.segments,
+      },
+    });
+
+    // 4. Sync restored state to backend
+    try {
+      const clipsChanged = JSON.stringify(targetSnap.videoClips) !== JSON.stringify(currentSnap.videoClips);
+      if (clipsChanged && targetSnap.videoClips.length > 0) {
+        const restoredClips = await restoreVideoClips(project.id, targetSnap.videoClips);
+        setVideoClips(restoredClips);
+      }
+      await restoreSegments(project.id, targetSnap.segments);
+    } catch (err: any) {
+      console.error('Redo sync failed:', err);
+    }
+  }, [videoClips, setVideoClips]);
 
   // Listen for keyboard shortcut events from ProjectEditor
   useEffect(() => {
@@ -781,9 +1424,30 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
           : 30);
   const segments = currentProject?.segments || [];
   const pixelsPerSecond = 20 * zoom;
+  const [textOverlays, setTextOverlays] = useTextOverlays(currentProject?.id);
+  const txTrack = useOverlayTrackPosition();
+  const [logoSettings, setLogoSettings] = useLogoSettings(currentProject?.id);
   // Ref so drag handlers always read the latest value without re-mounting listeners
   const pixelsPerSecondRef = useRef(pixelsPerSecond);
   pixelsPerSecondRef.current = pixelsPerSecond;
+
+  // Zoom is read through a ref inside the wheel handler so the listener is registered once
+  // instead of being replaced on every zoom step.
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const currentTimeRef = useRef(currentTime);
+  currentTimeRef.current = currentTime;
+
+  // What to keep still while zooming: the moment under the pointer, or the playhead.
+  const zoomAnchorRef = useRef<{ time: number; pointerX: number } | null>(null);
+  useLayoutEffect(() => {
+    const anchor = zoomAnchorRef.current;
+    const el = containerRef.current;
+    if (!anchor || !el) return;
+    zoomAnchorRef.current = null;
+    // runs after the track has its new width, so there is no frame where the old width is used
+    el.scrollLeft = Math.max(0, anchor.time * pixelsPerSecond - anchor.pointerX);
+  }, [pixelsPerSecond]);
   const sourceDurationRef = useRef(sourceDuration);
   sourceDurationRef.current = sourceDuration;
 
@@ -796,22 +1460,32 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
   const durationRef = useRef(duration);
   durationRef.current = duration;
 
+  const END_ROOM = 68;    // px kept after the end of the video for the add-clip button
   const ZOOM_MIN = 0.0005;
   const ZOOM_MAX = 20;
   const zoomBy = useCallback((factor: number) => {
-    setZoom(prev => Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, +(prev * factor).toFixed(4))));
+    const el = containerRef.current;
+    if (el) {
+      // keep the playhead where it is on screen, or the middle of the view if it is off-screen
+      const pps = pixelsPerSecondRef.current;
+      const playheadX = currentTimeRef.current * pps - el.scrollLeft;
+      const anchorX = playheadX >= 0 && playheadX <= el.clientWidth ? playheadX : el.clientWidth / 2;
+      zoomAnchorRef.current = { time: (anchorX + el.scrollLeft) / pps, pointerX: anchorX };
+    }
+    setFitMode(false);   // a zoom the user chose is kept
+    setZoom(prev => Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, prev * factor)));
   }, []);
   const getFitZoom = useCallback(() => {
     const el = containerRef.current;
     if (!el || duration <= 0) return 1;
-    const availableWidth = Math.max(100, el.clientWidth - 40);
+    const availableWidth = Math.max(100, el.clientWidth - END_ROOM);
     return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, +(availableWidth / (duration * 20)).toFixed(4)));
   }, [duration]);
 
-  const isFitZoom = Math.abs(zoom - getFitZoom()) < 0.015 || zoom <= getFitZoom() * 1.05;
+  const isFitZoom = fitMode || Math.abs(zoom - getFitZoom()) < 0.015 || zoom <= getFitZoom() * 1.05;
   const totalWidth = Math.max(
     containerRef.current?.clientWidth || 1000,
-    duration * pixelsPerSecond + (isFitZoom ? 0 : 300)
+    duration * pixelsPerSecond + END_ROOM
   );
 
   // Assign each segment to a lane (track) using rendered timeline coordinates so overlapping segments go to T2, T3, etc.
@@ -847,15 +1521,6 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     return { laneMap: map, laneCount: Math.max(lanes.length, 1) };
   }, [segments, clipLayout]);
 
-  const toggleTrackMute = (lane: number) => {
-    setMutedTracks((prev) => {
-      const next = new Set(prev);
-      if (next.has(lane)) next.delete(lane);
-      else next.add(lane);
-      return next;
-    });
-  };
-
   const speakerColors: Record<string, string> = {};
   let colorIndex = 0;
   segments.forEach((s) => {
@@ -885,6 +1550,35 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     }
     setCurrentTime(time);
   };
+
+  /** Move the playhead to a timeline time, mapping through the clip layout like ruler scrubbing. */
+  const seekToTime = useCallback(
+    (time: number) => {
+      if (clipLayout.length > 0) {
+        const result = timelineToSource(clipLayout, time);
+        if (result && videoRef.current) videoRef.current.currentTime = result.sourceTime;
+      } else if (videoRef.current) {
+        videoRef.current.currentTime = time;
+      }
+      setCurrentTime(time);
+    },
+    [clipLayout, videoRef, setCurrentTime],
+  );
+
+  // Captions changed, so anything already marked is out of date
+  const missingScanKey = useMemo(() => JSON.stringify(segments.map((s) => [s.id, s.start_time, s.end_time, s.text, s.speaker, s.voice_profile])), [segments]);
+  useEffect(() => {
+    ++missingRequest.current;
+    setMissingGaps([]);
+    setMissingError(null);
+    setLoadingMissing(false);
+    if (!showMissing || isTranscribing) return;
+    const timer = window.setTimeout(() => { void loadMissingGaps(); }, 400);
+    return () => {
+      window.clearTimeout(timer);
+      ++missingRequest.current;
+    };
+  }, [missingScanKey, showMissing, isTranscribing, loadMissingGaps]);
 
   // Ruler scrub: mousedown on ruler starts drag-to-seek
   const handleRulerMouseDown = (e: React.MouseEvent) => {
@@ -945,6 +1639,126 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     };
   }, [rulerDragging, xToTime, setCurrentTime, videoRef, clipLayout]);
 
+  /** Click selection shared by caption and voice clips — both are views of the same line.
+   *  Shift adds the range from the active line, Cmd/Ctrl toggles one line, a plain click
+   *  selects just this one. */
+  const selectWithModifiers = (e: React.MouseEvent, seg: Segment) => {
+    const currentSelected = new Set(useProjectStore.getState().selectedSegmentIds);
+    const sortedSegs = [...(currentProject?.segments || [])].sort((a, b) => a.start_time - b.start_time);
+
+    if (e.shiftKey) {
+      // Shift+Click: Range selection between activeSegmentId and clicked seg
+      const activeId = useProjectStore.getState().activeSegmentId;
+      if (activeId) {
+        const fromIdx = sortedSegs.findIndex((s) => s.id === activeId);
+        const toIdx = sortedSegs.findIndex((s) => s.id === seg.id);
+        if (fromIdx !== -1 && toIdx !== -1) {
+          const start = Math.min(fromIdx, toIdx);
+          const end = Math.max(fromIdx, toIdx);
+          for (let i = start; i <= end; i++) {
+            currentSelected.add(sortedSegs[i].id);
+          }
+          setSelectedSegmentIds(new Set(currentSelected));
+        } else {
+          currentSelected.add(seg.id);
+          setSelectedSegmentIds(new Set(currentSelected));
+        }
+      } else {
+        currentSelected.add(seg.id);
+        setSelectedSegmentIds(new Set(currentSelected));
+      }
+    } else if (e.metaKey || e.ctrlKey) {
+      // Cmd/Ctrl+Click: Toggle individual segment in/out of selection
+      if (currentSelected.has(seg.id)) {
+        currentSelected.delete(seg.id);
+      } else {
+        currentSelected.add(seg.id);
+      }
+      setSelectedSegmentIds(new Set(currentSelected));
+    } else {
+      // Single Click: If segment wasn't already selected, focus select just this one
+      if (!currentSelected.has(seg.id) || currentSelected.size > 1) {
+        setSelectedSegmentIds(new Set([seg.id]));
+      }
+    }
+  };
+
+  // --- Box (marquee) selection ---
+  // Dragging across empty space in the caption or voice lanes selects every clip the box
+  // touches — what a three-finger drag on a Mac trackpad does. A plain click still seeks.
+  const [marquee, setMarquee] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  const marqueeJustEndedRef = useRef(false);
+  const handleMarqueeStart = (e: React.MouseEvent) => {
+    const target = e.target as HTMLElement;
+    const container = containerRef.current;
+    if (e.button !== 0 || !container) return;
+    const lane = target.closest<HTMLElement>('[data-marquee-lane]');
+    if (!lane || target.closest('[data-seg-id], button, input, select')) return;
+    setSelectionLane(lane.dataset.marqueeLane === 'voice' ? 'voice' : 'caption');
+
+    const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+    const base = additive ? new Set(useProjectStore.getState().selectedSegmentIds) : new Set<string>();
+    const toContent = (clientX: number, clientY: number) => {
+      const r = container.getBoundingClientRect();
+      return { x: clientX - r.left + container.scrollLeft, y: clientY - r.top + container.scrollTop };
+    };
+    const start = toContent(e.clientX, e.clientY);
+    const startClient = { x: e.clientX, y: e.clientY };
+    let active = false;
+    let last = { x: e.clientX, y: e.clientY };
+    let frame = 0;
+
+    const update = () => {
+      frame = 0;
+      const end = toContent(last.x, last.y);
+      setMarquee({ x0: start.x, y0: start.y, x1: end.x, y1: end.y });
+      // compare in screen space against where each clip is actually drawn
+      const r = container.getBoundingClientRect();
+      const box = {
+        left: Math.min(start.x, end.x) - container.scrollLeft + r.left,
+        right: Math.max(start.x, end.x) - container.scrollLeft + r.left,
+        top: Math.min(start.y, end.y) - container.scrollTop + r.top,
+        bottom: Math.max(start.y, end.y) - container.scrollTop + r.top,
+      };
+      const next = new Set(base);
+      container.querySelectorAll<HTMLElement>('[data-seg-id]').forEach((el) => {
+        const c = el.getBoundingClientRect();
+        if (c.right >= box.left && c.left <= box.right && c.bottom >= box.top && c.top <= box.bottom) {
+          next.add(el.dataset.segId!);
+        }
+      });
+      setSelectedSegmentIds(next);
+    };
+
+    const onMove = (ev: MouseEvent) => {
+      last = { x: ev.clientX, y: ev.clientY };
+      if (!active) {
+        // a few pixels of slack, so a click with a wobble is still a click
+        if (Math.hypot(ev.clientX - startClient.x, ev.clientY - startClient.y) < 5) return;
+        active = true;
+      }
+      // keep going past the visible edge on a long timeline
+      const r = container.getBoundingClientRect();
+      if (ev.clientX > r.right - 30) container.scrollLeft += 20;
+      else if (ev.clientX < r.left + 30) container.scrollLeft -= 20;
+      if (!frame) frame = requestAnimationFrame(update);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      if (frame) cancelAnimationFrame(frame);
+      if (active) {
+        update();
+        marqueeJustEndedRef.current = true;
+        // if no click follows (released outside the timeline), don't swallow the next real one
+        setTimeout(() => (marqueeJustEndedRef.current = false), 0);
+      }
+      setMarquee(null);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
   const handleSegmentMouseDown = (
     e: React.MouseEvent,
     seg: Segment,
@@ -952,6 +1766,9 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
   ) => {
     e.stopPropagation();
     e.preventDefault();
+    setSelectionLane('caption');
+    selectWithModifiers(e, seg);
+
     setDragging({
       segmentId: seg.id,
       type,
@@ -962,18 +1779,43 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     setActiveSegment(seg.id);
   };
 
+  // Dragging a caption. The clip is moved straight on the page, once per frame, and the
+  // project only hears about it when the clip is dropped. Writing every mouse move into the
+  // store re-rendered the whole editor each time and re-packed the caption lanes mid-drag,
+  // so the clip stuttered behind the pointer and hopped between rows.
+  const clipLayoutRef = useRef(clipLayout);
+  clipLayoutRef.current = clipLayout;
+
   useEffect(() => {
     if (!dragging) return;
 
     const snap = dragging; // stable snapshot of drag start state
+    const container = containerRef.current;
+    const startScroll = container?.scrollLeft ?? 0;
+    const length = Math.max(0.1, snap.originalEnd - snap.originalStart);
+    const round = (t: number) => Math.round(t * 100) / 100;
+    // the caption clip and its voice clip are the same line, so both follow the pointer
+    const clips = () =>
+      Array.from(container?.querySelectorAll<HTMLElement>(`[data-seg-id="${CSS.escape(snap.segmentId)}"]`) ?? []);
 
-    const handleMouseMove = (e: MouseEvent) => {
-      if (e.buttons === 0) {
-        handleMouseUp();
-        return;
-      }
+    let pointerX = snap.startX;
+    let moved = false;
+    let pos = { start: snap.originalStart, end: snap.originalEnd };
+    let frame = 0;
+    let done = false;
+
+    const readout = document.createElement('div');
+    readout.className =
+      'fixed z-[100] pointer-events-none rounded bg-black/85 px-1.5 py-0.5 text-[10px] font-mono text-white shadow-lg';
+    readout.style.display = 'none';
+    document.body.appendChild(readout);
+    const bodyCursor = document.body.style.cursor;
+    document.body.style.cursor = snap.type === 'move' ? 'grabbing' : 'ew-resize';
+
+    const place = () => {
       const pps = pixelsPerSecondRef.current || (20 * zoom) || 20;
-      const dx = e.clientX - snap.startX;
+      // scrolling under a still pointer moves the clip too
+      const dx = pointerX - snap.startX + ((container?.scrollLeft ?? startScroll) - startScroll);
       const dt = dx / pps;
       const maxAllowedDuration = Math.max(
         durationRef.current || 0,
@@ -982,69 +1824,98 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
         3600
       );
 
-      // Auto-scroll timeline container when dragging near edges
-      if (containerRef.current) {
-        const cRect = containerRef.current.getBoundingClientRect();
-        const edgeThreshold = 60;
-        if (e.clientX > cRect.right - edgeThreshold) {
-          containerRef.current.scrollLeft += 10;
-        } else if (e.clientX < cRect.left + edgeThreshold) {
-          containerRef.current.scrollLeft -= 10;
-        }
-      }
-
       let newStart = snap.originalStart;
       let newEnd = snap.originalEnd;
-
       if (snap.type === 'move') {
-        const segDur = Math.max(0.1, snap.originalEnd - snap.originalStart);
-        newStart = Math.max(0, snap.originalStart + dt);
-        newEnd = newStart + segDur;
-        if (newEnd > maxAllowedDuration) {
-          newEnd = maxAllowedDuration;
-          newStart = Math.max(0, newEnd - segDur);
-        }
+        newStart = Math.max(0, Math.min(snap.originalStart + dt, maxAllowedDuration - length));
+        newEnd = newStart + length;
       } else if (snap.type === 'resize-start') {
         newStart = Math.max(0, Math.min(snap.originalStart + dt, snap.originalEnd - 0.2));
-      } else if (snap.type === 'resize-end') {
+      } else {
         newEnd = Math.min(maxAllowedDuration, Math.max(snap.originalEnd + dt, snap.originalStart + 0.2));
       }
+      pos = { start: newStart, end: newEnd };
 
-      // Read latest project from store to avoid stale closure over currentProject
-      const project = useProjectStore.getState().currentProject;
-      if (project) {
-        useProjectStore.setState({
-          currentProject: {
-            ...project,
-            segments: project.segments.map((s) =>
-              s.id === snap.segmentId
-                ? { ...s, start_time: newStart, end_time: newEnd }
-                : s
-            ),
-          },
-        });
+      const layout = clipLayoutRef.current;
+      const range = layout.length > 0
+        ? sourceRangeToTimeline(layout, newStart, newEnd)
+        : { timelineStart: newStart, timelineEnd: newEnd };
+      const left = range.timelineStart * pps;
+      const width = Math.max(range.timelineEnd * pps - left, 6);
+      for (const el of clips()) {
+        el.style.transition = 'none';
+        el.style.left = `${left}px`;
+        el.style.width = `${width}px`;
       }
+      readout.textContent = snap.type === 'resize-end'
+        ? `${formatFrameTime(newEnd)}  (${(newEnd - newStart).toFixed(2)}s)`
+        : snap.type === 'resize-start'
+        ? `${formatFrameTime(newStart)}  (${(newEnd - newStart).toFixed(2)}s)`
+        : `${formatFrameTime(newStart)} → ${formatFrameTime(newEnd)}`;
+    };
+
+    const tick = () => {
+      frame = 0;
+      if (done) return;
+      // Near an edge the timeline keeps scrolling for as long as the pointer rests there,
+      // faster the closer it is — it used to advance only while the mouse was moving.
+      if (container) {
+        const rect = container.getBoundingClientRect();
+        const edge = 60;
+        const before = container.scrollLeft;
+        if (pointerX > rect.right - edge) {
+          container.scrollLeft += Math.ceil(Math.min(1, (pointerX - (rect.right - edge)) / edge) * 18);
+        } else if (pointerX < rect.left + edge) {
+          container.scrollLeft -= Math.ceil(Math.min(1, (rect.left + edge - pointerX) / edge) * 18);
+        }
+        if (container.scrollLeft !== before) frame = requestAnimationFrame(tick);
+      }
+      place();
+    };
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (e.buttons === 0) {
+        handleMouseUp();
+        return;
+      }
+      pointerX = e.clientX;
+      if (!moved) {
+        // a click with a wobble is still a click: nothing moves, nothing is saved
+        if (Math.abs(e.clientX - snap.startX) < 3) return;
+        moved = true;
+        pushUndo();
+        readout.style.display = 'block';
+      }
+      readout.style.left = `${e.clientX + 12}px`;
+      readout.style.top = `${e.clientY - 28}px`;
+      if (!frame) frame = requestAnimationFrame(tick);
+    };
+
+    const cleanup = () => {
+      done = true;
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+      if (frame) cancelAnimationFrame(frame);
+      readout.remove();
+      document.body.style.cursor = bodyCursor;
+      for (const el of clips()) el.style.transition = '';
     };
 
     const handleMouseUp = async () => {
+      if (done) return;
+      if (moved) place(); // the last mouse position, not the last painted frame
+      cleanup();
       setDragging(null);
-      // Read latest positions from store after all mousemove updates
-      const project = useProjectStore.getState().currentProject;
-      const seg = project?.segments.find((s) => s.id === snap.segmentId);
-      if (seg) {
-        await updateSegment(seg.id, {
-          start_time: seg.start_time,
-          end_time: seg.end_time,
-        });
-      }
+      if (!moved) return;
+      const start = round(pos.start);
+      // a move keeps the line's exact length, so its voice is not thrown away as mismatched
+      const end = snap.type === 'move' ? round(start + length) : round(pos.end);
+      await updateSegment(snap.segmentId, { start_time: start, end_time: end });
     };
 
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-    };
+    return cleanup;
   }, [dragging]); // no currentProject/pixelsPerSecond — read from refs/store instead
 
   // Clip whole-body move drag handler
@@ -1088,53 +1959,6 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
       await updateVideoClip(currentProject.id, clip.id, newStart, newEnd);
     } catch (err: any) {
       console.error('Nudge clip failed:', err);
-    }
-  };
-
-  // Swap / Reorder clip position (e.g. Move Clip A before B, or after C)
-  const handleSwapClipOrder = async (clipId: string, direction: 'left' | 'right') => {
-    if (!currentProject) return;
-    const sorted = [...videoClipsRef.current].sort((a, b) => a.index - b.index);
-    const idx = sorted.findIndex(c => c.id === clipId);
-    if (idx === -1) return;
-    const targetIdx = direction === 'left' ? idx - 1 : idx + 1;
-    if (targetIdx < 0 || targetIdx >= sorted.length) return;
-
-    pushUndo();
-    const temp = sorted[idx];
-    sorted[idx] = sorted[targetIdx];
-    sorted[targetIdx] = temp;
-
-    const newClips = sorted.map((c, i) => ({ ...c, index: i }));
-    setVideoClips(newClips);
-
-    try {
-      const updated = await reorderVideoClips(currentProject.id, newClips.map(c => c.id));
-      setVideoClips(updated);
-    } catch (err: any) {
-      console.error('Failed to reorder clips:', err);
-    }
-  };
-
-  // Move clip to exact target index
-  const handleMoveClipToIndex = async (clipId: string, targetIdx: number) => {
-    if (!currentProject) return;
-    const sorted = [...videoClipsRef.current].sort((a, b) => a.index - b.index);
-    const currentIdx = sorted.findIndex(c => c.id === clipId);
-    if (currentIdx === -1 || targetIdx < 0 || targetIdx >= sorted.length || currentIdx === targetIdx) return;
-
-    pushUndo();
-    const [moved] = sorted.splice(currentIdx, 1);
-    sorted.splice(targetIdx, 0, moved);
-
-    const newClips = sorted.map((c, i) => ({ ...c, index: i }));
-    setVideoClips(newClips);
-
-    try {
-      const updated = await reorderVideoClips(currentProject.id, newClips.map(c => c.id));
-      setVideoClips(updated);
-    } catch (err: any) {
-      console.error('Failed to reorder clips:', err);
     }
   };
 
@@ -1308,18 +2132,12 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
 
   const handleGenerateVoice = async () => {
     if (!currentProject || segments.length === 0) return;
-    setAudioGenerating(true);
-    setAudioGenerated(false);
     try {
       const isSelection = selectedSegmentIds.size > 0;
       const ids = isSelection ? Array.from(selectedSegmentIds) : undefined;
       await generateVoiceForSegments(ids, 1.0, 'A', undefined, undefined, !isSelection);
-      setAudioGenerated(true);
-      setTimeout(() => setAudioGenerated(false), 3000);
     } catch (err) {
       console.error('Generate voice failed:', err);
-    } finally {
-      setAudioGenerating(false);
     }
   };
 
@@ -1331,7 +2149,6 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     try {
       await flipVideo(currentProject.id, direction);
       await loadProject(currentProject.id);
-      setShowFlipPanel(false);
     } catch (err: any) {
       console.error('Flip failed:', err);
     }
@@ -1344,160 +2161,10 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     try {
       await rotateVideo(currentProject.id, angle);
       await loadProject(currentProject.id);
-      setShowRotatePanel(false);
     } catch (err: any) {
       console.error('Rotate failed:', err);
     }
     setIsRotating(false);
-  };
-
-  const handleSpeedChange = async (speed: number) => {
-    if (!currentProject || isChangingSpeed) return;
-    setIsChangingSpeed(true);
-    try {
-      await changeVideoSpeed(currentProject.id, speed);
-      await loadProject(currentProject.id);
-      setShowSpeedPanel(false);
-    } catch (err: any) {
-      console.error('Speed change failed:', err);
-    }
-    setIsChangingSpeed(false);
-  };
-
-  const handleOpenBlur = () => {
-    const vid = videoRef.current;
-    const w = vid?.videoWidth || 1280;
-    const h = vid?.videoHeight || 720;
-
-    // Snapshot the current (paused) frame so the user has a large, precise,
-    // still reference to draw against instead of the small live player.
-    try {
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      if (ctx && vid && vid.videoWidth > 0) {
-        ctx.drawImage(vid, 0, 0, w, h);
-        setBlurSnapshot(canvas.toDataURL('image/jpeg', 0.85));
-      }
-    } catch {
-      // ignore cross-origin snapshot issues
-    }
-    setBlurNatural({ w, h });
-
-    // Default to a bottom subtitle box or previously selected box
-    setBlurRegion((prev) =>
-      prev.width > 0 && prev.height > 0
-        ? prev
-        : {
-            x: 0,
-            y: Math.round(h * 0.80),
-            width: w,
-            height: Math.round(h * 0.18),
-          }
-    );
-    setShowBlurModal(true);
-  };
-
-  const handleApplyBlur = async () => {
-    if (!currentProject || isBlurring) return;
-    setIsBlurring(true);
-    try {
-      const x = Math.max(0, Math.round(blurRegion.x));
-      const y = Math.max(0, Math.round(blurRegion.y));
-      const width = Math.max(4, Math.round(blurRegion.width));
-      const height = Math.max(4, Math.round(blurRegion.height));
-
-      await blurVideoRegion(currentProject.id, x, y, width, height);
-      await loadProject(currentProject.id);
-      if (videoRef.current) {
-        videoRef.current.load();
-      }
-      setShowBlurModal(false);
-    } catch (err: any) {
-      console.error('Blur failed:', err);
-      alert(`Blur operation failed: ${err?.response?.data?.detail || err.message || err}`);
-    } finally {
-      setIsBlurring(false);
-    }
-  };
-
-  // Drag/resize the blur region box — same window-listener pattern as clip resizing.
-  useEffect(() => {
-    if (!blurDrag) return;
-
-    const handleMouseMove = (e: MouseEvent) => {
-      if (e.buttons === 0) {
-        setBlurDrag(null);
-        return;
-      }
-      const img = blurImgRef.current;
-      if (!img) return;
-      const renderedW = img.getBoundingClientRect().width;
-      const scale = renderedW > 0 ? blurNatural.w / renderedW : 1;
-      const dx = (e.clientX - blurDrag.startX) * scale;
-      const dy = (e.clientY - blurDrag.startY) * scale;
-      const { orig } = blurDrag;
-      const MIN = 8;
-      const maxW = blurNatural.w;
-      const maxH = blurNatural.h;
-
-      let { x, y, width, height } = orig;
-      const origRight = orig.x + orig.width;
-      const origBottom = orig.y + orig.height;
-
-      if (blurDrag.mode === 'move') {
-        x = Math.min(Math.max(0, orig.x + dx), maxW - orig.width);
-        y = Math.min(Math.max(0, orig.y + dy), maxH - orig.height);
-      } else if (blurDrag.mode === 'tl') {
-        x = Math.min(Math.max(0, orig.x + dx), origRight - MIN);
-        y = Math.min(Math.max(0, orig.y + dy), origBottom - MIN);
-        width = origRight - x;
-        height = origBottom - y;
-      } else if (blurDrag.mode === 'tr') {
-        const right = Math.max(Math.min(maxW, origRight + dx), orig.x + MIN);
-        y = Math.min(Math.max(0, orig.y + dy), origBottom - MIN);
-        x = orig.x;
-        width = right - orig.x;
-        height = origBottom - y;
-      } else if (blurDrag.mode === 'bl') {
-        x = Math.min(Math.max(0, orig.x + dx), origRight - MIN);
-        const bottom = Math.max(Math.min(maxH, origBottom + dy), orig.y + MIN);
-        y = orig.y;
-        width = origRight - x;
-        height = bottom - orig.y;
-      } else if (blurDrag.mode === 'br') {
-        const right = Math.max(Math.min(maxW, origRight + dx), orig.x + MIN);
-        const bottom = Math.max(Math.min(maxH, origBottom + dy), orig.y + MIN);
-        x = orig.x;
-        y = orig.y;
-        width = right - orig.x;
-        height = bottom - orig.y;
-      }
-
-      setBlurRegion({ x: Math.round(x), y: Math.round(y), width: Math.round(width), height: Math.round(height) });
-    };
-
-    const handleMouseUp = () => setBlurDrag(null);
-
-    window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-    };
-  }, [blurDrag, blurNatural]);
-
-  const handleAddSegmentAtPlayhead = async () => {
-    if (!currentProject) return;
-    let sourceTime = currentTime;
-    if (clipLayout.length > 0) {
-      const result = timelineToSource(clipLayout, currentTime);
-      if (result) sourceTime = result.sourceTime;
-    }
-    const segStart = sourceTime;
-    const segEnd = Math.min(segStart + 3, sourceDuration);
-    await addSegment({ start_time: segStart, end_time: segEnd, text: '', speaker: 'Speaker 1' });
   };
 
   const handleOpenCrop = () => {
@@ -1545,156 +2212,170 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     });
   };
 
-  const handleStartVoiceRecording = async () => {
+  // --- Deleting with the keyboard ---------------------------------------------------------
+  // Whatever is selected on the timeline goes on Delete / Backspace: a text overlay, the logo,
+  // a video clip, caption and voice lines, or the isolated stems. With nothing selected
+  // nothing is deleted — the old fallback removed the line under the playhead, or, failing
+  // that, every caption in the project.
+  const [objectSel, setObjectSel] = useState<{ kind: 'overlay'; id: string } | { kind: 'logo' } | null>(null);
+  const selectObject = (sel: typeof objectSel) => {
+    setObjectSel(sel);
+    if (sel) {
+      setSelectedSegmentIds(new Set());
+      setSelectedClipId(null);
+    }
+  };
+  // picking a caption, voice or video clip takes the selection away from text and logo
+  useEffect(() => {
+    if (selectedSegmentIds.size > 0 || selectedClipId) setObjectSel(null);
+  }, [selectedSegmentIds, selectedClipId]);
+
+  /** Every undoable step in order, so Ctrl+Z also brings back a deleted text or logo. */
+  type UndoEntry =
+    | { kind: 'core' }
+    | { kind: 'overlays'; before: TextOverlay[] }
+    | { kind: 'logo'; before: LogoSettings };
+  const undoLogRef = useRef<UndoEntry[]>([]);
+
+  const removeOverlay = async (id: string) => {
+    if (!currentProject?.id) return;
+    const before = textOverlays;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunksRef.current.push(e.data);
-      };
-
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        const audioUrl = URL.createObjectURL(audioBlob);
-        const dur = Math.max(1.0, recordingSeconds);
-
-        await addSegment({
-          start_time: currentTime,
-          end_time: currentTime + dur,
-          text: '🎙️ Voiceover Clip',
-          speaker: 'Voiceover',
-          voice_profile: 'female',
-          audio_url: audioUrl,
-        });
-        if (currentProject?.id) await loadProject(currentProject.id);
-        setIsRecordingVoice(false);
-        setRecordingSeconds(0);
-        stream.getTracks().forEach((t) => t.stop());
-      };
-
-      mediaRecorder.start();
-      setIsRecordingVoice(true);
-      setRecordingSeconds(0);
-      recordingTimerRef.current = setInterval(() => {
-        setRecordingSeconds((prev) => prev + 1);
-      }, 1000);
-    } catch (err) {
-      alert('Microphone access is required for voiceover recording.');
+      const saved = await saveTextOverlays(currentProject.id, before.filter((o) => o.id !== id));
+      setTextOverlays(saved);
+      window.dispatchEvent(new CustomEvent(TEXT_OVERLAYS_CHANGED));
+      undoLogRef.current.push({ kind: 'overlays', before });
+      setCanUndo(true);
+      setObjectSel(null);
+    } catch (e: any) {
+      alert(`Could not delete the text: ${e?.message || e}`);
     }
   };
 
-  const handleStopVoiceRecording = () => {
-    if (mediaRecorderRef.current && isRecordingVoice) {
-      clearInterval(recordingTimerRef.current);
-      mediaRecorderRef.current.stop();
-    }
+  const removeLogo = () => {
+    if (!currentProject?.id || !logoSettings) return;
+    undoLogRef.current.push({ kind: 'logo', before: logoSettings });
+    setCanUndo(true);
+    // off the video and out of exports; the image stays uploaded for the Logo button
+    saveLogoSettings(currentProject.id, { ...logoSettings, url: '', enabled: false });
+    setObjectSel(null);
   };
 
-  const handleFreezeFrame = async () => {
-    if (!currentProject) return;
-    const video = videoRef.current;
-    let frameSnapshot = '';
-    if (video) {
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth || 1280;
-        canvas.height = video.videoHeight || 720;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          frameSnapshot = canvas.toDataURL('image/jpeg', 0.85);
-        }
-      } catch (e) {
-        console.warn('Could not capture frame snapshot:', e);
-      }
+  const undoAny = async () => {
+    const last = undoLogRef.current.pop();
+    if (last?.kind === 'overlays' && currentProject?.id) {
+      const saved = await saveTextOverlays(currentProject.id, last.before);
+      setTextOverlays(saved);
+      window.dispatchEvent(new CustomEvent(TEXT_OVERLAYS_CHANGED));
+    } else if (last?.kind === 'logo' && currentProject?.id) {
+      saveLogoSettings(currentProject.id, last.before);
+    } else {
+      await handleUndo();
     }
-    const freezeDur = 2.0;
-    const start = currentTime;
-    const end = Math.min((currentProject.duration || 60), start + freezeDur);
-
-    await addSegment({
-      start_time: start,
-      end_time: end,
-      text: '❄️ Freeze Frame',
-      speaker: 'Freeze',
-      voice_profile: 'freeze',
-      audio_url: frameSnapshot,
-    });
-    if (currentProject?.id) await loadProject(currentProject.id);
-  };
-
-  const handleDuplicate = async () => {
-    if (selectedClipId && videoClips.length > 0) {
-      const clip = videoClips.find((c) => c.id === selectedClipId);
-      if (clip) {
-        const newClips = [...videoClips, { ...clip, id: `clip-${Date.now()}` }];
-        setVideoClips(newClips);
-        return;
-      }
-    }
-    const targetSeg =
-      (activeSegmentId ? segments.find((s) => s.id === activeSegmentId) : null) ||
-      segments.find((s) => currentTime >= s.start_time && currentTime <= s.end_time) ||
-      segments[0];
-    if (targetSeg && currentProject) {
-      const dur = Math.max(1.0, targetSeg.end_time - targetSeg.start_time);
-      await addSegment({
-        start_time: targetSeg.end_time + 0.1,
-        end_time: targetSeg.end_time + 0.1 + dur,
-        text: targetSeg.text,
-        speaker: targetSeg.speaker,
-        voice_profile: targetSeg.voice_profile,
-        audio_url: targetSeg.audio_url,
-      });
-      await loadProject(currentProject.id);
-    }
+    setCanUndo(undoLogRef.current.length > 0 || undoStackRef.current.length > 0);
   };
 
   const handleDeleteSelected = async () => {
+    if (objectSel?.kind === 'overlay') return removeOverlay(objectSel.id);
+    if (objectSel?.kind === 'logo') return removeLogo();
     if (selectedClipId) {
+      if (
+        (selectedClipId === 'vocals-track' || selectedClipId === 'bgm-track') &&
+        !confirm('Remove the isolated vocals & BGM? This deletes the separated audio and cannot be undone.')
+      ) {
+        return;
+      }
       handleDeleteClip(selectedClipId);
       return;
     }
     const selectedIds = Array.from(selectedSegmentIds);
+    if (selectedIds.length > 0 && selectionLane === 'voice') {
+      // selected in the voice lane: the voices go, the captions stay
+      await removeVoices(selectedIds);
+      return;
+    }
     if (selectedIds.length > 0) {
+      pushUndo(); // so Ctrl+Z brings the lines back
       await deleteMultipleSegments(selectedIds);
-      if (currentProject?.id) await loadProject(currentProject.id);
-      return;
-    }
-    const targetSegId =
-      activeSegmentId ||
-      segments.find((s) => currentTime >= s.start_time && currentTime <= s.end_time)?.id;
-    if (targetSegId) {
-      await handleDeleteSegment(targetSegId);
-      if (currentProject?.id) await loadProject(currentProject.id);
-      return;
-    }
-    if (segments.length > 0) {
-      await deleteAllSegments();
+      setSelectedSegmentIds(new Set());
       if (currentProject?.id) await loadProject(currentProject.id);
     }
   };
+  const deleteSelectedRef = useRef(handleDeleteSelected);
+  deleteSelectedRef.current = handleDeleteSelected;
+  const undoAnyRef = useRef(undoAny);
+  undoAnyRef.current = undoAny;
+
+  const handleAutoFitAudio = useCallback(async () => {
+    if (!currentProject?.id || isAutoFitting) return;
+    setIsAutoFitting(true);
+    try {
+      const targetIds = selectedSegmentIds.size > 0 ? Array.from(selectedSegmentIds) : undefined;
+      const plan = await autoFitAudioToSubtitles(currentProject.id, targetIds, true);
+      if (!plan.updated_count) {
+        alert(
+          plan.runs_on
+            ? `Every voice already fits. ${plan.runs_on} run past their caption into silence, which is fine.`
+            : 'Every voice already fits its line — nothing to change.',
+        );
+        return;
+      }
+      pushUndo();  // so Ctrl+Z brings the old voices back
+      const res = await autoFitAudioToSubtitles(currentProject.id, targetIds);
+      await loadProject(currentProject.id);
+      const tooLong = res.too_long_lines
+        .slice(0, 5)
+        .map((l) => `  ${l.start_time.toFixed(1)}s  ${l.text}`)
+        .join('\n');
+      alert(
+        `Fitted ${res.updated_count} voices: ${res.sped_up + res.too_long} sped up, ${res.slowed} slowed slightly. ` +
+          `${res.left + res.runs_on} left at their natural pace.` +
+          (res.too_long
+            ? `\n\n${res.too_long} still run into the next line even at the fastest natural pace — ` +
+              `use Shorten in the toolbar to reword them, or give them more room:\n${tooLong}`
+            : ''),
+      );
+    } catch (e: any) {
+      alert(e?.response?.data?.detail || e?.message || 'Could not fit the voices');
+    } finally {
+      setIsAutoFitting(false);
+    }
+  }, [currentProject?.id, isAutoFitting, selectedSegmentIds, loadProject, pushUndo]);
 
   const handleFitToView = useCallback(() => {
     if (!containerRef.current || duration <= 0) return;
+    setFitMode(true);
     setZoom(getFitZoom());
     containerRef.current.scrollLeft = 0;
   }, [duration, getFitZoom]);
 
-  // Long videos start fully visible instead of 20,000px wide
-  const autoFitDoneRef = useRef(false);
+  // Fit the whole video to the timeline, and keep it fitted.
+  // This used to happen once, on the first render — which is before the project has loaded,
+  // so it fitted a 30-second placeholder and never looked again. It also only ever zoomed
+  // out, so a short clip was left filling a fraction of the width.
+  const [containerWidth, setContainerWidth] = useState(0);
   useEffect(() => {
-    if (autoFitDoneRef.current || duration <= 0 || !containerRef.current) return;
-    autoFitDoneRef.current = true;
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => setContainerWidth(el.clientWidth));
+    observer.observe(el);
+    setContainerWidth(el.clientWidth);
+    return () => observer.disconnect();
+  }, []);
+
+  // a different project starts fitted, whatever zoom the last one was left at
+  useEffect(() => {
+    setFitMode(true);
+  }, [currentProject?.id]);
+
+  useEffect(() => {
+    if (!fitMode || duration <= 0 || !containerRef.current || dragging) return;
     const fit = getFitZoom();
-    if (fit < zoom) {
+    if (Math.abs(fit - zoomRef.current) > fit * 0.002) {
       setZoom(fit);
       containerRef.current.scrollLeft = 0;
     }
-  }, [duration, getFitZoom, zoom]);
+  }, [fitMode, duration, containerWidth, getFitZoom, dragging]);
 
   // Wheel handling:
   // - Ctrl/Cmd + Wheel: Zoom in/out horizontally at pointer position
@@ -1711,14 +2392,18 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
         e.preventDefault();
         const rect = el.getBoundingClientRect();
         const pointerX = e.clientX - rect.left;
-        const scrollLeft = el.scrollLeft;
-        const pointerTime = (pointerX + scrollLeft) / (20 * zoom);
-        const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-        const newZoom = Math.max(0.05, Math.min(20, +(zoom * factor).toFixed(3)));
+        const current = zoomRef.current;
+        const pointerTime = (pointerX + el.scrollLeft) / (20 * current);
+        // Scale with how hard the wheel/trackpad was pushed. A fixed step per event made a
+        // trackpad — which fires many small deltas — lurch 15% at a time.
+        const factor = Math.exp(-e.deltaY * 0.0022);
+        const newZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, current * factor));
+        if (Math.abs(newZoom - current) < 0.0001) return;
+        // Hold the moment under the pointer still; the scroll is corrected after layout,
+        // once the track is actually its new width.
+        zoomAnchorRef.current = { time: pointerTime, pointerX };
+        setFitMode(false);
         setZoom(newZoom);
-        requestAnimationFrame(() => {
-          el.scrollLeft = pointerTime * (20 * newZoom) - pointerX;
-        });
         return;
       }
 
@@ -1753,26 +2438,20 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     };
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
-  }, [zoom]);
+  }, []);
 
-  // Close flip/rotate/speed/zoom/more panels on outside click
+  // Close the zoom menu on outside click
   useEffect(() => {
-    if (!showFlipPanel && !showRotatePanel && !showSpeedPanel && !showZoomDropdown && !showMoreToolsPanel) return;
+    if (!showZoomDropdown) return;
     const handleClick = (e: MouseEvent) => {
-      if (showFlipPanel && flipPanelRef.current && !flipPanelRef.current.contains(e.target as Node)) setShowFlipPanel(false);
-      if (showRotatePanel && rotatePanelRef.current && !rotatePanelRef.current.contains(e.target as Node)) setShowRotatePanel(false);
-      if (showSpeedPanel && speedPanelRef.current && !speedPanelRef.current.contains(e.target as Node)) setShowSpeedPanel(false);
-      if (showZoomDropdown && zoomDropdownRef.current && !zoomDropdownRef.current.contains(e.target as Node)) setShowZoomDropdown(false);
-      if (showMoreToolsPanel && moreToolsPanelRef.current && !moreToolsPanelRef.current.contains(e.target as Node)) setShowMoreToolsPanel(false);
+      if (zoomDropdownRef.current && !zoomDropdownRef.current.contains(e.target as Node)) setShowZoomDropdown(false);
     };
-    const timer = setTimeout(() => {
-      document.addEventListener('mousedown', handleClick);
-    }, 10);
-    return () => {
-      clearTimeout(timer);
-      document.removeEventListener('mousedown', handleClick);
-    };
-  }, [showFlipPanel, showRotatePanel, showSpeedPanel, showZoomDropdown, showMoreToolsPanel]);
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [showZoomDropdown]);
+
+  const [viewportScrollLeft, setViewportScrollLeft] = useState(0);
+  const [viewportWidth, setViewportWidth] = useState(800);
 
   // Time markers calculation — spans the full scrollable width of the timeline
   const targetPxBetweenMarkers = 85;
@@ -1780,9 +2459,11 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
   const standardSteps = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
   const markerInterval = standardSteps.find((s) => s >= rawSeconds) || 60;
 
-  const maxRulerTime = Math.max(duration * 1.5, totalWidth / Math.max(pixelsPerSecond, 0.1) + 60);
+  const maxRulerTime = totalWidth / Math.max(pixelsPerSecond, 0.1);
   const markers: number[] = [];
-  for (let t = 0; t <= maxRulerTime; t += markerInterval) {
+  const firstMarker = Math.max(0, Math.floor((viewportScrollLeft - viewportWidth) / Math.max(pixelsPerSecond, 0.1) / markerInterval) * markerInterval);
+  const lastMarker = Math.min(maxRulerTime, (viewportScrollLeft + 2 * viewportWidth) / Math.max(pixelsPerSecond, 0.1));
+  for (let t = firstMarker; t <= lastMarker; t += markerInterval) {
     markers.push(+t.toFixed(3));
   }
 
@@ -1796,25 +2477,40 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
   };
 
+  const TRACK_LABEL_WIDTH = 182;
   const TRACK_HEIGHT = 52;
   const VIDEO_TRACK_HEIGHT = 72;
-  const TRACK_LABEL_W = 80;
-
-  const toggleLock = (t: string) => {
-    setLockedTracks(prev => { const n = new Set(prev); n.has(t) ? n.delete(t) : n.add(t); return n; });
-  };
   const toggleHidden = (t: string) => {
     toggleTrackVisibility(t);
   };
-
-  const [magnetEnabled, setMagnetEnabled] = useState(true);
+  const [showTransform, setShowTransform] = useState(false);
   const [rippleEnabled, setRippleEnabled] = useState(false);
   const minimapRef = useRef<HTMLDivElement>(null);
-  const [viewportScrollLeft, setViewportScrollLeft] = useState(0);
-  const [viewportWidth, setViewportWidth] = useState(800);
+
+  // Bucketed caption density for the minimap: constant cost regardless of project size.
+  const captionDensity = useMemo(() => {
+    const buckets = new Array(MINIMAP_BUCKETS).fill(false);
+    if (duration <= 0) return buckets;
+    for (const seg of segments) {
+      const from = Math.max(0, Math.floor((seg.start_time / duration) * MINIMAP_BUCKETS));
+      const to = Math.min(MINIMAP_BUCKETS - 1, Math.floor((seg.end_time / duration) * MINIMAP_BUCKETS));
+      for (let i = from; i <= to; i++) buckets[i] = true;
+    }
+    return buckets;
+  }, [segments, duration]);
+
+  // Only the visible slice of the timeline is rendered, with a screen of margin either side,
+  // so a 2,000-caption project doesn't build tens of thousands of DOM nodes.
+  const visibleWindow = useMemo(() => {
+    const margin = viewportWidth;
+    const pps = Math.max(0.0001, pixelsPerSecond);
+    return {
+      from: Math.max(0, (viewportScrollLeft - margin) / pps),
+      to: (viewportScrollLeft + viewportWidth + margin) / pps,
+    };
+  }, [viewportScrollLeft, viewportWidth, pixelsPerSecond]);
+
   const [hoverRulerTime, setHoverRulerTime] = useState<number | null>(null);
-  const [showShortcutsModal, setShowShortcutsModal] = useState(false);
-  const [isSanitizingTimeline, setIsSanitizingTimeline] = useState(false);
 
   // Sync viewport width & scrollLeft for minimap
   const updateViewportMetrics = useCallback(() => {
@@ -1902,20 +2598,6 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     }
   }, [currentTime, duration, clipLayout, setCurrentTime, videoRef]);
 
-  // Sanitize timeline overlaps
-  const handleSanitizeTimeline = useCallback(async () => {
-    if (!currentProject?.id) return;
-    setIsSanitizingTimeline(true);
-    try {
-      await sanitizeProjectTimeline(currentProject.id);
-      await loadProject(currentProject.id);
-    } catch (err) {
-      console.error('Failed to sanitize timeline:', err);
-    } finally {
-      setIsSanitizingTimeline(false);
-    }
-  }, [currentProject?.id, loadProject]);
-
   // Minimap drag to seek & scroll
   const handleMinimapMouseDown = (e: React.MouseEvent) => {
     if (!minimapRef.current || duration <= 0) return;
@@ -1985,22 +2667,99 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
         e.preventDefault();
         handleToggleBookmark();
       } else if (e.key === 'z' || e.key === 'Z') {
-        if (!e.metaKey && !e.ctrlKey) {
+        if (e.metaKey || e.ctrlKey) {
+          e.preventDefault();
+          if (e.shiftKey) {
+            handleRedo();
+          } else {
+            undoAnyRef.current();
+          }
+        } else {
           e.preventDefault();
           handleFitToView();
         }
+      } else if ((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y')) {
+        e.preventDefault();
+        handleRedo();
       } else if (e.key === '[' || (e.altKey && e.key === 'ArrowLeft')) {
         e.preventDefault();
         handleJumpPrevCut();
       } else if (e.key === ']' || (e.altKey && e.key === 'ArrowRight')) {
         e.preventDefault();
         handleJumpNextCut();
+      } else if ((e.metaKey || e.ctrlKey) && (e.key === 'a' || e.key === 'A')) {
+        e.preventDefault();
+        const allIds = new Set((currentProject?.segments || []).map((s) => s.id));
+        setSelectionLane('caption');
+        setSelectedSegmentIds(allIds);
+      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        deleteSelectedRef.current();
+      } else if (e.key === 'Escape') {
+        setSelectedSegmentIds(new Set());
+        setObjectSel(null);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleStepFrame, handleSplitAtPlayhead, handleToggleBookmark, handleFitToView, handleJumpPrevCut, handleJumpNextCut, duration, setCurrentTime, videoRef]);
+  }, [handleStepFrame, handleSplitAtPlayhead, handleToggleBookmark, handleFitToView, handleJumpPrevCut, handleJumpNextCut, handleUndo, handleRedo, duration, setCurrentTime, videoRef]);
+
+  // Tell the page how tall the timeline wants to be, so it can fit the tracks on screen
+  // +1: the text overlay track (TX), always shown so text can be added from the timeline
+  // The text (TX) and logo (LG) tracks appear only once there is something on them — text
+  // added with the Text button above the video, a logo with the Logo button
+  const hasText = textOverlays.length > 0;
+  const hasLogo = !!logoSettings?.url;
+  const trackCount = laneCount + (hasText ? 1 : 0) + (hasLogo ? 1 : 0) + aiTrackProfiles.length + (audioSeparated ? 2 : 0);
+  // The text overlay track (TX): drag clips to move, their edges to resize, double-click to edit
+  const txLabel = (
+    <>
+      {hasText && (
+        <OverlayTrackLabel
+          height={TRACK_HEIGHT}
+          count={textOverlays.length}
+          pos={txTrack.pos}
+          onMove={txTrack.setPosition}
+        />
+      )}
+      {hasLogo && <LogoTrackLabel height={TRACK_HEIGHT} logo={logoSettings} />}
+    </>
+  );
+  const txLane = currentProject?.id && hasText ? (
+    <OverlayTrackLane
+      projectId={currentProject.id}
+      overlays={textOverlays}
+      setOverlays={setTextOverlays}
+      height={TRACK_HEIGHT}
+      duration={duration}
+      timeToX={timeToX}
+      xToSeconds={(px) => px / pixelsPerSecond}
+      markers={markers}
+      currentTime={currentTime}
+      selectedId={objectSel?.kind === 'overlay' ? objectSel.id : null}
+      onSelect={(id) => selectObject(id ? { kind: 'overlay', id } : null)}
+      onDelete={(o) => removeOverlay(o.id)}
+    />
+  ) : null;
+  // The logo track (LG) travels with the text track wherever that is dragged
+  const lgLane = currentProject?.id && logoSettings?.url ? (
+    <LogoTrackLane
+      projectId={currentProject.id}
+      logo={logoSettings}
+      setLogo={setLogoSettings}
+      height={TRACK_HEIGHT}
+      duration={duration}
+      timeToX={timeToX}
+      xToSeconds={(px) => px / pixelsPerSecond}
+      markers={markers}
+      selected={objectSel?.kind === 'logo'}
+      onSelect={(on) => selectObject(on ? { kind: 'logo' } : null)}
+    />
+  ) : null;
+  useEffect(() => {
+    onContentHeight?.(TIMELINE_CHROME_HEIGHT + VIDEO_TRACK_HEIGHT + TRACK_HEIGHT * trackCount + 6);
+  }, [trackCount, VIDEO_TRACK_HEIGHT, TRACK_HEIGHT, onContentHeight]);
 
   const formatFrameTime = (sec: number) => {
     const h = Math.floor(sec / 3600);
@@ -2010,572 +2769,236 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
     return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}:${f.toString().padStart(2, '0')}`;
   };
 
+  // the toolbar's tools are grouped by what they act on, each group named
+  const groupLabel = 'hidden 2xl:inline text-[9px] font-bold uppercase tracking-wider text-zinc-600 pl-1 pr-0.5 select-none';
+  const divider = 'w-px h-4 bg-white/10 mx-1.5 shrink-0';
+
   return (
-    <div className="flex flex-col h-full bg-[#121316] text-[#e1e3e6] select-none font-sans">
-      {/* Meatika Timeline Toolbar */}
-      <div className="h-10 border-b border-[#1c1e24] bg-[#121316] px-3 flex items-center justify-between shrink-0 gap-2 relative z-30 overflow-visible">
-        {/* Left Action Tools */}
-        <div className="flex items-center gap-0.5 sm:gap-1 text-zinc-400 shrink min-w-0">
-          {/* Undo */}
-          <button
-            onClick={handleUndo}
-            disabled={undoStackRef.current.length === 0}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors disabled:opacity-30 cursor-pointer"
-            title="Undo (Ctrl+Z)"
-          >
+    <div className="flex flex-col h-full bg-[var(--s1)] text-[#e1e4ea] select-none font-sans">
+      {/* Timeline toolbar: all editing tools visible, grouped by purpose */}
+      <div className="h-10 border-b border-[var(--s4)] bg-[var(--s2)] px-2 flex items-center justify-between shrink-0 gap-2 relative z-30 overflow-visible">
+        <div className="flex items-center gap-0.5 text-zinc-400 shrink min-w-0">
+          <IconButton onClick={() => undoAny()} disabled={!canUndo} title="Undo (Ctrl+Z)">
             <Undo2 className="w-4 h-4" />
-          </button>
-
-          {/* Redo */}
-          <button
-            onClick={handleRedo}
-            disabled={redoStackRef.current.length === 0}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors disabled:opacity-30 cursor-pointer"
-            title="Redo (Ctrl+Shift+Z)"
-          >
+          </IconButton>
+          <IconButton onClick={handleRedo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)">
             <Redo2 className="w-4 h-4" />
-          </button>
-
-          <div className="w-px h-3.5 bg-[#24272f] mx-0.5" />
-
-          {/* Split */}
-          <button
-            onClick={handleSplitAtPlayhead}
-            disabled={!currentProject?.video_path || splitProcessing}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors disabled:opacity-30 cursor-pointer"
-            title="Split at playhead (S / C)"
-          >
-            {splitProcessing ? <Loader2 className="w-4 h-4 animate-spin text-pink-400" /> : <Scissors className="w-4 h-4" />}
-          </button>
-
-          {/* Delete */}
-          <button
+          </IconButton>
+          <IconButton onClick={handleSplitAtPlayhead} disabled={!currentProject?.video_path || splitProcessing} title="Split at playhead (S)">
+            {splitProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Scissors className="w-4 h-4" />}
+          </IconButton>
+          <IconButton
             onClick={handleDeleteSelected}
-            className="p-1.5 rounded-lg hover:bg-[#1e2025] text-red-400 hover:text-red-300 transition-colors cursor-pointer"
-            title="Delete Selected (Delete / Backspace)"
+            disabled={!objectSel && !selectedClipId && selectedSegmentIds.size === 0}
+            title={
+              selectedSegmentIds.size > 0 && selectionLane === 'voice' && !objectSel && !selectedClipId
+                ? 'Remove the selected voices and keep their captions (Delete / Backspace)'
+                : 'Delete what is selected (Delete / Backspace)'
+            }
           >
             <Trash2 className="w-4 h-4" />
+          </IconButton>
+
+          <div className={divider} />
+
+          {/* Captions: finding and fixing the lines */}
+          <span className={groupLabel}>Captions</span>
+          <button
+            onClick={toggleMissing}
+            disabled={!currentProject?.video_path || isTranscribing}
+            title={showMissing ? 'Hide the speech that has no caption' : 'Mark speech that has no caption on the timeline'}
+            className={`flex items-center gap-1.5 px-2 h-7 rounded-md text-[11px] font-medium whitespace-nowrap transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${
+              showMissing ? 'bg-amber-500/20 text-amber-200' : 'text-zinc-400 hover:text-white hover:bg-white/10'
+            }`}
+          >
+            {loadingMissing ? <Loader2 className="w-4 h-4 animate-spin" /> : <AlertCircle className="w-4 h-4" />}
+            {loadingMissing ? 'Scanning…' : showMissing
+              ? missingError && missingGaps.length === 0 ? 'Scan unavailable' : `${missingGaps.length} gaps`
+              : 'Missing'}
           </button>
+          {showMissing && missingError && (
+            <span role="status" className="text-[11px] text-amber-300 max-w-64 truncate" title={missingError}>{missingError}</span>
+          )}
+          <IconButton onClick={handleSplitLongCaptions} disabled={isSplitting || !segments.length} title="Split captions that hold more text than they can show" label="Split long">
+            {isSplitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Split className="w-4 h-4" />}
+          </IconButton>
+          <IconButton onClick={handleNormalizeRate} disabled={isEvening || !segments.length} title="Even out speaking rate: resize caption boxes to match their text" label="Even out">
+            {isEvening ? <Loader2 className="w-4 h-4 animate-spin" /> : <Gauge className="w-4 h-4" />}
+          </IconButton>
+          <IconButton onClick={handleSnapToSpeech} disabled={isSnapping} title="Snap captions to speech (needs isolated vocals)" label="Snap">
+            {isSnapping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Magnet className="w-4 h-4" />}
+          </IconButton>
+          <IconButton onClick={handleTidyCaptions} disabled={isFixingReading} title="Tidy captions: merge short lines, remove overlaps, fix reading speed" label="Tidy">
+            {isFixingReading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Timer className="w-4 h-4" />}
+          </IconButton>
 
-          {/* Desktop visible extended tools */}
-          <div className="hidden lg:flex items-center gap-0.5 sm:gap-1">
-            {/* Crop */}
-            <button
-              onClick={handleOpenCrop}
-              className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors cursor-pointer"
-              title="Crop / Transform Video"
-            >
-              <Crop className="w-4 h-4" />
-            </button>
+          <div className={divider} />
 
-            {/* Blur Watermark / Region */}
-            <button
-              onClick={handleOpenBlur}
-              className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors cursor-pointer"
-              title="Blur Logo / Watermark"
-            >
-              <Eraser className="w-4 h-4" />
-            </button>
+          {/* Voices: making the dub fit its time */}
+          <span className={groupLabel}>Voices</span>
+          <IconButton
+            onClick={() => {
+              videoRef.current?.pause();
+              useProjectStore.getState().setIsPlaying(false);
+              const sourceTime = clipLayout.length ? timelineToSource(clipLayout, currentTime)?.sourceTime : currentTime;
+              setCaptureTime(sourceTime ?? 0);
+            }}
+            disabled={!currentProject?.video_path}
+            title="Capture a character's voice from the movie, to dub with"
+            label="Capture"
+          >
+            <Mic className="w-4 h-4" />
+          </IconButton>
+          <IconButton
+            onClick={handleAutoFitAudio}
+            disabled={isAutoFitting || !segments.some((sg) => !!sg.audio_url)}
+            title="Auto-fit: speed up voices that run into the next line, and gently stretch ones that end just short"
+            label="Auto-fit"
+          >
+            {isAutoFitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+          </IconButton>
+          <IconButton onClick={handleLipTiming} disabled={isLipTiming || !segments.length} title="Lip timing: move each line onto the actor's speech and dub the changed lines again to fit (needs isolated vocals)" label="Lip timing">
+            {isLipTiming ? <Loader2 className="w-4 h-4 animate-spin" /> : <Mic className="w-4 h-4" />}
+          </IconButton>
+          <IconButton onClick={handleSpreadIntoSilence} disabled={isSpreading || !segments.length} title="Stretch captions into the silence after them, slowing each voice to match" label="Stretch">
+            {isSpreading ? <Loader2 className="w-4 h-4 animate-spin" /> : <StretchHorizontal className="w-4 h-4" />}
+          </IconButton>
+          <IconButton onClick={handleShortenToFit} disabled={isShortening || !segments.length} title="Shorten to fit: reword lines that have more words than their time (or just the selected lines)" label="Shorten">
+            {isShortening ? <Loader2 className="w-4 h-4 animate-spin" /> : <Minimize2 className="w-4 h-4" />}
+          </IconButton>
 
-            {/* Duplicate */}
-            <button
-              onClick={handleDuplicate}
-              className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors cursor-pointer"
-              title="Duplicate Selected Clip / Segment (Ctrl+D)"
-            >
-              <Copy className="w-4 h-4" />
-            </button>
+          <div className={divider} />
 
-            {/* Freeze Frame */}
-            <button
-              onClick={handleFreezeFrame}
-              className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors cursor-pointer"
-              title="Freeze Frame at Playhead"
-            >
-              <Snowflake className="w-4 h-4" />
-            </button>
-
-            {/* Add Bookmark / Marker */}
-            <button
-              onClick={handleToggleBookmark}
-              className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
-                bookmarks.some(b => Math.abs(b - currentTime) < 0.2)
-                  ? 'bg-purple-600/30 text-purple-300 border border-purple-500/40'
-                  : 'hover:bg-[#1e2025] hover:text-white'
-              }`}
-              title="Add / Remove Bookmark at Playhead (M)"
-            >
-              <Bookmark className="w-4 h-4" />
-            </button>
-
-            {/* Speed Curve / Speed Panel */}
-            <div className="relative">
-              <button
-                onClick={() => {
-                  setShowSpeedPanel(!showSpeedPanel);
-                  setShowRotatePanel(false);
-                  setShowFlipPanel(false);
-                  setShowZoomDropdown(false);
-                  setShowMoreToolsPanel(false);
-                }}
-                className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
-                  showSpeedPanel ? 'bg-blue-600 text-white' : 'hover:bg-[#1e2025] hover:text-white'
-                }`}
-                title="Change Video Speed"
-              >
-                <TrendingUp className="w-4 h-4" />
-              </button>
-
-              {showSpeedPanel && (
-                <div
-                  ref={speedPanelRef}
-                  className="absolute top-full left-0 mt-1.5 bg-[#1e2025] border border-[#31353e] rounded-xl shadow-2xl p-2 z-50 w-44 space-y-1 animate-in fade-in"
-                >
-                  <div className="text-[10px] text-zinc-400 font-bold px-2 py-1 uppercase tracking-wider">Video Speed</div>
-                  {[0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => handleSpeedChange(s)}
-                      className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
-                    >
-                      <span>{s}x</span>
-                      {isChangingSpeed && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Rotate Video */}
-            <div className="relative">
-              <button
-                onClick={() => {
-                  setShowRotatePanel(!showRotatePanel);
-                  setShowSpeedPanel(false);
-                  setShowFlipPanel(false);
-                  setShowZoomDropdown(false);
-                  setShowMoreToolsPanel(false);
-                }}
-                className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
-                  showRotatePanel ? 'bg-blue-600 text-white' : 'hover:bg-[#1e2025] hover:text-white'
-                }`}
-                title="Rotate Video"
-              >
-                <RotateCw className="w-4 h-4" />
-              </button>
-
-              {showRotatePanel && (
-                <div
-                  ref={rotatePanelRef}
-                  className="absolute top-full left-0 mt-1.5 bg-[#1e2025] border border-[#31353e] rounded-xl shadow-2xl p-2 z-50 w-44 space-y-1 animate-in fade-in"
-                >
-                  <div className="text-[10px] text-zinc-400 font-bold px-2 py-1 uppercase tracking-wider">Rotate</div>
+          {/* Video and its sound */}
+          <span className={groupLabel}>Video</span>
+          <IconButton onClick={() => setShowCutPanel(true)} disabled={!segments.length} title="Review the stretches with no speech and cut them out of the video" label="Cut silence">
+            <Scissors className="w-4 h-4" />
+          </IconButton>
+          <IconButton
+            onClick={handleSeparateAudioClick}
+            disabled={isSeparatingAudio}
+            active={audioSeparated}
+            title={audioSeparated ? 'The music is isolated. Click to remove the isolated voices and music.' : 'Isolate the voices and the background music'}
+            label="Music"
+          >
+            {isSeparatingAudio ? <Loader2 className="w-4 h-4 animate-spin" /> : <Music className="w-4 h-4" />}
+          </IconButton>
+          {/* crop, rotate and flip are rarely needed: one button opens them */}
+          <div className="relative" onMouseLeave={() => setShowTransform(false)}>
+            <IconButton onClick={() => setShowTransform((v) => !v)} active={showTransform} title="Crop, rotate or flip the video" label="Transform">
+              {isRotating || isFlipping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Crop className="w-4 h-4" />}
+            </IconButton>
+            {showTransform && (
+              <div role="menu" className="absolute left-0 top-full z-50 w-48 rounded-lg border border-[var(--s5)] bg-[var(--s2)] shadow-xl py-1">
+                {([
+                  ['Crop…', Crop, handleOpenCrop, false],
+                  ['Rotate right', RotateCw, () => handleRotate(90), isRotating],
+                  ['Rotate left', RotateCcw, () => handleRotate(270), isRotating],
+                  ['Flip left–right', FlipHorizontal, () => handleFlip('horizontal'), isFlipping],
+                  ['Flip top–bottom', FlipVertical, () => handleFlip('vertical'), isFlipping],
+                ] as [string, typeof Crop, () => void, boolean][]).map(([name, Icon, run, busy]) => (
                   <button
-                    onClick={() => handleRotate(90)}
-                    disabled={isRotating}
-                    className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
+                    key={name}
+                    role="menuitem"
+                    disabled={busy}
+                    onClick={() => { setShowTransform(false); run(); }}
+                    className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[11px] text-zinc-300 hover:text-white hover:bg-white/10 disabled:opacity-40 cursor-pointer"
                   >
-                    <span>90° Clockwise</span>
-                    {isRotating && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
+                    <Icon className="w-3.5 h-3.5" /> {name}
                   </button>
-                  <button
-                    onClick={() => handleRotate(270)}
-                    disabled={isRotating}
-                    className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
-                  >
-                    <span>90° Counter-CW</span>
-                    {isRotating && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
-                  </button>
-                  <button
-                    onClick={() => handleRotate(180)}
-                    disabled={isRotating}
-                    className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
-                  >
-                    <span>180° Flip</span>
-                    {isRotating && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Flip Video */}
-            <div className="relative">
-              <button
-                onClick={() => {
-                  setShowFlipPanel(!showFlipPanel);
-                  setShowSpeedPanel(false);
-                  setShowRotatePanel(false);
-                  setShowZoomDropdown(false);
-                  setShowMoreToolsPanel(false);
-                }}
-                className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
-                  showFlipPanel ? 'bg-blue-600 text-white' : 'hover:bg-[#1e2025] hover:text-white'
-                }`}
-                title="Flip Video"
-              >
-                <FlipHorizontal className="w-4 h-4" />
-              </button>
-
-              {showFlipPanel && (
-                <div
-                  ref={flipPanelRef}
-                  className="absolute top-full left-0 mt-1.5 bg-[#1e2025] border border-[#31353e] rounded-xl shadow-2xl p-2 z-50 w-44 space-y-1 animate-in fade-in"
-                >
-                  <div className="text-[10px] text-zinc-400 font-bold px-2 py-1 uppercase tracking-wider">Flip Mirror</div>
-                  <button
-                    onClick={() => handleFlip('horizontal')}
-                    disabled={isFlipping}
-                    className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
-                  >
-                    <span>Flip Horizontal</span>
-                    {isFlipping && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
-                  </button>
-                  <button
-                    onClick={() => handleFlip('vertical')}
-                    disabled={isFlipping}
-                    className="w-full px-2.5 py-1.5 text-left text-xs font-mono rounded-lg hover:bg-[#282c34] flex items-center justify-between text-zinc-200 transition-colors cursor-pointer"
-                  >
-                    <span>Flip Vertical</span>
-                    {isFlipping && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Collapsed More Tools Dropdown on smaller screens (< lg) */}
-          <div className="lg:hidden relative">
-            <button
-              onClick={() => {
-                setShowMoreToolsPanel(!showMoreToolsPanel);
-                setShowSpeedPanel(false);
-                setShowRotatePanel(false);
-                setShowFlipPanel(false);
-                setShowZoomDropdown(false);
-              }}
-              className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
-                showMoreToolsPanel ? 'bg-[#282c34] text-white' : 'hover:bg-[#1e2025] hover:text-white'
-              }`}
-              title="More Editing Tools"
-            >
-              <MoreHorizontal className="w-4 h-4" />
-            </button>
-
-            {showMoreToolsPanel && (
-              <div
-                ref={moreToolsPanelRef}
-                className="absolute top-full left-0 mt-1.5 bg-[#181a20] border border-[#2e3340] rounded-xl shadow-2xl p-1.5 z-50 w-48 space-y-1 animate-in fade-in"
-              >
-                <div className="text-[10px] text-zinc-500 font-bold px-2 py-1 uppercase tracking-wider">
-                  Editing Actions
-                </div>
-                <button
-                  onClick={() => {
-                    handleOpenCrop();
-                    setShowMoreToolsPanel(false);
-                  }}
-                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
-                >
-                  <Crop className="w-3.5 h-3.5 text-blue-400" />
-                  <span>Crop / Transform</span>
-                </button>
-                <button
-                  onClick={() => {
-                    handleOpenBlur();
-                    setShowMoreToolsPanel(false);
-                  }}
-                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
-                >
-                  <Eraser className="w-3.5 h-3.5 text-pink-400" />
-                  <span>Blur Watermark</span>
-                </button>
-                <button
-                  onClick={() => {
-                    handleDuplicate();
-                    setShowMoreToolsPanel(false);
-                  }}
-                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
-                >
-                  <Copy className="w-3.5 h-3.5 text-purple-400" />
-                  <span>Duplicate Selected</span>
-                </button>
-                <button
-                  onClick={() => {
-                    handleFreezeFrame();
-                    setShowMoreToolsPanel(false);
-                  }}
-                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
-                >
-                  <Snowflake className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Freeze Frame</span>
-                </button>
-                <button
-                  onClick={() => {
-                    handleToggleBookmark();
-                    setShowMoreToolsPanel(false);
-                  }}
-                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
-                >
-                  <Bookmark className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Add Bookmark (M)</span>
-                </button>
-                <div className="w-full h-px bg-white/5 my-1" />
-                <button
-                  onClick={() => handleRotate(90)}
-                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
-                >
-                  <RotateCw className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Rotate 90°</span>
-                </button>
-                <button
-                  onClick={() => handleFlip('horizontal')}
-                  className="w-full px-2.5 py-1.5 text-left text-xs rounded-lg hover:bg-[#242833] flex items-center gap-2 text-zinc-200 hover:text-white cursor-pointer"
-                >
-                  <FlipHorizontal className="w-3.5 h-3.5 text-indigo-400" />
-                  <span>Flip Horizontal</span>
-                </button>
+                ))}
               </div>
             )}
           </div>
 
-          <div className="w-px h-3.5 bg-[#24272f] mx-0.5" />
+          <div className={divider} />
 
-          {/* Voiceover Live Recording */}
-          <div className="flex items-center">
-            {isRecordingVoice ? (
-              <button
-                onClick={handleStopVoiceRecording}
-                className="flex items-center gap-1 px-2 py-1 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-mono transition-all animate-pulse cursor-pointer"
-                title="Stop Recording Voiceover"
-              >
-                <span className="w-2 h-2 rounded-full bg-white animate-ping" />
-                <span>REC {recordingSeconds}s</span>
-              </button>
-            ) : (
-              <button
-                onClick={handleStartVoiceRecording}
-                className="flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-[#1e2025] text-zinc-400 hover:text-white text-xs transition-colors cursor-pointer"
-                title="Record Voiceover at Playhead"
-              >
-                <Mic className="w-3.5 h-3.5 text-rose-400" />
-                <span className="hidden md:inline text-[11px]">Record</span>
-              </button>
-            )}
-          </div>
+          <IconButton onClick={handleToggleBookmark} title="Toggle bookmark at playhead (M)">
+            <Bookmark className="w-4 h-4" />
+          </IconButton>
+          <IconButton onClick={() => setRippleEnabled(!rippleEnabled)} active={rippleEnabled} title={rippleEnabled ? 'Ripple edit is on: cutting or moving a clip moves everything after it' : 'Ripple edit: move everything after a clip when it is cut or moved'}>
+            <MoveHorizontal className="w-4 h-4" />
+          </IconButton>
 
-          {/* Isolate Vocals & BGM (AI Demucs) */}
-          <button
-            onClick={handleSeparateAudioClick}
-            disabled={isSeparatingAudio}
-            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium transition-all cursor-pointer ${
-              audioSeparated
-                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30'
-                : 'bg-[#181a1f] border border-[#26282e] hover:border-amber-500/40 text-zinc-300 hover:text-white'
-            }`}
-            title={
-              audioSeparated
-                ? 'Audio separated into Vocals & BGM tracks — Click to remove'
-                : 'Isolate video background music from vocals with AI Demucs'
-            }
-          >
-            {isSeparatingAudio ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-purple-400" />
-                <span className="hidden xl:inline text-[11px] text-purple-300">Isolating...</span>
-              </>
-            ) : audioSeparated ? (
-              <>
-                <Check className="w-3.5 h-3.5 text-emerald-400" />
-                <span className="hidden xl:inline text-[11px]">BGM Isolated</span>
-              </>
-            ) : (
-              <>
-                <Music className="w-3.5 h-3.5 text-amber-400" />
-                <span className="hidden xl:inline text-[11px]">Isolate BGM</span>
-              </>
-            )}
-          </button>
-        </div>
-
-        {/* Center Transport & Frame Navigation */}
-        <div className="flex items-center gap-0.5 sm:gap-1 bg-[#181a1f] px-1.5 sm:px-2 py-0.5 rounded-xl border border-[#24272f] shrink-0">
-          <button
-            onClick={handleJumpPrevCut}
-            className="hidden sm:inline-flex p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors cursor-pointer"
-            title="Jump to Previous Cut Point ([)"
-          >
-            <SkipBack className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => handleStepFrame(-1)}
-            className="p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors cursor-pointer"
-            title="Step 1 Frame Backward (←)"
-          >
-            <ChevronLeft className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => {
-              if (videoRef.current) {
-                if (videoRef.current.paused) videoRef.current.play();
-                else videoRef.current.pause();
-              }
-            }}
-            className="p-1 px-1.5 rounded-lg bg-pink-600/30 hover:bg-pink-600/50 text-pink-300 hover:text-white border border-pink-500/30 transition-colors cursor-pointer"
-            title="Play / Pause (Space)"
-          >
-            {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 fill-current" />}
-          </button>
-          <button
-            onClick={() => handleStepFrame(1)}
-            className="p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors cursor-pointer"
-            title="Step 1 Frame Forward (→)"
-          >
-            <ChevronRight className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={handleJumpNextCut}
-            className="hidden sm:inline-flex p-1 rounded hover:bg-[#282c34] text-zinc-400 hover:text-white transition-colors cursor-pointer"
-            title="Jump to Next Cut Point (])"
-          >
-            <SkipForward className="w-3.5 h-3.5" />
-          </button>
-
-          <div className="w-px h-3 bg-zinc-700/50 mx-0.5 sm:mx-1" />
-
-          {/* Frame-accurate Timecode */}
-          <div className="font-mono text-[11px] sm:text-xs font-semibold text-zinc-200 tracking-wider px-0.5 sm:px-1 whitespace-nowrap">
-            <span className="text-pink-300 font-bold">{formatFrameTime(currentTime)}</span>
-            <span className="hidden sm:inline">
-              <span className="text-zinc-600 mx-1">/</span>
-              <span className="text-zinc-500">{formatFrameTime(duration)}</span>
+          {isSeparatingAudio && (
+            <span className="ml-1 flex items-center gap-1 text-[11px] text-zinc-500">
+              <Loader2 className="w-3 h-3 animate-spin" /> {separationLabel}
             </span>
-          </div>
+          )}
         </div>
 
-        {/* Right Controls */}
-        <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
-          {/* Fit to View Button */}
-          <button
-            onClick={handleFitToView}
-            className="p-1.5 rounded-lg bg-[#181a1f] hover:bg-[#242730] text-zinc-400 hover:text-white border border-[#24272f] hover:border-zinc-600 transition-colors cursor-pointer"
-            title="Zoom to Fit Full Timeline (Z)"
-          >
+        {/* Selection actions */}
+        {selectedSegmentIds.size > 0 && (
+          <div className="flex items-center gap-1 text-[11px] text-zinc-300 shrink-0">
+            <span className="font-mono">{selectedSegmentIds.size} selected</span>
+            <button
+              onClick={handleGenerateVoice}
+              disabled={isGeneratingAudio}
+              className="px-2 py-0.5 rounded-md bg-white/10 hover:bg-white/15 flex items-center gap-1 cursor-pointer disabled:opacity-40"
+              title="Dub selected segments with AI voice"
+            >
+              {isGeneratingAudio ? <Loader2 className="w-3 h-3 animate-spin" /> : <Mic className="w-3 h-3" />}
+              Dub
+            </button>
+            <IconButton onClick={handleDeleteSelected} title="Delete selected">
+              <Trash2 className="w-3.5 h-3.5" />
+            </IconButton>
+            <IconButton onClick={() => setSelectedSegmentIds(new Set())} title="Deselect all (Esc)">
+              <X className="w-3.5 h-3.5" />
+            </IconButton>
+          </div>
+        )}
+
+        {/* Zoom */}
+        <div className="flex items-center gap-0.5 shrink-0">
+
+          <IconButton onClick={handleFitToView} active={fitMode} title={fitMode ? 'The whole video is kept in view. Zoom in to turn this off (Z to fit again)' : 'Fit the whole video in view and keep it fitted (Z)'}>
             <Maximize2 className="w-3.5 h-3.5" />
-          </button>
-
-          {/* Shortcuts Button */}
-          <button
-            onClick={() => setShowShortcutsModal(true)}
-            className="hidden sm:inline-flex p-1.5 rounded-lg bg-[#181a1f] hover:bg-[#242730] text-zinc-400 hover:text-white border border-[#24272f] transition-colors cursor-pointer"
-            title="Keyboard Shortcuts Cheatsheet"
-          >
-            <Keyboard className="w-3.5 h-3.5" />
-          </button>
-
-          {/* Snapping Magnet Badge */}
-          <button
-            onClick={() => setMagnetEnabled(!magnetEnabled)}
-            className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
-              magnetEnabled ? 'bg-blue-600 text-white shadow-sm' : 'bg-[#181a1f] text-zinc-400 hover:text-white'
-            }`}
-            title="Clip Snapping (N)"
-          >
-            <Magnet className="w-3.5 h-3.5" />
-          </button>
-
-          {/* Ripple Button */}
-          <button
-            onClick={() => setRippleEnabled(!rippleEnabled)}
-            className={`hidden md:inline-flex p-1.5 rounded-lg transition-colors cursor-pointer ${
-              rippleEnabled ? 'bg-blue-600 text-white shadow-sm' : 'bg-[#181a1f] text-zinc-400 hover:text-white'
-            }`}
-            title="Ripple Edit"
-          >
-            <MoveHorizontal className="w-3.5 h-3.5" />
-          </button>
-
-          {/* Timeline Track Zoom dropdown */}
+          </IconButton>
           <div className="relative" ref={zoomDropdownRef}>
             <button
-              onClick={() => setShowZoomDropdown(!showZoomDropdown)}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-[#181a1f] border border-[#26282e] hover:border-[#3a3e49] text-xs font-mono text-zinc-300 hover:text-white transition-colors cursor-pointer"
-              title="Timeline Track Zoom"
+              onClick={() => {
+                setShowZoomDropdown(!showZoomDropdown);
+              }}
+              className="flex items-center gap-1 px-1.5 py-1 rounded-md hover:bg-white/10 text-xs font-mono text-zinc-400 hover:text-white cursor-pointer"
+              title="Timeline zoom (Ctrl + scroll)"
             >
-              <span>
-                {Math.abs(zoom - getFitZoom()) < 0.015 || zoom <= getFitZoom() * 1.05
-                  ? 'Fit'
-                  : `${Math.round(zoom * 100)}%`}
-              </span>
-              <ChevronDown className="w-3 h-3 text-zinc-500" />
+              {isFitZoom ? 'Fit' : `${Math.round(zoom * 100)}%`}
+              <ChevronDown className="w-3 h-3" />
             </button>
 
             {showZoomDropdown && (
-              <div className="absolute top-full right-0 mt-1.5 w-36 bg-[#1e2025] border border-[#31353e] rounded-xl shadow-2xl py-1 z-50 animate-in fade-in">
+              <div className="absolute bottom-full right-0 mb-1 w-28 bg-[var(--s2)] border border-[var(--s5)] rounded-lg shadow-xl py-1 z-50">
                 {[
-                  { label: 'Fit to View', value: 'fit' },
+                  { label: 'Fit', value: 'fit' },
                   { label: '25%', value: 0.25 },
                   { label: '50%', value: 0.5 },
-                  { label: '75%', value: 0.75 },
-                  { label: '100% (1x)', value: 1.0 },
-                  { label: '150%', value: 1.5 },
-                  { label: '200% (2x)', value: 2.0 },
-                  { label: '300% (3x)', value: 3.0 },
+                  { label: '100%', value: 1.0 },
+                  { label: '200%', value: 2.0 },
+                  { label: '300%', value: 3.0 },
                 ].map((item) => {
-                  const isCurrent =
-                    item.value === 'fit'
-                      ? Math.abs(zoom - getFitZoom()) < 0.015 || zoom <= getFitZoom() * 1.05
-                      : Math.abs(zoom - (item.value as number)) < 0.02;
+                  const isCurrent = item.value === 'fit' ? isFitZoom : Math.abs(zoom - (item.value as number)) < 0.02;
                   return (
                     <button
                       key={item.label}
                       onClick={() => {
-                        if (item.value === 'fit') {
-                          handleFitToView();
-                        } else {
+                        if (item.value === 'fit') handleFitToView();
+                        else {
+                          setFitMode(false);
                           setZoom(item.value as number);
                         }
                         setShowZoomDropdown(false);
                       }}
-                      className={`w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-[#282c34] flex items-center justify-between transition-colors cursor-pointer ${
-                        isCurrent ? 'text-pink-400 font-bold bg-[#282c34]' : 'text-zinc-300'
+                      className={`w-full px-3 py-1 text-left text-xs font-mono hover:bg-white/5 cursor-pointer ${
+                        isCurrent ? 'text-white' : 'text-zinc-400'
                       }`}
                     >
-                      <span>{item.label}</span>
-                      {isCurrent && <span className="w-1.5 h-1.5 rounded-full bg-pink-400" />}
+                      {item.label}
                     </button>
                   );
                 })}
               </div>
             )}
-          </div>
-
-          {/* Timeline Zoom Slider (desktop only) */}
-          <div className="hidden xl:flex items-center gap-1 pl-1">
-            <button
-              onClick={() => zoomBy(1 / 1.3)}
-              className="p-1 rounded hover:bg-[#1e2025] text-zinc-400 hover:text-white transition-colors cursor-pointer"
-              title="Zoom Out"
-            >
-              <ZoomOut className="w-3.5 h-3.5" />
-            </button>
-
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={Math.log(zoom / 0.05) / Math.log(20 / 0.05)}
-              onChange={(e) => setZoom(+((0.05 * Math.pow(20 / 0.05, parseFloat(e.target.value))).toFixed(3)))}
-              className="w-14 h-1 accent-white bg-[#26282e] rounded-lg cursor-pointer"
-            />
-
-            <button
-              onClick={() => zoomBy(1.3)}
-              className="p-1 rounded hover:bg-[#1e2025] text-zinc-400 hover:text-white transition-colors cursor-pointer"
-              title="Zoom In"
-            >
-              <ZoomIn className="w-3.5 h-3.5" />
-            </button>
           </div>
         </div>
       </div>
@@ -2585,7 +3008,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
         <div
           ref={minimapRef}
           onMouseDown={handleMinimapMouseDown}
-          className="h-3 bg-[#0c0d10] border-b border-[#1c1e24] relative cursor-pointer group/minimap overflow-hidden shrink-0 select-none"
+          className="h-3 bg-[var(--s1)] border-b border-[var(--s3)] relative cursor-pointer group/minimap overflow-hidden shrink-0 select-none"
           title="Overview Navigator — Click or drag to jump anywhere across the video"
         >
           {/* Clips Representation */}
@@ -2601,32 +3024,31 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
             ))}
           </div>
 
-          {/* Subtitles Representation */}
+          {/* Subtitles Representation — bucketed, so the strip costs the same at any project size */}
           <div className="absolute inset-0 flex items-center opacity-70 pointer-events-none">
-            {segments.map((s, i) => (
-              <div
-                key={`mini-seg-${s.id || i}`}
-                className="absolute h-1 bg-pink-400/80 rounded-xs"
-                style={{
-                  left: `${(s.start_time / duration) * 100}%`,
-                  width: `${Math.max(0.2, ((s.end_time - s.start_time) / duration) * 100)}%`,
-                }}
-              />
-            ))}
+            {captionDensity.map((filled, i) =>
+              filled ? (
+                <div
+                  key={`mini-bucket-${i}`}
+                  className="absolute h-1 bg-zinc-400/70 rounded-xs"
+                  style={{ left: `${(i / MINIMAP_BUCKETS) * 100}%`, width: `${100 / MINIMAP_BUCKETS}%` }}
+                />
+              ) : null
+            )}
           </div>
 
           {/* Bookmarks */}
           {bookmarks.map((bm, i) => (
             <div
               key={`mini-bm-${i}`}
-              className="absolute top-0 bottom-0 w-0.5 bg-purple-400 pointer-events-none z-10"
+              className="absolute top-0 bottom-0 w-0.5 bg-blue-400 pointer-events-none z-10"
               style={{ left: `${(bm / duration) * 100}%` }}
             />
           ))}
 
           {/* Current Playhead indicator */}
           <div
-            className="absolute top-0 bottom-0 w-0.5 bg-pink-500 z-20 shadow-[0_0_6px_rgba(236,72,153,0.9)]"
+            className="absolute top-0 bottom-0 w-0.5 bg-blue-400 z-20"
             style={{ left: `${(currentTime / duration) * 100}%` }}
           />
 
@@ -2645,11 +3067,11 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
 
       {/* Timeline body */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Track labels */}
+        {/* Track labels sidebar */}
         <div
           ref={trackLabelsRef}
-          className="shrink-0 border-r border-[#1c1e24] overflow-hidden bg-[#121316] select-none"
-          style={{ width: 140 }}
+          className="relative shrink-0 border-r border-[var(--s4)] overflow-hidden bg-[var(--s2)] select-none"
+          style={{ width: TRACK_LABEL_WIDTH }}
           onWheel={(e) => {
             if (containerRef.current) {
               containerRef.current.scrollTop += e.deltaY;
@@ -2657,47 +3079,30 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
           }}
         >
           {/* Time ruler spacer */}
-          <div className="h-7 border-b border-[#1c1e24]" />
+          <div className="h-7 border-b border-[var(--s4)] bg-[var(--s2)]" />
 
           {/* V1 — Video Track */}
           <div
-            className="flex items-center justify-between px-2.5 border-b border-[#1c1e24] group relative"
+            className="flex items-center justify-between px-2 border-b border-[var(--s4)] group relative bg-[rgb(var(--s2-rgb)/0.6)] hover:bg-[var(--s3)] transition-colors"
             style={{ height: VIDEO_TRACK_HEIGHT }}
           >
             <div className="flex items-center gap-1.5">
-              <span className="text-[11px] font-bold text-zinc-200">V1</span>
-              {/* Nudge / Toggle V1 Track Forward / Backward */}
-              <div className="flex items-center bg-[#181a1f] rounded border border-zinc-700/40 p-0.5 ml-0.5">
-                <button
-                  onClick={() => handleNudgeV1Track(-0.5)}
-                  className="p-0.5 hover:bg-zinc-700/60 rounded text-zinc-400 hover:text-white transition-colors"
-                  title="Nudge Video Backward (-0.5s)"
-                >
-                  <ChevronLeft className="w-2.5 h-2.5" />
-                </button>
-                <button
-                  onClick={() => handleNudgeV1Track(0.5)}
-                  className="p-0.5 hover:bg-zinc-700/60 rounded text-zinc-400 hover:text-white transition-colors"
-                  title="Nudge Video Forward (+0.5s)"
-                >
-                  <ChevronRight className="w-2.5 h-2.5" />
-                </button>
-              </div>
+              <TrackTag code="V1" name="Video" />
             </div>
-            <div className="flex items-center gap-1.5 text-zinc-400">
+            <div className="flex items-center gap-1 text-zinc-400">
               {!audioSeparated ? (
-                <div className="flex items-center gap-1 bg-[#101116] px-1.5 py-0.5 rounded-lg border border-purple-500/20" title={`Video Audio Volume: ${Math.round(videoVolume * 100)}%`}>
+                <div className="flex items-center gap-0.5 bg-[var(--s1)] px-1 py-0.5 rounded-lg border border-blue-500/20" title={`Video Audio Volume: ${Math.round(videoVolume * 100)}%`}>
                   <button
                     onClick={() => setA2Muted(!a2Muted)}
-                    className="p-0.5 rounded hover:bg-purple-900/50 text-zinc-400 hover:text-white transition-colors"
+                    className="p-0.5 rounded hover:bg-blue-900/50 text-zinc-400 hover:text-white transition-colors cursor-pointer"
                     title={a2Muted ? 'Unmute Video Audio' : 'Mute Video Audio'}
                   >
                     {a2Muted || videoVolume === 0 ? (
                       <VolumeX className="w-3 h-3 text-red-400" />
                     ) : videoVolume < 0.5 ? (
-                      <Volume1 className="w-3 h-3 text-purple-400" />
+                      <Volume1 className="w-3 h-3 text-blue-400" />
                     ) : (
-                      <Volume2 className="w-3 h-3 text-purple-400" />
+                      <Volume2 className="w-3 h-3 text-blue-400" />
                     )}
                   </button>
                   <input
@@ -2711,17 +3116,14 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                       setVideoVolume(v);
                       if (a2Muted && v > 0) setA2Muted(false);
                     }}
-                    className="w-12 h-1 bg-zinc-700 accent-purple-400 rounded-lg cursor-pointer"
+                    className="w-10 h-1 bg-zinc-700 accent-blue-400 rounded-lg cursor-pointer"
                     title={`Video Audio Volume: ${Math.round(videoVolume * 100)}%`}
                   />
-                  <span className="text-[9px] font-mono text-purple-300/90 w-6 text-right select-none">
-                    {a2Muted ? '0%' : `${Math.round(videoVolume * 100)}%`}
-                  </span>
                 </div>
               ) : (
                 <button
                   onClick={() => setA2Muted(!a2Muted)}
-                  className="hover:text-white transition-colors"
+                  className="p-1 rounded hover:bg-white/10 hover:text-white transition-colors cursor-pointer"
                   title="Mute video audio"
                 >
                   {a2Muted ? <VolumeX className="w-3 h-3 text-red-400" /> : <Volume2 className="w-3 h-3" />}
@@ -2729,7 +3131,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
               )}
               <button
                 onClick={() => toggleHidden('V1')}
-                className="hover:text-white transition-colors"
+                className="p-1 rounded hover:bg-white/10 hover:text-white transition-colors cursor-pointer"
                 title={hiddenTracks.has('V1') || hiddenTracks.has('V') || !videoVisible ? 'Show video track' : 'Hide video track'}
               >
                 {hiddenTracks.has('V1') || hiddenTracks.has('V') || !videoVisible ? <EyeOff className="w-3 h-3 text-red-400" /> : <Eye className="w-3 h-3" />}
@@ -2737,21 +3139,25 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
             </div>
           </div>
 
-          {/* T tracks / V2 */}
+          {/* TX — text overlays: under the video, the captions or the voices, as chosen */}
+          {txTrack.pos === 'top' && txLabel}
+
+          {/* T tracks / Subtitles */}
           {Array.from({ length: laneCount }, (_, i) => {
             const laneKey = `T${i + 1}`;
             const isHidden = hiddenTracks.has(laneKey) || hiddenTracks.has('T') || !subtitlesVisible;
             return (
               <div
                 key={`t-label-${i}`}
-                className="flex items-center justify-between px-2.5 border-b border-[#1c1e24] group"
+                data-track-group="captions"
+                className="flex items-center justify-between px-2.5 border-b border-[var(--s4)] group bg-[rgb(var(--s2-rgb)/0.4)] hover:bg-[var(--s3)] transition-colors"
                 style={{ height: TRACK_HEIGHT }}
               >
-                <span className="text-[11px] font-bold text-zinc-300">T{i + 1}</span>
+                <TrackTag code={`T${i + 1}`} name={laneCount > 1 ? `Captions ${i + 1}` : 'Captions'} />
                 <div className="flex items-center gap-1.5 text-zinc-400">
                   <button
                     onClick={() => toggleHidden(laneKey)}
-                    className="hover:text-white transition-colors"
+                    className="p-1 rounded hover:bg-white/10 hover:text-white transition-colors cursor-pointer"
                     title={isHidden ? 'Show track subtitles' : 'Hide track subtitles'}
                   >
                     {isHidden ? <EyeOff className="w-3 h-3 text-red-400" /> : <Eye className="w-3 h-3" />}
@@ -2761,6 +3167,8 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
             );
           })}
 
+          {txTrack.pos === 'middle' && txLabel}
+
           {/* A1 — AI Audio */}
           {aiTrackProfiles.map((profile, idx) => {
             const isMuted = aiMutedProfiles.has(profile);
@@ -2769,21 +3177,22 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
             return (
               <div
                 key={`ai-label-${profile}`}
-                className="flex items-center justify-between px-2.5 border-b border-[#1c1e24] group"
+                data-track-group="voices"
+                className="flex items-center justify-between px-2.5 border-b border-[var(--s4)] group bg-[rgb(var(--s3-rgb)/0.4)] hover:bg-[var(--s3)] transition-colors"
                 style={{ height: TRACK_HEIGHT }}
               >
-                <span className="text-[11px] font-bold text-purple-300">A{idx + 1}</span>
-                <div className="flex items-center gap-1.5 text-zinc-400">
+                <TrackTag code={`A${idx + 1}`} name={profile === '_all' ? 'AI voice' : VOICE_TRACK_NAMES[profile] || profile} />
+                <div className="flex items-center gap-1 text-zinc-400">
                   <button
                     onClick={() => toggleAiTrackMute(profile)}
-                    className="hover:text-white transition-colors"
+                    className="p-1 rounded hover:bg-white/10 hover:text-white transition-colors cursor-pointer"
                     title="Mute AI voice"
                   >
                     {isMuted ? <VolumeX className="w-3 h-3 text-red-400" /> : <Volume2 className="w-3 h-3" />}
                   </button>
                   <button
                     onClick={() => toggleHidden(aKey)}
-                    className="hover:text-white transition-colors"
+                    className="p-1 rounded hover:bg-white/10 hover:text-white transition-colors cursor-pointer"
                     title={isAHidden ? 'Show track' : 'Hide track'}
                   >
                     {isAHidden ? <EyeOff className="w-3 h-3 text-red-400" /> : <Eye className="w-3 h-3" />}
@@ -2793,123 +3202,32 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
             );
           })}
 
-          {/* Isolated Vocals Track */}
-          {audioSeparated && (
-            <div
-              className="flex items-center justify-between px-2 border-b border-[#1c1e24] bg-blue-950/20 group"
-              style={{ height: TRACK_HEIGHT }}
-            >
-              <div className="flex items-center gap-1.5 min-w-0">
-                <Mic className="w-3 h-3 text-blue-400 shrink-0" />
-                <span className="text-[11px] font-bold text-blue-300 truncate">Vocals</span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <div className="flex items-center gap-1 bg-[#101116] px-1.5 py-0.5 rounded-lg border border-blue-500/20" title={`Vocals Volume: ${Math.round(vocalsVolume * 100)}%`}>
-                  <button
-                    onClick={() => setV1Muted(!v1Muted)}
-                    className="p-0.5 rounded hover:bg-blue-900/50 text-zinc-400 hover:text-white transition-colors"
-                    title={v1Muted ? 'Unmute Isolated Vocals' : 'Mute Isolated Vocals'}
-                  >
-                    {v1Muted || vocalsVolume === 0 ? (
-                      <VolumeX className="w-3 h-3 text-red-400" />
-                    ) : vocalsVolume < 0.5 ? (
-                      <Volume1 className="w-3 h-3 text-blue-400" />
-                    ) : (
-                      <Volume2 className="w-3 h-3 text-blue-400" />
-                    )}
-                  </button>
-                  <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={v1Muted ? 0 : vocalsVolume}
-                    onChange={(e) => {
-                      const v = Number(e.target.value);
-                      setVocalsVolume(v);
-                      if (v1Muted && v > 0) setV1Muted(false);
-                    }}
-                    className="w-12 h-1 bg-zinc-700 accent-blue-400 rounded-lg cursor-pointer"
-                    title={`Vocals Volume: ${Math.round(vocalsVolume * 100)}%`}
-                  />
-                  <span className="text-[9px] font-mono text-blue-300/90 w-6 text-right select-none">
-                    {v1Muted ? '0%' : `${Math.round(vocalsVolume * 100)}%`}
-                  </span>
-                </div>
-                <button
-                  onClick={() => { if (confirm('Remove isolated vocals & BGM?')) onRemoveAudioSeparation?.(); }}
-                  className="p-1 rounded hover:bg-red-900/40 text-zinc-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
-                  title="Remove isolated audio"
-                >
-                  <Trash2 className="w-3 h-3" />
-                </button>
-              </div>
-            </div>
-          )}
+          {txTrack.pos === 'bottom' && txLabel}
 
-          {/* Isolated BGM Track */}
+          {/* Isolated Vocals / BGM Tracks */}
           {audioSeparated && (
-            <div
-              className="flex items-center justify-between px-2 border-b border-[#1c1e24] bg-amber-950/20 group"
-              style={{ height: TRACK_HEIGHT }}
-            >
-              <div className="flex items-center gap-1.5 min-w-0">
-                <Music className="w-3 h-3 text-amber-400 shrink-0" />
-                <span className="text-[11px] font-bold text-amber-300 truncate">BGM</span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <div className="flex items-center gap-1 bg-[#101116] px-1.5 py-0.5 rounded-lg border border-amber-500/20" title={`BGM Volume: ${Math.round(bgmVolume * 100)}%`}>
-                  <button
-                    onClick={() => setB1Muted(!b1Muted)}
-                    className="p-0.5 rounded hover:bg-amber-900/50 text-zinc-400 hover:text-white transition-colors"
-                    title={b1Muted ? 'Unmute Isolated BGM' : 'Mute Isolated BGM'}
-                  >
-                    {b1Muted || bgmVolume === 0 ? (
-                      <VolumeX className="w-3 h-3 text-red-400" />
-                    ) : bgmVolume < 0.5 ? (
-                      <Volume1 className="w-3 h-3 text-amber-400" />
-                    ) : (
-                      <Volume2 className="w-3 h-3 text-amber-400" />
-                    )}
-                  </button>
-                  <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={b1Muted ? 0 : bgmVolume}
-                    onChange={(e) => {
-                      const v = Number(e.target.value);
-                      setBgmVolume(v);
-                      if (b1Muted && v > 0) setB1Muted(false);
-                    }}
-                    className="w-12 h-1 bg-zinc-700 accent-amber-400 rounded-lg cursor-pointer"
-                    title={`BGM Volume: ${Math.round(bgmVolume * 100)}%`}
-                  />
-                  <span className="text-[9px] font-mono text-amber-300/90 w-6 text-right select-none">
-                    {b1Muted ? '0%' : `${Math.round(bgmVolume * 100)}%`}
-                  </span>
-                </div>
-                <button
-                  onClick={() => { if (confirm('Remove isolated vocals & BGM?')) onRemoveAudioSeparation?.(); }}
-                  className="p-1 rounded hover:bg-red-900/40 text-zinc-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
-                  title="Remove isolated audio"
-                >
-                  <Trash2 className="w-3 h-3" />
-                </button>
-              </div>
-            </div>
+            <>
+              <StemTrackLabel kind="vocals" height={TRACK_HEIGHT} volume={vocalsVolume} muted={v1Muted} setVolume={setVocalsVolume} setMuted={setV1Muted} onRemove={onRemoveAudioSeparation} />
+              <StemTrackLabel kind="bgm" height={TRACK_HEIGHT} volume={bgmVolume} muted={b1Muted} setVolume={setBgmVolume} setMuted={setB1Muted} onRemove={onRemoveAudioSeparation} />
+            </>
           )}
-
         </div>
 
         {/* Scrollable timeline */}
         <div
           ref={containerRef}
           className={`flex-1 overflow-auto relative select-none transition-colors ${
-            isTimelineDragging ? 'bg-teal-950/20 ring-2 ring-inset ring-teal-500/50' : ''
+            isTimelineDragging ? 'bg-blue-950/20 ring-2 ring-inset ring-blue-500/50' : ''
           }`}
           onClick={handleTimelineClick}
+          onMouseDown={handleMarqueeStart}
+          onClickCapture={(e) => {
+            // the click that ends a box selection must not also move the playhead or clear it
+            if (marqueeJustEndedRef.current) {
+              marqueeJustEndedRef.current = false;
+              e.stopPropagation();
+            }
+          }}
           onDragOver={(e) => {
             e.preventDefault();
             e.dataTransfer.dropEffect = 'copy';
@@ -2935,20 +3253,47 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
             setViewportScrollLeft(e.currentTarget.scrollLeft);
           }}
         >
+          {marquee && (
+            <div
+              className="absolute z-50 pointer-events-none rounded-sm border border-blue-300/90 bg-blue-400/15"
+              style={{
+                left: Math.min(marquee.x0, marquee.x1),
+                top: Math.min(marquee.y0, marquee.y1),
+                width: Math.abs(marquee.x1 - marquee.x0),
+                height: Math.abs(marquee.y1 - marquee.y0),
+              }}
+            />
+          )}
+
           {/* Drag & Drop Overlay Indicator */}
           {isTimelineDragging && (
-            <div className="sticky left-0 top-0 w-full h-full min-h-[220px] z-50 pointer-events-none bg-teal-950/80 backdrop-blur-sm border-2 border-dashed border-teal-400 flex flex-col items-center justify-center gap-2 text-teal-200 animate-in fade-in">
-              <Upload className="w-9 h-9 text-teal-300 animate-bounce" />
+            <div className="sticky left-0 top-0 w-full h-full min-h-[220px] z-50 pointer-events-none bg-blue-950/80 backdrop-blur-sm border-2 border-dashed border-blue-400 flex flex-col items-center justify-center gap-2 text-blue-200 animate-in fade-in">
+              <Upload className="w-9 h-9 text-blue-300 animate-bounce" />
               <span className="text-sm font-bold text-white tracking-wide shadow-sm">
                 Drop video file to add to timeline
               </span>
-              <span className="text-xs text-teal-300/80 font-mono">
+              <span className="text-xs text-blue-300/80 font-mono">
                 Supports MP4, MOV, WebM, MKV, AVI, TS
               </span>
             </div>
           )}
 
           <div className="relative" style={{ width: totalWidth, minHeight: '100%' }}>
+            {/* Speech with no caption: a band down the whole timeline so the holes line up
+                with the caption track. Not clickable, so it never blocks clip dragging —
+                the chips on the ruler above are the handles. */}
+            {showMissing &&
+              missingGaps.map((g) => (
+                <div
+                  key={`missing-band-${g.index}`}
+                  className="absolute top-7 bottom-0 z-20 pointer-events-none bg-amber-400/10 border-x border-amber-400/40"
+                  style={{
+                    left: timeToX(g.start),
+                    width: Math.max(2, timeToX(g.end) - timeToX(g.start)),
+                  }}
+                />
+              ))}
+
             {/* Time ruler — click or drag to scrub */}
             <div
               className="h-7 border-b border-zinc-700/40 relative cursor-pointer group/ruler"
@@ -2963,6 +3308,24 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
               }}
               onMouseLeave={() => setHoverRulerTime(null)}
             >
+              {showMissing &&
+                missingGaps.map((g) => (
+                  <button
+                    key={`missing-chip-${g.index}`}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      seekToTime(g.start);
+                    }}
+                    title={`No caption here: ${fmtTime(g.start)} – ${fmtTime(g.end)} (${g.seconds.toFixed(1)}s). Click to jump.`}
+                    className="absolute bottom-0 h-2 z-30 bg-amber-400/80 hover:bg-amber-300 rounded-sm cursor-pointer"
+                    style={{
+                      left: timeToX(g.start),
+                      width: Math.max(3, timeToX(g.end) - timeToX(g.start)),
+                    }}
+                  />
+                ))}
+
               {markers.map((t) => (
                 <div
                   key={t}
@@ -2995,10 +3358,10 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                   style={{ left: timeToX(bm) }}
                   title={`Bookmark at ${formatFrameTime(bm)} (Click to jump)`}
                 >
-                  <div className="w-2.5 h-3 bg-purple-500 rounded-b-sm shadow-md flex items-center justify-center text-[7px] text-white -translate-x-1/2 hover:scale-125 transition-transform">
+                  <div className="w-2.5 h-3 bg-blue-500 rounded-b-sm shadow-md flex items-center justify-center text-[9px] text-white -translate-x-1/2 hover:scale-125 transition-transform">
                     ★
                   </div>
-                  <div className="w-px h-full bg-purple-500/50" />
+                  <div className="w-px h-full bg-blue-500/50" />
                 </div>
               ))}
 
@@ -3008,8 +3371,8 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                   className="absolute top-0 bottom-0 pointer-events-none z-25"
                   style={{ left: timeToX(hoverRulerTime) }}
                 >
-                  <div className="w-px h-full bg-cyan-400/70" />
-                  <div className="absolute top-0.5 -translate-x-1/2 bg-[#0c131a] text-cyan-300 border border-cyan-500/60 text-[9px] font-mono font-bold px-1.5 py-0.5 rounded shadow-lg whitespace-nowrap">
+                  <div className="w-px h-full bg-blue-400/70" />
+                  <div className="absolute top-0.5 -translate-x-1/2 bg-[#0c131a] text-blue-300 border border-blue-500/60 text-[9px] font-mono font-bold px-1.5 py-0.5 rounded shadow-lg whitespace-nowrap">
                     {formatFrameTime(hoverRulerTime)}
                   </div>
                 </div>
@@ -3064,14 +3427,6 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                   const width = Math.max(timeToX(layoutItem.timelineEnd) - left, 6);
                   const isSelected = clip.id === selectedClipId;
 
-                  // Calculate which thumbnails belong to this clip (use source time for indexing)
-                  const thumbsPerClip = thumbnails.length > 0
-                    ? thumbnails.slice(
-                        Math.floor((clip.source_start / sourceDuration) * thumbnails.length),
-                        Math.ceil((clip.source_end / sourceDuration) * thumbnails.length)
-                      )
-                    : [];
-
                   // Show resize handles if clip is trimmed or there are multiple clips
                   const canResize = !lockedTracks.has('V') && (videoClips.length > 1 || clip.source_start > 0 || clip.source_end < sourceDuration);
 
@@ -3080,17 +3435,17 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                       key={clip.id}
                       className={`absolute top-2 rounded-md cursor-grab active:cursor-grabbing transition-all group select-none ${
                         clipDragging?.clipId === clip.id
-                          ? 'z-40 shadow-2xl scale-[1.02] ring-2 ring-teal-300 border-teal-300 pointer-events-none'
+                          ? 'z-40 shadow-2xl scale-[1.02] ring-2 ring-blue-300 border-blue-300 pointer-events-none'
                           : isSelected
-                          ? 'ring-2 ring-teal-400 ring-offset-1 ring-offset-[#1a1b26] z-20'
-                          : 'z-10'
+                          ? 'ring-2 ring-teal-300/70 z-20'
+                          : 'z-10 hover:brightness-110'
                       }`}
                       style={{
                         left,
                         width,
                         height: VIDEO_TRACK_HEIGHT - 16,
-                        border: `2px solid ${isSelected || clipDragging?.clipId === clip.id ? '#2dd4bf' : '#0d9488'}`,
-                        background: 'var(--bg-base)',
+                        border: `1px solid ${isSelected || clipDragging?.clipId === clip.id ? '#5eead4' : 'rgba(45, 212, 191, 0.35)'}`,
+                        background: 'var(--s1)',
                         transform: clipDragging?.clipId === clip.id ? `translateX(${clipDragging.currentDeltaX || 0}px)` : undefined,
                         opacity: clipDragging?.clipId === clip.id ? 0.92 : 1,
                       }}
@@ -3103,61 +3458,85 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                       {/* Left resize handle */}
                       {canResize && (
                         <div
-                          className="absolute top-0 w-3 h-full cursor-col-resize z-20 hover:bg-teal-400/30 transition-colors"
+                          className="absolute top-0 w-3 h-full cursor-col-resize z-20 hover:bg-blue-400/30 transition-colors"
                           style={{ left: -4 }}
                           onMouseDown={(e) => handleClipResizeDown(e, clip, 'resize-start')}
                         >
-                          <div className="absolute top-1/2 left-1 -translate-y-1/2 w-0.5 h-5 bg-teal-400/60 rounded-full opacity-0 group-hover:opacity-100 transition-opacity" />
+                          <div className="absolute top-1/2 left-1 -translate-y-1/2 w-0.5 h-5 bg-blue-400/60 rounded-full opacity-0 group-hover:opacity-100 transition-opacity" />
                         </div>
                       )}
 
                       {/* Right resize handle */}
                       {canResize && (
                         <div
-                          className="absolute top-0 w-3 h-full cursor-col-resize z-20 hover:bg-teal-400/30 transition-colors"
+                          className="absolute top-0 w-3 h-full cursor-col-resize z-20 hover:bg-blue-400/30 transition-colors"
                           style={{ right: -4 }}
                           onMouseDown={(e) => handleClipResizeDown(e, clip, 'resize-end')}
                         >
-                          <div className="absolute top-1/2 right-1 -translate-y-1/2 w-0.5 h-5 bg-teal-400/60 rounded-full opacity-0 group-hover:opacity-100 transition-opacity" />
+                          <div className="absolute top-1/2 right-1 -translate-y-1/2 w-0.5 h-5 bg-blue-400/60 rounded-full opacity-0 group-hover:opacity-100 transition-opacity" />
                         </div>
                       )}
 
-                      {/* One clean Thumbnail card + Sleek Clip Bar */}
-                      <div className="relative flex items-center h-full w-full overflow-hidden rounded-md bg-[#131b24] border border-teal-900/50">
-                        {thumbsPerClip.length > 0 ? (
-                          <div className="relative h-full aspect-video shrink-0 bg-black/40 overflow-hidden border-r border-teal-500/30">
-                            <img
-                              src={thumbsPerClip[0]}
-                              alt=""
-                              className="w-full h-full object-cover"
-                              draggable={false}
-                            />
-                            <div className="absolute inset-0 bg-gradient-to-r from-transparent via-transparent to-[#131b24]/80 pointer-events-none" />
-                          </div>
-                        ) : (
-                          <div className="h-full aspect-video shrink-0 bg-teal-950/60 flex items-center justify-center border-r border-teal-500/30">
-                            <Film className="w-4 h-4 text-teal-400/50" />
-                          </div>
-                        )}
+                      {/* Filmstrip: frames from this clip's own stretch of the source, edge to edge */}
+                      {(() => {
+                        const stripHeight = VIDEO_TRACK_HEIGHT - 20;
+                        const frameWidth = Math.max(24, (stripHeight * 16) / 9);
+                        const tiles = Math.min(120, Math.max(1, Math.ceil(width / frameWidth)));
+                        const frameAt = (i: number) => {
+                          if (!thumbnails.length || sourceDuration <= 0) return null;
+                          const t = clip.source_start + ((i + 0.5) / tiles) * clipDuration;
+                          const k = Math.min(thumbnails.length - 1, Math.max(0, Math.floor((t / sourceDuration) * thumbnails.length)));
+                          return thumbnails[k];
+                        };
+                        const fullName = currentProject?.video_filename || 'Master video';
+                        const title = clipTitle(fullName);
+                        return (
+                          <div className="relative h-full w-full overflow-hidden rounded-[5px] bg-[var(--s1)]" title={fullName}>
+                            <div className="absolute inset-0 flex pointer-events-none">
+                              {Array.from({ length: tiles }, (_, i) => {
+                                const src = frameAt(i);
+                                return src ? (
+                                  <img
+                                    key={i}
+                                    src={src}
+                                    alt=""
+                                    draggable={false}
+                                    className="h-full object-cover shrink-0 border-r border-black/40"
+                                    style={{ width: frameWidth }}
+                                  />
+                                ) : (
+                                  // frames are still being captured, or the video could not be read
+                                  <div key={i} className="h-full shrink-0 bg-teal-950/50 border-r border-black/40" style={{ width: frameWidth }} />
+                                );
+                              })}
+                            </div>
+                            {/* Keeps the labels readable over bright frames */}
+                            <div className="absolute inset-0 bg-gradient-to-b from-black/55 via-transparent to-black/45 pointer-events-none" />
 
-                        {/* Clip Information & Status */}
-                        <div className="flex-1 min-w-0 px-2.5 flex items-center justify-between gap-2 pointer-events-none">
-                          <div className="flex items-center gap-1.5 truncate">
-                            <span className="px-1.5 py-0.5 rounded bg-teal-950 border border-teal-400/40 text-[9px] font-black text-teal-300 uppercase tracking-wider shrink-0 shadow-sm">
-                              Clip {String.fromCharCode(65 + (clip.index ?? 0))}
-                            </span>
-                            <span className="text-[11px] font-semibold text-zinc-200 truncate tracking-tight">
-                              {currentProject?.video_filename || 'Video'}
-                            </span>
-                          </div>
-                          <span className="text-[10px] text-teal-300/80 font-mono font-bold shrink-0 bg-black/40 px-1.5 py-0.5 rounded border border-white/5">
-                            {fmtTime(clipDuration)}
-                          </span>
-                        </div>
-                      </div>
+                            <div className="absolute top-1 left-1.5 right-8 flex items-center gap-1.5 min-w-0 pointer-events-none">
+                              <span className="shrink-0 w-4 h-4 rounded bg-teal-500/90 text-[9px] font-bold text-black flex items-center justify-center">
+                                {String.fromCharCode(65 + (clip.index ?? 0))}
+                              </span>
+                              {width > 90 && (
+                                <span className="truncate text-[11px] font-medium text-white drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]">
+                                  {title}
+                                </span>
+                              )}
+                            </div>
 
-                      {/* Bottom highlight bar */}
-                      <div className="absolute bottom-0 left-0 right-0 h-1.5 bg-gradient-to-r from-teal-500/40 via-teal-400/20 to-transparent pointer-events-none" />
+                            {width > 60 && (
+                              <div className="absolute bottom-1 right-1.5 flex items-center gap-1 pointer-events-none">
+                                <span className="hidden group-hover:inline px-1 py-px rounded bg-black/60 text-[9px] font-mono text-zinc-300">
+                                  {fmtTime(clip.source_start)} → {fmtTime(clip.source_end)}
+                                </span>
+                                <span className="px-1 py-px rounded bg-black/60 text-[10px] font-mono text-teal-200">
+                                  {fmtTime(clipDuration)}
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
 
                       {/* Delete button (on selection or hover) */}
                       <button
@@ -3186,7 +3565,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                       console.error('Failed to add clip:', err);
                     }
                   }}
-                  className="px-4 py-2 flex items-center gap-2.5 h-full cursor-pointer hover:bg-teal-950/30 text-teal-400 hover:text-teal-300 border border-dashed border-teal-500/40 rounded-lg mx-2 my-1 transition-all"
+                  className="px-4 py-2 flex items-center gap-2.5 h-full cursor-pointer hover:bg-blue-950/30 text-blue-400 hover:text-blue-300 border border-dashed border-blue-500/40 rounded-lg mx-2 my-1 transition-all"
                   title="Click to place master video from My Assets back onto Timeline"
                 >
                   <Plus className="w-4 h-4" />
@@ -3197,7 +3576,7 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
               ) : (
                 <div
                   onClick={handleAddClipClick}
-                  className="px-4 py-2 flex items-center gap-2.5 h-full cursor-pointer hover:bg-teal-950/30 text-teal-400 hover:text-teal-300 border border-dashed border-teal-500/40 rounded-lg mx-2 my-1 transition-all"
+                  className="px-4 py-2 flex items-center gap-2.5 h-full cursor-pointer hover:bg-blue-950/30 text-blue-400 hover:text-blue-300 border border-dashed border-blue-500/40 rounded-lg mx-2 my-1 transition-all"
                   title="Upload a new video to timeline"
                 >
                   <Plus className="w-4 h-4" />
@@ -3209,14 +3588,18 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
               <button
                 onClick={handleAddClipClick}
                 disabled={isUploadingClip}
-                className="absolute top-2.5 h-8 px-2.5 rounded-lg border border-dashed border-teal-500/40 hover:border-teal-400 bg-teal-950/30 hover:bg-teal-900/50 text-teal-300 hover:text-teal-100 flex items-center gap-1 text-[11px] font-semibold transition-all z-20"
-                style={{ left: timeToX(duration) + 12 }}
-                title="Upload & Append New Video Clip to V1"
+                aria-label="Add another video to the end of the timeline"
+                className="absolute top-2 w-10 rounded-md border border-dashed border-blue-500/40 hover:border-blue-400 bg-blue-950/30 hover:bg-blue-900/50 text-blue-300 hover:text-blue-100 flex items-center justify-center transition-all z-20"
+                // the same top and height as the video clips beside it
+                style={{ left: timeToX(duration) + 12, height: VIDEO_TRACK_HEIGHT - 16 }}
+                title="Add another video to the end of the timeline"
               >
-                {isUploadingClip ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plus className="w-3 h-3" />}
-                <span>+ Clip</span>
+                {isUploadingClip ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
               </button>
             </div>
+
+            {txTrack.pos === 'top' && txLane}
+            {txTrack.pos === 'top' && lgLane}
 
             {/* ──── Text Tracks: T1, T2... ──── */}
             {Array.from({ length: laneCount }, (_, laneIdx) => {
@@ -3224,89 +3607,128 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
               return (
               <div
                 key={`t-track-${laneIdx}`}
+                data-marquee-lane="caption"
                 className={`relative border-b border-zinc-700/30 transition-opacity ${isLaneHidden ? 'opacity-25' : ''}`}
                 style={{ height: TRACK_HEIGHT }}
+                onClick={(e) => {
+                  if (e.target === e.currentTarget) {
+                    setSelectedSegmentIds(new Set());
+                  }
+                }}
               >
                 {markers.map((t) => (
                   <div
                     key={`t${laneIdx}-grid-${t}`}
-                    className="absolute top-0 bottom-0 w-px bg-zinc-700/15"
+                    className="absolute top-0 bottom-0 w-px bg-zinc-700/15 pointer-events-none"
                     style={{ left: timeToX(t) }}
                   />
                 ))}
 
                 {segments
-                  .filter((seg) => laneMap.get(seg.id) === laneIdx)
+                  .filter(
+                    (seg) =>
+                      laneMap.get(seg.id) === laneIdx
+                  )
                   .map((seg) => {
                     const range = clipLayout.length > 0
                       ? sourceRangeToTimeline(clipLayout, seg.start_time, seg.end_time)
                       : { timelineStart: seg.start_time, timelineEnd: seg.end_time, isVisible: true };
 
-                    if (!range.isVisible) return null;
+                    // the clip being dragged stays mounted even when its saved position scrolls out of view
+                    if (!range.isVisible || (dragging?.segmentId !== seg.id && (range.timelineEnd < visibleWindow.from || range.timelineStart > visibleWindow.to))) return null;
 
                     const left = timeToX(range.timelineStart);
                     const width = Math.max(timeToX(range.timelineEnd) - left, 6);
                     const color = speakerColors[seg.speaker] || COLORS[0];
                     const isActive = seg.id === activeSegmentId;
+                    const isSelected = selectedSegmentIds.has(seg.id);
 
                     const isFreeze = seg.speaker === 'Freeze' || seg.voice_profile === 'freeze' || seg.text.includes('Freeze Frame');
 
                     return (
                       <div
                         key={seg.id}
-                        className={`absolute top-1.5 rounded-md cursor-grab active:cursor-grabbing transition-all ${
-                          isActive ? 'ring-2 ring-white/40' : ''
+                        data-seg-id={seg.id}
+                        className={`absolute top-1.5 rounded-lg cursor-grab active:cursor-grabbing transition-[filter,box-shadow] select-none group/seg ${
+                          isSelected
+                            ? 'ring-2 ring-blue-400 border-2 border-blue-300 shadow-lg shadow-blue-950/70 z-20 brightness-110'
+                            : isActive
+                            ? 'ring-2 ring-white/70 shadow-md z-15'
+                            : 'hover:brightness-125 hover:ring-1 hover:ring-white/30'
                         } ${mutedTracks.has(laneIdx) ? 'opacity-30' : ''}`}
                         style={{
                           left,
                           width,
                           height: TRACK_HEIGHT - 12,
                           background: isFreeze
-                            ? 'linear-gradient(135deg, rgba(8, 145, 178, 0.5) 0%, rgba(6, 182, 212, 0.7) 50%, rgba(14, 165, 233, 0.5) 100%)'
+                            ? 'linear-gradient(135deg, rgba(8, 145, 178, 0.6) 0%, rgba(6, 182, 212, 0.8) 50%, rgba(14, 165, 233, 0.6) 100%)'
+                            : isSelected
+                            ? 'linear-gradient(135deg, rgba(37, 99, 235, 0.75) 0%, rgba(29, 78, 216, 0.9) 100%)'
                             : `${color}55`,
-                          borderLeft: isFreeze ? '3px solid #38bdf8' : `3px solid ${color}`,
-                          border: isFreeze ? '1px solid #38bdf8' : undefined,
-                          boxShadow: isFreeze ? '0 0 10px rgba(56, 189, 248, 0.3)' : undefined,
-                          borderRadius: '6px',
+                          borderLeft: isFreeze ? '3px solid #38bdf8' : isSelected ? '3px solid #60a5fa' : `3px solid ${color}`,
+                          border: isFreeze ? '1px solid #38bdf8' : isSelected ? '1px solid #60a5fa' : undefined,
+                          boxShadow: isFreeze ? '0 0 10px rgba(56, 189, 248, 0.4)' : isSelected ? '0 0 12px rgba(59, 130, 246, 0.5)' : undefined,
+                          borderRadius: '7px',
                         }}
                         onMouseDown={(e) => handleSegmentMouseDown(e, seg, 'move')}
+                        title={`${formatFrameTime(seg.start_time)} → ${formatFrameTime(seg.end_time)}  (${(seg.end_time - seg.start_time).toFixed(1)}s)${seg.speaker ? `\n${seg.speaker}` : ''}\n${seg.text}`}
                       >
+                        {width >= 18 && (
+                        <>
+                        {/* Left Trim/Resize Handle */}
                         <div
-                          className="absolute left-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-white/20 rounded-l-md"
+                          className="absolute left-0 top-0 bottom-0 w-2.5 cursor-ew-resize hover:bg-white/40 active:bg-blue-400 rounded-l-lg flex items-center justify-center opacity-0 group-hover/seg:opacity-100 transition-opacity z-30"
                           onMouseDown={(e) => handleSegmentMouseDown(e, seg, 'resize-start')}
-                        />
-                        {width > 30 && (
-                          <div className="px-2 py-1 overflow-hidden h-full flex flex-col justify-center">
-                            <p className="text-[10px] text-white/90 truncate font-khmer leading-tight flex items-center gap-1">
-                              {isFreeze && <Snowflake className="w-2.5 h-2.5 text-cyan-300 shrink-0 animate-pulse" />}
+                          title="Drag to trim start time"
+                        >
+                          <div className="w-0.5 h-3 bg-white/70 rounded-full pointer-events-none" />
+                        </div>
+
+                        {width > 24 && (
+                          <div className="px-2 py-0.5 overflow-hidden h-full flex flex-col justify-center pointer-events-none">
+                            <p className="text-[10px] text-white font-khmer font-semibold truncate leading-tight flex items-center gap-1">
+                              {isFreeze && <Snowflake className="w-2.5 h-2.5 text-blue-300 shrink-0 animate-pulse" />}
                               <span>{seg.text}</span>
                             </p>
-                            {seg.speaker && width > 80 && (
-                              <p className="text-[8px] text-white/50 truncate">
-                                {isFreeze ? '2.0s Freeze Snapshot' : seg.speaker}
+                            {seg.speaker && width > 70 && (
+                              <p className="text-[9px] text-white/70 font-mono truncate">
+                                {isFreeze ? '2.0s Freeze' : seg.speaker}
                               </p>
                             )}
                           </div>
                         )}
+
+                        {/* Right Trim/Resize Handle */}
                         <div
-                          className="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-white/20 rounded-r-md"
+                          className="absolute right-0 top-0 bottom-0 w-2.5 cursor-ew-resize hover:bg-white/40 active:bg-blue-400 rounded-r-lg flex items-center justify-center opacity-0 group-hover/seg:opacity-100 transition-opacity z-30"
                           onMouseDown={(e) => handleSegmentMouseDown(e, seg, 'resize-end')}
-                        />
+                          title="Drag to extend/trim end time"
+                        >
+                          <div className="w-0.5 h-3 bg-white/70 rounded-full pointer-events-none" />
+                        </div>
+                        </>
+                        )}
                       </div>
                     );
                   })}
 
+                {laneIdx === 0 && segments.length === 0 && !isTranscribing && (
+                  <div className="sticky left-3 top-0 h-full flex items-center pointer-events-none">
+                    <span className="text-[11px] text-zinc-600">No captions yet — use “Generate captions” in the Captions panel</span>
+                  </div>
+                )}
+
                 {/* Real-time Streaming Pulse Indicator when AI is transcribing */}
                 {isTranscribing && laneIdx === 0 && (
                   <div
-                    className="absolute top-1.5 h-7 rounded-md bg-gradient-to-r from-pink-500/20 via-purple-500/30 to-transparent border border-dashed border-pink-500/50 animate-pulse pointer-events-none flex items-center px-2 z-10"
+                    className="absolute top-1.5 h-7 rounded-md bg-gradient-to-r from-blue-500/20 via-blue-500/30 to-transparent border border-dashed border-blue-500/50 animate-pulse pointer-events-none flex items-center px-2 z-10"
                     style={{
                       left: timeToX(segments.length > 0 ? segments[segments.length - 1].end_time : 0),
                       width: Math.max(90, timeToX(Math.max(1, (transcribePercent / 100) * duration)) - timeToX(segments.length > 0 ? segments[segments.length - 1].end_time : 0)),
                     }}
                   >
-                    <span className="text-[9px] font-mono font-bold text-pink-300 flex items-center gap-1 truncate">
-                      <Sparkles className="w-2.5 h-2.5 animate-spin text-pink-400" />
+                    <span className="text-[9px] font-mono font-bold text-blue-300 flex items-center gap-1 truncate">
+                      <Sparkles className="w-2.5 h-2.5 animate-spin text-blue-400" />
                       <span>Transcribing queue... ({transcribePercent}%)</span>
                     </span>
                   </div>
@@ -3314,6 +3736,9 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
               </div>
             );
             })}
+
+            {txTrack.pos === 'middle' && txLane}
+            {txTrack.pos === 'middle' && lgLane}
 
             {/* ──── AI Audio Tracks — one per voice_profile ──── */}
             {aiTrackProfiles.map((profile, trackIdx) => {
@@ -3330,8 +3755,12 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
               return (
                 <div
                   key={`ai-track-${profile}`}
+                  data-marquee-lane="voice"
                   className={`relative border-b border-zinc-700/30 transition-opacity ${isAHidden ? 'opacity-25' : ''}`}
                   style={{ height: TRACK_HEIGHT }}
+                  onClick={(e) => {
+                    if (e.target === e.currentTarget) setSelectedSegmentIds(new Set());
+                  }}
                 >
                   {markers.map((t) => (
                     <div
@@ -3346,16 +3775,27 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                       ? sourceRangeToTimeline(clipLayout, seg.start_time, seg.end_time)
                       : { timelineStart: seg.start_time, timelineEnd: seg.end_time, isVisible: true };
 
-                    if (!range.isVisible) return null;
+                    // the clip being dragged stays mounted even when its saved position scrolls out of view
+                    if (!range.isVisible || (dragging?.segmentId !== seg.id && (range.timelineEnd < visibleWindow.from || range.timelineStart > visibleWindow.to))) return null;
 
                     const left = timeToX(range.timelineStart);
                     const width = Math.max(timeToX(range.timelineEnd) - left, 6);
                     const isActive = seg.id === activeSegmentId;
+                    const isSelected = selectedSegmentIds.has(seg.id) && selectedSegmentIds.size > 1;
                     return (
                       <div
                         key={`ai-${seg.id}`}
-                        className={`absolute top-1 rounded-xl transition-all overflow-hidden cursor-pointer shadow-md shadow-purple-950/30 ${
-                          isActive ? 'ring-2 ring-white ring-offset-1 ring-offset-black' : 'hover:brightness-110'
+                        data-seg-id={seg.id}
+                        role="button"
+                        tabIndex={0}
+                        aria-label={`Voice clip: ${seg.speaker || seg.text.slice(0, 24)}`}
+                        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); e.currentTarget.click(); } }}
+                        className={`absolute top-1 rounded-xl transition-[filter,box-shadow] overflow-hidden cursor-pointer shadow-md shadow-blue-950/30 select-none ${
+                          isSelected
+                            ? 'ring-2 ring-blue-400 ring-offset-1 ring-offset-black brightness-110 z-10'
+                            : isActive
+                            ? 'ring-2 ring-white ring-offset-1 ring-offset-black'
+                            : 'hover:brightness-110'
                         } ${isMuted ? 'opacity-30' : ''}`}
                         style={{
                           left,
@@ -3364,27 +3804,65 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                           background: 'linear-gradient(135deg, #7c3aed 0%, #9333ea 50%, #6d28d9 100%)',
                           border: '1px solid rgba(196, 181, 253, 0.4)',
                         }}
-                        onClick={(e) => {
+                        title={`${seg.voice_fx && seg.voice_fx !== 'normal' ? `Effect: ${VOICE_EFFECTS.find(v => v.value === seg.voice_fx)?.label ?? seg.voice_fx} · ` : ''}Cmd/Ctrl-click or Shift-click to select several · double-click for all of ${seg.speaker || 'this speaker'} · right-click for voice effects`}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
                           e.stopPropagation();
                           setActiveSegment(seg.id);
-                          if (videoRef.current) videoRef.current.currentTime = seg.start_time;
-                          const tlTime = clipLayout.length > 0 ? sourceToTimeline(clipLayout, seg.start_time) : seg.start_time;
-                          setCurrentTime(tlTime);
+                          setVoiceEffectError('');
+                          // The keyboard menu key reports no pointer position, so anchor to the clip
+                          const r = e.currentTarget.getBoundingClientRect();
+                          const x = e.clientX || r.left + 8;
+                          const y = e.clientY || r.bottom;
+                          // Right-clicking inside a multi-selection acts on the whole selection
+                          const sel = useProjectStore.getState().selectedSegmentIds;
+                          setVoiceMenuScope(sel.size > 1 && sel.has(seg.id) ? 'selected' : 'line');
+                          setSelectionLane('voice');
+                          setVoiceMenu({ segmentId: seg.id, x, y });
+                        }}
+                        onMouseDown={(e) => {
+                          // stops the browser selecting text on double-click / shift-click
+                          if (e.detail > 1 || e.shiftKey) e.preventDefault();
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const modified = e.shiftKey || e.metaKey || e.ctrlKey;
+                          setSelectionLane('voice');
+                          selectWithModifiers(e, seg);
+                          if (!modified) {
+                            // a plain click also moves the playhead, as before
+                            if (videoRef.current) videoRef.current.currentTime = seg.start_time;
+                            const tlTime = clipLayout.length > 0 ? sourceToTimeline(clipLayout, seg.start_time) : seg.start_time;
+                            setCurrentTime(tlTime);
+                          }
+                          // Shift extends from the active line, so it stays put while extending
+                          if (!e.shiftKey) setActiveSegment(seg.id);
+                        }}
+                        onDoubleClick={(e) => {
+                          e.stopPropagation();
+                          // every voiced line by this speaker (or, unnamed, on this voice track)
+                          const same = segments.filter(s =>
+                            s.audio_url && (seg.speaker ? s.speaker === seg.speaker : (s.voice_profile || 'female') === (seg.voice_profile || 'female')),
+                          );
+                          setSelectedSegmentIds(new Set(same.map(s => s.id)));
+                          setActiveSegment(seg.id);
                         }}
                       >
+                        {width >= 28 && <>
                         {/* Audio Clip Header Title */}
                         <div className="px-2.5 pt-1 flex items-center justify-between gap-1 z-10 relative">
                           <span className="text-[10px] font-medium text-white/95 truncate">
                             {seg.speaker ? `${seg.speaker}.wav` : seg.text ? `${seg.text.slice(0, 24)}...wav` : 'speech.wav'}
                           </span>
-                          <span className="text-[9px] font-mono text-purple-200/70 shrink-0">
+                          <span className="flex items-center gap-1 text-[9px] font-mono text-blue-200/70 shrink-0">
+                            {seg.voice_fx && seg.voice_fx !== 'normal' && <Wand2 className="w-2.5 h-2.5 text-purple-100" />}
                             {seg.audio_speed ? `${seg.audio_speed}x` : '1.0x'}
                           </span>
                         </div>
 
                         {/* Waveform Graphic */}
                         <div className="absolute inset-x-0 bottom-0 top-3 flex items-end justify-between px-1.5 pb-1 opacity-75 pointer-events-none gap-[1.5px] overflow-hidden">
-                          {Array.from({ length: Math.max(12, Math.floor(width / 3.5)) }).map((_, barIdx) => {
+                          {Array.from({ length: Math.min(100, Math.max(12, Math.floor(width / 3.5))) }).map((_, barIdx) => {
                             const barHeight = Math.sin((barIdx * 0.45) + (idx * 1.5)) * 40 + 50;
                             return (
                               <div
@@ -3399,167 +3877,58 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
                             );
                           })}
                         </div>
+                        </>}
                       </div>
                     );
                   })}
 
                   {emptySegs && (
                     <div className="px-3 py-1 flex items-center h-full">
-                      <span className="text-[10px] text-cyan-300/25">{trackLabel}</span>
+                      <span className="text-[10px] text-blue-300/25">{trackLabel}</span>
                     </div>
                   )}
                 </div>
               );
             })}
 
-            {/* ──── Isolated Vocals Track ──── */}
-            {audioSeparated && (
-              <div
-                className="relative border-b border-[#1c1e24] bg-[#0c121e]/50"
-                style={{ height: TRACK_HEIGHT }}
-              >
-                {markers.map((t) => (
-                  <div
-                    key={`v1-grid-${t}`}
-                    className="absolute top-0 bottom-0 w-px bg-zinc-700/15"
-                    style={{ left: timeToX(t) }}
-                  />
-                ))}
+            {txTrack.pos === 'bottom' && txLane}
+            {txTrack.pos === 'bottom' && lgLane}
 
-                <div
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setSelectedClipId('vocals-track');
+            {/* ──── Isolated Vocals / BGM Tracks ──── */}
+            {audioSeparated &&
+              (['vocals', 'bgm'] as const).map((kind) => (
+                <StemTrackLane
+                  key={kind}
+                  kind={kind}
+                  peaks={stemPeaks[kind]}
+                  height={TRACK_HEIGHT}
+                  width={Math.max(timeToX(duration), 60)}
+                  markers={markers}
+                  timeToX={timeToX}
+                  // greyed out when muted or turned down to nothing
+                  muted={kind === 'vocals' ? v1Muted || vocalsVolume === 0 : b1Muted || bgmVolume === 0}
+                  cleanLevel={kind === 'bgm' ? bgmClean : undefined}
+                  onCleanLevel={kind === 'bgm' ? handleBgmClean : undefined}
+                  cleaning={kind === 'bgm' ? bgmCleaning : undefined}
+                  keepEffects={kind === 'bgm' ? bgmKeepEffects : undefined}
+                  onKeepEffects={kind === 'bgm' ? handleKeepEffects : undefined}
+                  effectsBusy={kind === 'bgm' ? effectsBusy : undefined}
+                  selectedClipId={selectedClipId}
+                  onSelect={(selectionId) => {
+                    setSelectedClipId(selectionId);
                     setActiveSegment(null);
                   }}
-                  className={`group absolute top-1 rounded-lg overflow-hidden cursor-pointer transition-all shadow-sm select-none ${
-                    v1Muted ? 'opacity-35 grayscale' : 'opacity-100'
-                  } ${
-                    selectedClipId === 'vocals-track'
-                      ? 'ring-2 ring-blue-400 ring-offset-1 ring-offset-zinc-950 shadow-[0_0_15px_rgba(96,165,250,0.4)]'
-                      : 'hover:brightness-110'
-                  }`}
-                  style={{
-                    left: 0,
-                    width: Math.max(timeToX(duration), 60),
-                    height: TRACK_HEIGHT - 8,
-                    border: selectedClipId === 'vocals-track' ? '2px solid #60a5fa' : '1px solid rgba(59, 130, 246, 0.4)',
-                    background: 'linear-gradient(180deg, #1e3a8a 0%, #172554 100%)',
-                  }}
-                >
-                  {/* Subtle audio waveform dots */}
-                  <div className="absolute inset-0 opacity-30 bg-[radial-gradient(#60a5fa_1px,transparent_1px)] [background-size:6px_6px] pointer-events-none" />
-                  <div className="relative px-2.5 flex items-center justify-between h-full z-10 pointer-events-none">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <Mic className="w-3.5 h-3.5 text-blue-300 shrink-0" />
-                      <span className="text-[11px] font-bold text-blue-100 truncate">
-                        Isolated Vocals (Speech) {v1Muted && '· Muted'}
-                      </span>
-                    </div>
-                    {/* Visual audio equalizer bars */}
-                    <div className="flex items-center gap-0.5 opacity-70">
-                      <div className="w-0.5 h-2.5 bg-blue-300 rounded-full" />
-                      <div className="w-0.5 h-4 bg-blue-200 rounded-full" />
-                      <div className="w-0.5 h-2 bg-blue-300 rounded-full" />
-                      <div className="w-0.5 h-3.5 bg-blue-200 rounded-full" />
-                      <div className="w-0.5 h-2.5 bg-blue-300 rounded-full" />
-                    </div>
-                  </div>
-
-                  {/* Delete button (on selection or hover) */}
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (confirm('Remove isolated vocals & BGM?')) onRemoveAudioSeparation?.();
-                    }}
-                    className={`absolute top-1 right-1 p-1 rounded-md bg-red-950/90 hover:bg-red-800 text-red-200 border border-red-700/60 transition-opacity z-30 shadow cursor-pointer ${
-                      selectedClipId === 'vocals-track' ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                    }`}
-                    title="Delete / Remove Isolated Audio (Delete/Backspace key)"
-                  >
-                    <Trash2 className="w-3 h-3" />
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* ──── Isolated BGM Track ──── */}
-            {audioSeparated && (
-              <div
-                className="relative border-b border-[#1c1e24] bg-[#1a1205]/50"
-                style={{ height: TRACK_HEIGHT }}
-              >
-                {markers.map((t) => (
-                  <div
-                    key={`b1-grid-${t}`}
-                    className="absolute top-0 bottom-0 w-px bg-zinc-700/15"
-                    style={{ left: timeToX(t) }}
-                  />
-                ))}
-
-                <div
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setSelectedClipId('bgm-track');
-                    setActiveSegment(null);
-                  }}
-                  className={`group absolute top-1 rounded-lg overflow-hidden cursor-pointer transition-all shadow-sm select-none ${
-                    b1Muted ? 'opacity-35 grayscale' : 'opacity-100'
-                  } ${
-                    selectedClipId === 'bgm-track'
-                      ? 'ring-2 ring-amber-400 ring-offset-1 ring-offset-zinc-950 shadow-[0_0_15px_rgba(251,191,36,0.4)]'
-                      : 'hover:brightness-110'
-                  }`}
-                  style={{
-                    left: 0,
-                    width: Math.max(timeToX(duration), 60),
-                    height: TRACK_HEIGHT - 8,
-                    border: selectedClipId === 'bgm-track' ? '2px solid #fbbf24' : '1px solid rgba(245, 158, 11, 0.4)',
-                    background: 'linear-gradient(180deg, #78350f 0%, #451a03 100%)',
-                  }}
-                >
-                  {/* Subtle audio waveform dots */}
-                  <div className="absolute inset-0 opacity-30 bg-[radial-gradient(#fbbf24_1px,transparent_1px)] [background-size:6px_6px] pointer-events-none" />
-                  <div className="relative px-2.5 flex items-center justify-between h-full z-10 pointer-events-none">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <Music className="w-3.5 h-3.5 text-amber-300 shrink-0" />
-                      <span className="text-[11px] font-bold text-amber-100 truncate">
-                        Isolated BGM (Background Music) {b1Muted && '· Muted'}
-                      </span>
-                    </div>
-                    {/* Visual audio equalizer bars */}
-                    <div className="flex items-center gap-0.5 opacity-70">
-                      <div className="w-0.5 h-3.5 bg-amber-300 rounded-full" />
-                      <div className="w-0.5 h-2 bg-amber-200 rounded-full" />
-                      <div className="w-0.5 h-4.5 bg-amber-300 rounded-full" />
-                      <div className="w-0.5 h-2.5 bg-amber-200 rounded-full" />
-                      <div className="w-0.5 h-3.5 bg-amber-300 rounded-full" />
-                    </div>
-                  </div>
-
-                  {/* Delete button (on selection or hover) */}
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (confirm('Remove isolated vocals & BGM?')) onRemoveAudioSeparation?.();
-                    }}
-                    className={`absolute top-1 right-1 p-1 rounded-md bg-red-950/90 hover:bg-red-800 text-red-200 border border-red-700/60 transition-opacity z-30 shadow cursor-pointer ${
-                      selectedClipId === 'bgm-track' ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                    }`}
-                    title="Delete / Remove Isolated Audio (Delete/Backspace key)"
-                  >
-                    <Trash2 className="w-3 h-3" />
-                  </button>
-                </div>
-              </div>
-            )}
+                  onRemove={onRemoveAudioSeparation}
+                />
+              ))}
 
             {/* ──── Playhead — vertical line ──── */}
             <div
               className="absolute top-0 w-px z-20 pointer-events-none timeline-playhead"
               style={{
                 left: timeToX(currentTime),
-                height: 7 + VIDEO_TRACK_HEIGHT + TRACK_HEIGHT * (laneCount + 1 + (audioSeparated ? 2 : 0)),
+                // every track: captions, text, each voice track and the stems
+                height: 7 + VIDEO_TRACK_HEIGHT + TRACK_HEIGHT * trackCount,
               }}
             />
           </div>
@@ -3567,357 +3936,196 @@ export default function TimelineEditor({ videoRef, vocalsRef, bgmRef, audioSepar
       </div>
 
       {/* Hidden audio elements for AI audio playback */}
-      {segments.filter(s => s.audio_url).map(seg => {
+      {playbackSegments.map(seg => {
         const profile = seg.voice_profile || 'female';
         const isMuted = aiTrackProfiles[0] === '_all'
           ? aiMutedProfiles.has('_all')
           : aiMutedProfiles.has(profile);
         return (
-          <audio
+          <VoicePlaybackAudio
             key={`ai-audio-${seg.id}-${seg.audio_url}`}
-            ref={(el) => {
-              if (el) aiAudioRefs.current.set(seg.id, el);
-              else aiAudioRefs.current.delete(seg.id);
-            }}
+            id={seg.id}
+            players={aiAudioRefs.current}
+            initiated={audioInitiatedRef.current}
             src={seg.audio_url.startsWith('http') || seg.audio_url.startsWith('/') ? seg.audio_url : '/' + seg.audio_url.replace(/^\.\//, '')}
-            preload="auto"
             muted={isMuted}
           />
         );
       })}
 
-      {/* Crop Modal */}
+      {captureTime !== null && <VoiceCaptureModal initialTime={captureTime} onClose={() => setCaptureTime(null)} />}
+
       {showCropModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setShowCropModal(false)}>
-          <div
-            className="bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl w-full max-w-md p-5 space-y-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-white flex items-center gap-2"><Crop className="w-4 h-4" /> Crop Video</h3>
-              <button onClick={() => setShowCropModal(false)} className="p-1 rounded hover:bg-zinc-700 transition-colors">
-                <X className="w-4 h-4 text-zinc-400" />
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="text-[11px] text-zinc-400 uppercase tracking-wide block mb-1">X (left)</label>
-                <input
-                  type="number"
-                  value={cropX}
-                  onChange={(e) => setCropX(Math.max(0, parseInt(e.target.value) || 0))}
-                  min={0}
-                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-600 rounded-lg text-sm text-white font-mono focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30"
-                />
-              </div>
-              <div>
-                <label className="text-[11px] text-zinc-400 uppercase tracking-wide block mb-1">Y (top)</label>
-                <input
-                  type="number"
-                  value={cropY}
-                  onChange={(e) => setCropY(Math.max(0, parseInt(e.target.value) || 0))}
-                  min={0}
-                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-600 rounded-lg text-sm text-white font-mono focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30"
-                />
-              </div>
-              <div>
-                <label className="text-[11px] text-zinc-400 uppercase tracking-wide block mb-1">Width</label>
-                <input
-                  type="number"
-                  value={cropW}
-                  onChange={(e) => setCropW(Math.max(2, parseInt(e.target.value) || 2))}
-                  min={2}
-                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-600 rounded-lg text-sm text-white font-mono focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30"
-                />
-              </div>
-              <div>
-                <label className="text-[11px] text-zinc-400 uppercase tracking-wide block mb-1">Height</label>
-                <input
-                  type="number"
-                  value={cropH}
-                  onChange={(e) => setCropH(Math.max(2, parseInt(e.target.value) || 2))}
-                  min={2}
-                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-600 rounded-lg text-sm text-white font-mono focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30"
-                />
-              </div>
-            </div>
-
-            <p className="text-[10px] text-zinc-500">Crop region is measured in pixels from the top-left corner of the video.</p>
-
-            <div className="flex justify-end gap-2 pt-1">
-              <button
-                onClick={() => setShowCropModal(false)}
-                className="px-4 py-2 rounded-lg text-xs font-medium text-zinc-300 bg-zinc-700 hover:bg-zinc-600 transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleCrop}
-                disabled={isCropping}
-                className="px-4 py-2 rounded-lg text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 transition-colors disabled:opacity-50 flex items-center gap-1.5"
-              >
-                {isCropping && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                Crop
-              </button>
-            </div>
-          </div>
-        </div>
+        <CropModal
+          rect={{ x: cropX, y: cropY, w: cropW, h: cropH }}
+          onChange={(r) => {
+            setCropX(r.x);
+            setCropY(r.y);
+            setCropW(r.w);
+            setCropH(r.h);
+          }}
+          onApply={handleCrop}
+          onClose={() => setShowCropModal(false)}
+          busy={isCropping}
+        />
       )}
 
-      {/* Blur Logo Modal */}
-      {showBlurModal && blurSnapshot && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setShowBlurModal(false)}>
-          <div
-            className="bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl w-full max-w-xl p-5 space-y-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-white flex items-center gap-2"><Eraser className="w-4 h-4 text-pink-400" /> Blur Subtitles / Watermark</h3>
-              <button onClick={() => setShowBlurModal(false)} className="p-1 rounded hover:bg-zinc-700 transition-colors">
-                <X className="w-4 h-4 text-zinc-400" />
-              </button>
-            </div>
 
-            <p className="text-[11px] text-zinc-400">Choose a preset or drag and resize the box over original text/logos to permanently blur them.</p>
-
-            {/* Quick Blur Presets */}
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Presets:</span>
-              <button
-                onClick={() => {
-                  if (blurNatural.w > 0 && blurNatural.h > 0) {
-                    setBlurRegion({
-                      x: 0,
-                      y: Math.round(blurNatural.h * 0.80),
-                      width: blurNatural.w,
-                      height: Math.round(blurNatural.h * 0.18),
-                    });
-                  }
-                }}
-                className="px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-[11px] text-zinc-200 font-medium border border-zinc-700/60 transition-colors flex items-center gap-1"
-              >
-                <span>🔤</span>
-                <span>Bottom Subtitles</span>
-              </button>
-              <button
-                onClick={() => {
-                  if (blurNatural.w > 0 && blurNatural.h > 0) {
-                    setBlurRegion({
-                      x: Math.round(blurNatural.w * 0.10),
-                      y: Math.round(blurNatural.h * 0.82),
-                      width: Math.round(blurNatural.w * 0.80),
-                      height: Math.round(blurNatural.h * 0.14),
-                    });
-                  }
-                }}
-                className="px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-[11px] text-zinc-200 font-medium border border-zinc-700/60 transition-colors flex items-center gap-1"
-              >
-                <span>💬</span>
-                <span>Compact Box</span>
-              </button>
-              <button
-                onClick={() => {
-                  if (blurNatural.w > 0 && blurNatural.h > 0) {
-                    setBlurRegion({
-                      x: Math.round(blurNatural.w * 0.76),
-                      y: Math.round(blurNatural.h * 0.04),
-                      width: Math.round(blurNatural.w * 0.20),
-                      height: Math.round(blurNatural.h * 0.10),
-                    });
-                  }
-                }}
-                className="px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-[11px] text-zinc-200 font-medium border border-zinc-700/60 transition-colors flex items-center gap-1"
-              >
-                <span>🏷️</span>
-                <span>Top-Right Logo</span>
-              </button>
-              <button
-                onClick={() => {
-                  if (blurNatural.w > 0 && blurNatural.h > 0) {
-                    setBlurRegion({
-                      x: Math.round(blurNatural.w * 0.04),
-                      y: Math.round(blurNatural.h * 0.04),
-                      width: Math.round(blurNatural.w * 0.20),
-                      height: Math.round(blurNatural.h * 0.10),
-                    });
-                  }
-                }}
-                className="px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-[11px] text-zinc-200 font-medium border border-zinc-700/60 transition-colors flex items-center gap-1"
-              >
-                <span>🏷️</span>
-                <span>Top-Left Logo</span>
-              </button>
-            </div>
-
-            <div className="relative select-none" style={{ touchAction: 'none' }}>
-              <img
-                ref={blurImgRef}
-                src={blurSnapshot}
-                alt="Video frame"
-                className="w-full h-auto rounded-lg block"
-                draggable={false}
-                onLoad={(e) => {
-                  const img = e.currentTarget;
-                  if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-                    setBlurNatural({ w: img.naturalWidth, h: img.naturalHeight });
-                  }
-                }}
-              />
-              {blurNatural.w > 0 && (
-                <div
-                  className="absolute border-2 border-blue-500 bg-blue-500/20 cursor-move"
-                  style={{
-                    left: `${(blurRegion.x / blurNatural.w) * 100}%`,
-                    top: `${(blurRegion.y / blurNatural.h) * 100}%`,
-                    width: `${(blurRegion.width / blurNatural.w) * 100}%`,
-                    height: `${(blurRegion.height / blurNatural.h) * 100}%`,
-                  }}
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    setBlurDrag({ mode: 'move', startX: e.clientX, startY: e.clientY, orig: { ...blurRegion } });
-                  }}
-                >
-                  {(['tl', 'tr', 'bl', 'br'] as const).map((corner) => (
-                    <div
-                      key={corner}
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setBlurDrag({ mode: corner, startX: e.clientX, startY: e.clientY, orig: { ...blurRegion } });
-                      }}
-                      className="absolute w-3 h-3 bg-blue-500 border border-white rounded-full"
-                      style={{
-                        left: corner.includes('l') ? '-6px' : undefined,
-                        right: corner.includes('r') ? '-6px' : undefined,
-                        top: corner.includes('t') ? '-6px' : undefined,
-                        bottom: corner.includes('b') ? '-6px' : undefined,
-                        cursor: corner === 'tl' || corner === 'br' ? 'nwse-resize' : 'nesw-resize',
-                      }}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div className="flex justify-end gap-2 pt-1">
-              <button
-                onClick={() => setShowBlurModal(false)}
-                disabled={isBlurring}
-                className="px-4 py-2 rounded-lg text-xs font-medium text-zinc-300 bg-zinc-700 hover:bg-zinc-600 transition-colors disabled:opacity-40"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleApplyBlur}
-                disabled={isBlurring}
-                className="px-5 py-2 rounded-lg text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 transition-colors disabled:opacity-50 flex items-center gap-2 shadow-md shadow-blue-950/50"
-              >
-                {isBlurring ? (
-                  <>
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    <span>Rendering Blur to Video...</span>
-                  </>
-                ) : (
-                  <>
-                    <Eraser className="w-3.5 h-3.5" />
-                    <span>Apply Permanent Blur</span>
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ──── Keyboard Shortcuts Modal ──── */}
-      {showShortcutsModal && (
+      {voiceMenu && voiceMenuSeg && createPortal(
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4"
-          onClick={() => setShowShortcutsModal(false)}
+          ref={voiceMenuRef}
+          role="menu"
+          aria-label="Voice effect"
+          onKeyDown={e => e.stopPropagation()}
+          onContextMenu={e => e.preventDefault()}
+          className="fixed z-[200] w-72 max-h-[calc(100vh-16px)] overflow-y-auto rounded-lg border border-[var(--s5)] bg-[var(--s2)] shadow-2xl py-1 text-xs"
+          style={{
+            // keep the whole menu on screen near the right and bottom edges
+            left: Math.max(8, Math.min(voiceMenu.x, window.innerWidth - 296)),
+            top: Math.max(8, Math.min(voiceMenu.y, window.innerHeight - 560)),
+            // scroll rather than run off the bottom on a short window
+            maxHeight: `calc(100vh - ${Math.max(8, Math.min(voiceMenu.y, window.innerHeight - 560))}px - 8px)`,
+          }}
         >
-          <div
-            className="bg-[#181a20] border border-[#2d3139] rounded-2xl shadow-2xl w-full max-w-lg p-5 text-zinc-200 animate-in fade-in zoom-in-95 duration-150"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-[#2d3139] pb-3 mb-4">
-              <div className="flex items-center gap-2">
-                <Keyboard className="w-5 h-5 text-pink-400" />
-                <h3 className="font-semibold text-base text-white">Timeline Keyboard Shortcuts</h3>
-              </div>
-              <button
-                onClick={() => setShowShortcutsModal(false)}
-                className="p-1 rounded-lg hover:bg-[#252830] text-zinc-400 hover:text-white transition-colors"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3 text-xs">
-              <div className="space-y-2">
-                <h4 className="text-[11px] font-bold tracking-wider uppercase text-zinc-400 border-b border-zinc-700/50 pb-1">
-                  Playback & Navigation
-                </h4>
-                <div className="flex items-center justify-between bg-[#121316] px-2.5 py-1.5 rounded-lg border border-zinc-800">
-                  <span className="text-zinc-300">Play / Pause</span>
-                  <kbd className="px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 font-mono">Space</kbd>
-                </div>
-                <div className="flex items-center justify-between bg-[#121316] px-2.5 py-1.5 rounded-lg border border-zinc-800">
-                  <span className="text-zinc-300">Step 1 Frame</span>
-                  <kbd className="px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 font-mono">← / →</kbd>
-                </div>
-                <div className="flex items-center justify-between bg-[#121316] px-2.5 py-1.5 rounded-lg border border-zinc-800">
-                  <span className="text-zinc-300">Step 1 Second</span>
-                  <kbd className="px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 font-mono">Shift + ← / →</kbd>
-                </div>
-                <div className="flex items-center justify-between bg-[#121316] px-2.5 py-1.5 rounded-lg border border-zinc-800">
-                  <span className="text-zinc-300">Prev / Next Cut</span>
-                  <kbd className="px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 font-mono">[ / ]</kbd>
-                </div>
-                <div className="flex items-center justify-between bg-[#121316] px-2.5 py-1.5 rounded-lg border border-zinc-800">
-                  <span className="text-zinc-300">Jump Start / End</span>
-                  <kbd className="px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 font-mono">Home / End</kbd>
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <h4 className="text-[11px] font-bold tracking-wider uppercase text-zinc-400 border-b border-zinc-700/50 pb-1">
-                  Editing & Tools
-                </h4>
-                <div className="flex items-center justify-between bg-[#121316] px-2.5 py-1.5 rounded-lg border border-zinc-800">
-                  <span className="text-zinc-300">Split at Playhead</span>
-                  <kbd className="px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 font-mono">S or C</kbd>
-                </div>
-                <div className="flex items-center justify-between bg-[#121316] px-2.5 py-1.5 rounded-lg border border-zinc-800">
-                  <span className="text-zinc-300">Add Marker</span>
-                  <kbd className="px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 font-mono">M</kbd>
-                </div>
-                <div className="flex items-center justify-between bg-[#121316] px-2.5 py-1.5 rounded-lg border border-zinc-800">
-                  <span className="text-zinc-300">Fit to Timeline</span>
-                  <kbd className="px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 font-mono">Z</kbd>
-                </div>
-                <div className="flex items-center justify-between bg-[#121316] px-2.5 py-1.5 rounded-lg border border-zinc-800">
-                  <span className="text-zinc-300">Zoom at Cursor</span>
-                  <kbd className="px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 font-mono">Ctrl + Scroll</kbd>
-                </div>
-                <div className="flex items-center justify-between bg-[#121316] px-2.5 py-1.5 rounded-lg border border-zinc-800">
-                  <span className="text-zinc-300">Horizontal Scroll</span>
-                  <kbd className="px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 font-mono">Shift + Scroll</kbd>
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-5 pt-3 border-t border-[#2d3139] flex justify-end">
-              <button
-                onClick={() => setShowShortcutsModal(false)}
-                className="px-4 py-1.5 bg-pink-600 hover:bg-pink-500 text-white text-xs font-semibold rounded-xl shadow transition-colors cursor-pointer"
-              >
-                Got It
-              </button>
-            </div>
+          <div className="px-3 pt-1 pb-1.5 border-b border-[var(--s4)] mb-1">
+            <div className="text-zinc-300 truncate" title={voiceMenuSeg.text}>{voiceMenuSeg.speaker || voiceMenuSeg.text.slice(0, 30) || 'Selected voice'}</div>
           </div>
-        </div>
+          <button
+            role="menuitem"
+            onClick={playMenuLine}
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-zinc-300 hover:bg-white/5"
+          >
+            <span className="w-3.5 shrink-0 flex justify-center"><Play className="w-3 h-3" /></span>
+            Play this line
+          </button>
+          <button
+            role="menuitem"
+            onClick={() => void regenerateMenuVoice()}
+            disabled={isGeneratingAudio || regeneratingVoice || !!applyingVoiceEffect}
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-zinc-300 hover:bg-white/5 disabled:opacity-50 disabled:cursor-wait"
+          >
+            <span className="w-3.5 shrink-0 flex justify-center">
+              {regeneratingVoice ? <Loader2 className="w-3 h-3 animate-spin text-purple-300" /> : <RefreshCw className="w-3 h-3" />}
+            </span>
+            {regeneratingVoice ? 'Regenerating…' : 'Regenerate voice'}
+          </button>
+          <div className="px-3 pt-2 pb-1 mt-1 border-t border-[var(--s4)] text-[10px] uppercase tracking-wide text-purple-300/80">Voice effect</div>
+          {(speakerVoiceIds.length > 1 || selectedVoiceIds.length > 1) && (
+            <div className="mx-3 mb-1 flex gap-0.5 p-0.5 rounded-md bg-[var(--s1)] border border-[var(--s4)] text-[10px]">
+              {([
+                ['line', 'This line'],
+                ...(selectedVoiceIds.length > 1 ? [['selected', `Selected (${selectedVoiceIds.length})`]] : []),
+                ...(speakerVoiceIds.length > 1 ? [['speaker', `All ${speakerVoiceIds.length} by speaker`]] : []),
+              ] as ['line' | 'selected' | 'speaker', string][]).map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => setVoiceMenuScope(key)}
+                  title={
+                    key === 'speaker'
+                      ? `Every voiced line by ${voiceMenuSeg.speaker}`
+                      : key === 'selected'
+                      ? 'Every voice clip you have selected'
+                      : undefined
+                  }
+                  className={`flex-1 flex items-center justify-center gap-1 py-1 rounded ${
+                    voiceMenuScope === key ? 'bg-purple-600/70 text-white' : 'text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  {key === 'speaker' && <Users className="w-2.5 h-2.5" />}
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+          {VOICE_EFFECT_GROUPS.map(({ group, items }) => (
+          <div key={group}>
+          {group !== 'Normal' && <div className="px-3 pt-1 text-[9px] uppercase tracking-wide text-zinc-500">{group}</div>}
+          <div className="grid grid-cols-2 gap-1 px-2 pb-1">
+            {items.map(({ value, label, hint }) => {
+              const current = (voiceMenuSeg.voice_fx || 'normal') === value;
+              const applying = applyingVoiceEffect === value;
+              const busy = isGeneratingAudio || !!applyingVoiceEffect || regeneratingVoice;
+              return (
+                <div
+                  key={value}
+                  className={`group/fx relative flex items-center rounded-md border transition-colors ${
+                    current ? 'border-purple-400/60 bg-purple-500/15' : 'border-transparent hover:bg-white/5'
+                  } ${applyingVoiceEffect && !applying ? 'opacity-50' : ''}`}
+                >
+                  <button
+                    role="menuitemradio"
+                    aria-checked={current}
+                    disabled={busy}
+                    onClick={() => void applyTimelineVoiceEffect(value)}
+                    title={hint}
+                    className={`flex-1 min-w-0 flex items-center gap-1.5 pl-2 pr-6 py-1.5 text-left disabled:cursor-wait ${
+                      current ? 'text-white' : 'text-zinc-300'
+                    }`}
+                  >
+                    {applying ? (
+                      <Loader2 className="w-3 h-3 shrink-0 animate-spin text-purple-300" />
+                    ) : current ? (
+                      <Check className="w-3 h-3 shrink-0 text-purple-300" />
+                    ) : null}
+                    <span className="truncate">{label}</span>
+                  </button>
+                  <button
+                    onClick={() => void previewMenuEffect(value)}
+                    disabled={!!previewingFx}
+                    aria-label={`Preview ${label}`}
+                    title={`Listen with ${label} — doesn't change the clip`}
+                    className={`absolute right-1 p-1 rounded text-zinc-400 hover:text-white hover:bg-white/10 ${
+                      previewingFx === value ? 'opacity-100' : 'opacity-0 group-hover/fx:opacity-100 focus:opacity-100'
+                    }`}
+                  >
+                    {previewingFx === value ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Play className="w-2.5 h-2.5" />}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          </div>
+          ))}
+          <p className="px-3 pb-1 text-[10px] text-zinc-500">Hover an effect and press ▶ to hear it first.</p>
+          <div className="mt-1 border-t border-[var(--s4)] px-2 pt-1.5 pb-1">
+            <button
+              role="menuitem"
+              disabled={isGeneratingAudio}
+              onClick={() => void removeMenuVoice()}
+              title="Take the dubbed voice off and keep the caption (Delete does the same for clips selected in this lane)"
+              className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded text-left text-red-300 hover:bg-red-500/15 disabled:opacity-40"
+            >
+              <Trash2 className="w-3 h-3 shrink-0" />
+              <span className="truncate">
+                {voiceMenuScope === 'speaker' && speakerVoiceIds.length > 1
+                  ? `Remove ${speakerVoiceIds.length} voices of ${voiceMenuSeg.speaker}`
+                  : voiceMenuScope === 'selected' && selectedVoiceIds.length > 1
+                  ? `Remove ${selectedVoiceIds.length} selected voices`
+                  : 'Remove voice'}
+              </span>
+              <span className="ml-auto text-[10px] text-zinc-500">keeps caption</span>
+            </button>
+          </div>
+          {voiceEffectError && <div role="alert" className="px-3 pt-1.5 pb-1 mt-1 border-t border-[var(--s4)] text-red-300">{voiceEffectError}</div>}
+        </div>,
+        document.body,
       )}
+
+      {showCutPanel && currentProject?.id && (
+        <FillGapsModal
+          projectId={currentProject.id}
+          videoSeconds={duration}
+          mode="cut"
+          onBeforeCut={pushUndo}
+          onClose={() => setShowCutPanel(false)}
+          onPreview={(seconds: number) => seekToTime(seconds)}
+          onChanged={() => {
+            loadProject(currentProject.id);
+            loadMissingGaps();
+          }}
+        />
+      )}
+
     </div>
   );
 }

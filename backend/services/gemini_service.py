@@ -1,195 +1,15 @@
 import os
-import json
 import re
 import asyncio
-import queue
 import shutil
 import subprocess
 import tempfile
+import uuid
+from collections import OrderedDict
 from typing import AsyncGenerator
 import google.generativeai as genai
-from backend.config import settings
-from backend.database.db import async_session
-from backend.database.models import ApiKey
-from sqlalchemy import select
-
-# Chunking settings for dense, ultra-fast, complete video dialogue coverage
-CHUNK_DURATION = 150    # 150 seconds (2.5 minutes) per chunk for 100% complete dialogue capture
-CHUNK_OVERLAP = 5       # 5 second overlap between chunks to avoid boundary gaps
-CHUNK_THRESHOLD = 150   # Split videos exceeding 2.5 minutes into granular chunks
-MAX_PARALLEL_CHUNKS = 4  # Process up to 4 chunks simultaneously (key-rotated)
-
-# Gemini File API rejects uploads larger than 2 GiB. Compress anything that
-# gets close, so we stay safely under the hard limit.
-GEMINI_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024      # 2 GiB hard limit
-UPLOAD_COMPRESS_THRESHOLD = 1900 * 1024 * 1024    # compress above ~1.9 GB
-
-# Track which key index we used last for round-robin
-_last_key_index = 0
-
-
-async def _get_active_keys() -> list:
-    """Load all active API keys from the database."""
-    async with async_session() as db:
-        result = await db.execute(
-            select(ApiKey.key).where(ApiKey.is_active == True).order_by(ApiKey.created_at)
-        )
-        all_keys = [row[0].strip() for row in result.all()]
-        valid_keys = [k for k in all_keys if k and not k.startswith("AQ.")]
-        return valid_keys if valid_keys else all_keys
-
-
-async def _configure_genai():
-    """Configure genai with the next available active key (round-robin)."""
-    global _last_key_index
-
-    keys = await _get_active_keys()
-
-    # Fallback: if no keys in DB, use the config singleton (e.g. from .env)
-    if not keys:
-        if not settings.gemini_api_key or settings.gemini_api_key == "your_gemini_api_key_here":
-            raise RuntimeError(
-                "No API keys configured. "
-                "Please add a Gemini API key in Settings. "
-                "Get a key at https://aistudio.google.com/apikey"
-            )
-        genai.configure(api_key=settings.gemini_api_key)
-        return
-
-    # Round-robin key selection
-    _last_key_index = _last_key_index % len(keys)
-    chosen_key = keys[_last_key_index]
-    _last_key_index = (_last_key_index + 1) % len(keys)
-
-    genai.configure(api_key=chosen_key)
-
-
-async def _generate_with_fallback(contents, generation_config=None, initial_model: str | None = None):
-    """Generate content with automatic fallback across multiple active models and multiple API keys."""
-    keys = await _get_active_keys()
-    candidates = [
-        initial_model or settings.gemini_model or "gemini-3.1-flash-lite",
-        "gemini-3.1-flash-lite",
-        "gemini-3.5-flash-lite",
-        "gemini-3.5-flash",
-        "gemini-3.6-flash",
-        "gemini-flash-latest",
-        "gemini-flash-lite-latest",
-        "gemini-2.5-pro",
-    ]
-    seen = set()
-    models_to_try = [m for m in candidates if not (m in seen or seen.add(m))]
-
-    last_err = None
-    attempts = max(1, len(keys))
-    for key_idx in range(attempts):
-        if key_idx < len(keys):
-            genai.configure(api_key=keys[key_idx])
-        for m_name in models_to_try:
-            try:
-                model = genai.GenerativeModel(m_name)
-                if generation_config:
-                    response = await asyncio.to_thread(
-                        model.generate_content,
-                        contents,
-                        generation_config=generation_config,
-                    )
-                else:
-                    response = await asyncio.to_thread(model.generate_content, contents)
-                if response and response.text:
-                    return response
-            except Exception as e:
-                last_err = e
-                continue
-        # Switch to next key
-        await _configure_genai()
-
-    raise last_err or Exception("All Gemini models and API keys failed")
-
-
-async def _get_video_duration(video_path: str) -> float:
-    """Get video duration in seconds via ffprobe."""
-    ffprobe = shutil.which("ffprobe") or "ffprobe"
-    cmd = [
-        ffprobe, "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        video_path,
-    ]
-    try:
-        res = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=15
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            return float(res.stdout.strip())
-    except Exception:
-        pass
-    return 0.0
-
-
-async def _split_video_chunks(video_path: str, chunk_duration: float = CHUNK_DURATION):
-    """Extract full audio once in <4s, then quickly slice into macro-chunks (15 min each).
-    Each chunk overlaps by CHUNK_OVERLAP seconds so boundary speech isn't lost.
-    Returns list of (chunk_audio_path, start_offset_seconds).
-    Caller must clean up the temp directory."""
-    duration = await _get_video_duration(video_path)
-    if duration <= 0 or duration <= chunk_duration * 1.15:
-        # Don't split short videos or if we can't determine duration
-        audio_path, tmp_dir = await _extract_audio_for_gemini(video_path)
-        if audio_path:
-            return [(audio_path, 0.0)], tmp_dir
-        return [(video_path, 0.0)], None
-
-    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-    tmp_dir = tempfile.mkdtemp(prefix="gemini_chunks_")
-    full_audio_path = os.path.join(tmp_dir, "full_audio.mp3")
-
-    # Step 1: Extract high-fidelity 24kHz mono audio once in 2-3 seconds
-    extract_cmd = [
-        ffmpeg, "-y",
-        "-i", video_path,
-        "-vn",
-        "-acodec", "libmp3lame",
-        "-ar", "24000",
-        "-ac", "1",
-        "-b:a", "128k",
-        full_audio_path,
-    ]
-    res = await asyncio.to_thread(subprocess.run, extract_cmd, capture_output=True, text=True, timeout=120)
-    if res.returncode != 0 or not os.path.exists(full_audio_path) or os.path.getsize(full_audio_path) == 0:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return [(video_path, 0.0)], None
-
-    # Step 2: Instant audio slicing from full_audio.mp3 (<0.01s per slice)
-    chunks = []
-    step = 0.0
-    idx = 0
-    while step < duration:
-        extract_start = max(0, step - CHUNK_OVERLAP) if step > 0 else 0.0
-        extract_dur = min(chunk_duration + (step - extract_start), duration - extract_start)
-        chunk_path = os.path.join(tmp_dir, f"chunk_{idx}.mp3")
-        cmd = [
-            ffmpeg, "-y",
-            "-ss", str(extract_start),
-            "-i", full_audio_path,
-            "-t", str(extract_dur),
-            "-vn",
-            "-acodec", "libmp3lame",
-            "-ar", "24000",
-            "-ac", "1",
-            "-b:a", "128k",
-            chunk_path,
-        ]
-        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode == 0 and os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
-            chunks.append((chunk_path, extract_start))
-        step += chunk_duration
-        idx += 1
-
-    if not chunks:
-        chunks.append((full_audio_path, 0.0))
-
-    return chunks, tmp_dir
+from backend.services.gemini_client import CHUNK_DURATION, CHUNK_OVERLAP, CHUNK_THRESHOLD, MAX_PARALLEL_CHUNKS, _build_media_proxy_for_gemini, _configure_genai, _generate_with_fallback, _get_video_duration, _split_video_chunks, _transcribe_media_with_fallback, GeminiBlocked, GeminiTruncated
+from backend.services.transcript_cleanup import _clean_khmer_spacing, _safe_json_loads
 
 
 def _build_prompt(target_language: str = "km") -> str:
@@ -216,1482 +36,286 @@ def _build_prompt(target_language: str = "km") -> str:
 
     if target_language == "auto":
         target_inst = """2. "text" — VERBATIM NATIVE TRANSCRIPTION:
-   - Output the exact verbatim spoken dialogue in the native spoken language of the audio (e.g. Chinese, English, etc.)."""
+   - Output the exact verbatim spoken dialogue in the native spoken language of the audio."""
     elif target_language == "km":
         target_inst = """2. "text" — CINEMATIC CAMBODIAN KHMER DUBBING & SUBTITLE LOCALIZATION (ភាសាខ្មែរ / អក្សរខ្មែរ):
-   - Translate the dialogue into natural, expressive, cinematic spoken Cambodian Khmer suited for high-quality movie dubbing, character acting, and video storytelling (ភាសានិយាយភាពយន្ត / សម្រាយរឿង / ភាពយន្តភាគ).
-   - Use authentic contextual pronouns matching character dynamics:
-     * Husband/Wife / Lovers: បង / អូន
-     * Close Friends / Peers: ឯង / យើង / គ្នាយើង
-     * Elders / Grandparents: លោកយាយ / លោកតា / ចៅ
-     * Royalty / Masters / Leaders: ព្រះអង្គ / លោកម្ចាស់ / ទូលបង្គំ / លោកមេបញ្ជាការ / លោកគ្រូ
-     * Polite / Everyday: ខ្ញុំ / លោក / លោកស្រី / អ្នកនាង
-     * Hostile / Confrontational: ឯង / អញ / ពួកឯង
-   - Write 100% EXCLUSIVELY in authentic CAMBODIAN KHMER SCRIPT (អក្សរខ្មែរ). NEVER mix Chinese Hanzi, Thai script, or English letters in the "text" field.
-   - Use correct Khmer spelling, smooth grammar, and natural conversational cadence without robotic phrasing."""
+   - Translate the spoken dialogue into natural, expressive, cinematic spoken Cambodian Khmer (ភាសានិយាយភាពយន្ត / សម្រាយរឿង / ភាពយន្តភាគ).
+   - Use authentic contextual pronouns (បង/អូន, ឯង/យើង, លោកយាយ/លោកតា, ព្រះអង្គ/លោកម្ចាស់, ខ្ញុំ/លោក).
+   - Write 100% EXCLUSIVELY in authentic CAMBODIAN KHMER SCRIPT (អក្សរខ្មែរ). NEVER mix Chinese Hanzi, Thai script, or English letters in "text".
+   - Use correct Khmer spelling and natural conversational cadence without robotic phrasing."""
     else:
         target_inst = f"""2. "text" — NATURAL {lang_name.upper()} LOCALIZATION:
-   - Translate and adapt the dialogue into natural, expressive, cinematic spoken {lang_name} suited for movie dubbing and video captions."""
+   - Translate and adapt the dialogue into natural, expressive, cinematic spoken {lang_name}."""
 
-    return f"""You are a master film transcriber, multilingual speech recognizer, character diarization expert, and movie dialogue localization engine.
+    return f"""You are a master film speech transcriber, multilingual recognizer, character diarization expert, and subtitle localization engine.
 
-Watch and listen to the audio carefully through all background music, sound effects, action sounds, and ambient noise.
+Listen to the audio carefully through background music, sound effects, action sounds, and ambient noise.
 
-CRITICAL DUAL-FIELD SPECIFICATION:
-1. "original_text" — VERBATIM SPOKEN DIALOGUE (NATIVE SCRIPT):
-   - Transcribe the EXACT spoken words in the native spoken language of the characters in the video (e.g. Chinese Hanzi "唐兄，好久不见！" or English "Hey John, long time no see!").
+CRITICAL RULES:
+1. READABLE SUBTITLE LINES:
+   - Each segment is one subtitle line the viewer must be able to READ: aim for 2.0s to 5.0s.
+   - HARD LIMIT: at most 80 characters per segment. A Khmer viewer reads about 16 characters a
+     second, so 80 characters already fills 5 seconds. A longer line cannot be read in time and
+     cannot be dubbed without the voice racing.
+   - NEVER put more than ONE sentence in a segment. If the speaker says several sentences in a
+     row, emit one segment per sentence, each with its own start_time and end_time.
+   - Keep one speaker per segment, and never span a change of speaker.
+   - Split any speech that runs longer than about 5 seconds into consecutive segments.
+
+2. "original_text" — VERBATIM SPOKEN DIALOGUE (NATIVE SCRIPT):
+   - Transcribe the EXACT spoken words in native script (e.g. Chinese Hanzi "唐兄，好久不见！" or English "Hey John, long time no see!").
    - NEVER leave "original_text" blank.
 
 {target_inst}
 
-3. INTELLIGENT CHARACTER NAME IDENTIFICATION & VOICE PROFILES:
-   - Listen carefully to character names spoken, addressed, or referenced in dialogue (e.g. "Tang Bohu", "Autumn Fragrance", "Madame Hua", "Grandma", "Elena", "Brother Chen", "Master", "Doctor Lin", "Xiao Yan").
-   - Accurately assign the detected character name to the "speaker" field.
-   - Assign the EXACT "voice_profile" archetype for each character:
-     * "female": Adult Woman / Young Lady / Heroine (e.g. 秋香, Autumn Fragrance, 石榴姐, Lady, Girl)
-     * "male": Adult Male / Young Man / Hero (e.g. 唐伯虎, Tang Bohu, Scholar, General)
-     * "grandma": Elderly Grandmother / Old Woman / Madame (e.g. 华夫人, Madame Hua, Grandma, 老奶奶, យាយ, ម៉ែ)
-     * "grandpa": Elderly Grandfather / Old Master (e.g. Grandpa, Master, Elder, 老爷, 老爷爷, តា)
-     * "child_boy": Young Boy (e.g. Son, Little Boy, ក្មេងប្រុស)
-     * "child_girl": Young Girl (e.g. Daughter, Little Girl, ក្មេងស្រី)
-   - Tag authentic "emotion": "neutral", "angry", "happy", "sad", "fearful", "excited", "serious", "calm", "whisper".
+3. CHARACTER NAME IDENTIFICATION & VOICE ARCHETYPES:
+   - Listen carefully to character names spoken in dialogue, and reuse the SAME name for that character every time they speak.
+   - NEVER output placeholder labels such as "Unnamed", "Unknown", "Speaker", "Character" or "?".
+   - If a character's name is never said, label them by who they are in the scene, consistently:
+     e.g. "Narrator", "Young Man", "Older Woman", "Guard", "Waitress" — never a placeholder.
+   - Classify each voice from the audible speech, not the character name or dialogue text. Keep the profile consistent for the same speaker.
+   - Assign exact "voice_profile": "female", "male", "grandma", "grandpa", "child_boy", "child_girl".
+   - Tag authentic "emotion": "neutral", "angry", "happy", "sad", "crying", "laughing", "fearful", "excited", "surprised", "serious", "calm", "whisper", "scream".
+   - Infer emotion from audible delivery, not merely words: a calm threat stays calm; a question is not automatically fearful. Use neutral when uncertain.
+   - Preserve natural punctuation and pauses in the translated dialogue for clear pronunciation. Keep character names spelled consistently and put performance directions only in the emotion field, never in spoken text.
 
-4. EXACT AUDIO-SYNCHRONIZED TIMESTAMPS:
-   - "start_time" MUST match the EXACT timestamp (in seconds) where the speaker's vocal audio begins for that phrase. DO NOT start early during silence, pause, or background music.
-   - "end_time" MUST match the exact timestamp where the speaker stops speaking.
-   - Break long sentences at natural speech pauses into 1.0 to 3.5s segments.
-   - All timestamps MUST accurately match the audio timeline.
+4. EXACT TIGHT AUDIO-SYNCHRONIZED TIMESTAMPS:
+   - "start_time" MUST match the EXACT second where the speaker begins vocalizing the first audible phoneme or word. DO NOT start early before the character speaks.
+   - "end_time" MUST match the EXACT second where the speaker STOPS vocalizing that line (typically 2.0s to 5.0s duration).
+   - CRITICAL: NEVER extend "end_time" across silent pauses, action/fight sequences, or background music until the next line. If a character speaks from 10.0s to 12.5s and the next line is at 30.0s, end_time MUST be 12.5s (NOT 30.0s).
 
 5. 100% COMPLETE & EXHAUSTIVE COVERAGE:
    - Transcribe EVERY SINGLE spoken utterance from 0.0s to the very end of the media without skipping any line.
 
 6. STRICTLY IGNORE & NEVER TRANSCRIBE BACKGROUND MUSIC OR SOUND EFFECTS:
-   - ABSOLUTELY NEVER transcribe background music, soundtrack, intro/outro melodies, instrumental breaks, or ambient noise as subtitles (e.g. NEVER output "[ភ្លេង]", "[តន្ត្រី]", "[ភ្លេងកំដរ]", "[តន្ត្រីកំដរ]", "[បទភ្លេង]", "[ចម្រៀង]", "[ចម្រៀងកំដរ]", "[Music]", "[BGM]", "[Instrumental]", "[Sound Effect]", "🎵", "🎶").
-   - If a section contains only background music, theme song, or instruments without human speech, DO NOT create a subtitle segment for it. Completely skip purely musical sections.
-   - ONLY transcribe genuine human dialogue and spoken words.
+   - NEVER transcribe background music, soundtrack, or ambient noise (e.g. NEVER output "[Music]", "[ភ្លេង]", "[តន្ត្រី]", "🎵").
+   - ONLY transcribe genuine human dialogue.
 
-Return a JSON array of granular segment objects:
+Return a JSON array of subtitle segment objects:
 [
-  {{"start_time": 0.0, "end_time": 2.2, "original_text": "唐兄，好久不见！", "text": "បងថាង! មិនបានជួបគ្នាយូរហើយ!", "speaker": "Autumn Fragrance", "gender": "female", "emotion": "happy"}},
-  {{"start_time": 2.4, "end_time": 4.5, "original_text": "秋香，别来无恙吧？", "text": "ឈីវស៊ាង! នាងសុខសប្បាយជាទេ?", "speaker": "Tang Bohu", "gender": "male", "emotion": "cheerful"}}
+  {{"start_time": 0.0, "end_time": 2.2, "original_text": "唐兄，好久不见！", "text": "បងថាង! មិនបានជួបគ្នាយូរហើយ!", "speaker": "Autumn Fragrance", "gender": "female", "voice_profile": "female", "emotion": "happy"}},
+  {{"start_time": 2.4, "end_time": 4.5, "original_text": "秋香，别来无恙吧？", "text": "ឈីវស៊ាង! នាងសុខសប្បាយជាទេ?", "speaker": "Tang Bohu", "gender": "male", "voice_profile": "male", "emotion": "cheerful"}}
 ]
 
 Rules:
-- CONTINUOUS SECONDS: start_time and end_time MUST be continuous numbers in seconds (e.g. 5.2, 62.5, 78.0, 89.2).
-- NO MUSIC / NOISE TAGS: NEVER output [ភ្លេង], [តន្ត្រី], [ភ្លេងកំដរ], [តន្ត្រីកំដរ], [បទភ្លេង], [ចម្រៀង], [Music], [BGM], or sound effect segments. If there is no human speech, produce NO segment.
+- CONTINUOUS SECONDS: start_time and end_time MUST be numbers in seconds (e.g. 5.2, 62.5, 78.0).
 - NO PREFIXES: Neither "original_text" nor "text" should contain speaker prefixes like "Speaker:".
-- JSON ONLY: Return ONLY the raw JSON array. No markdown formatting, no explanations."""
+- JSON ONLY: Return ONLY the raw JSON array. No markdown, no explanations."""
 
 
-async def _compress_for_upload(video_path: str):
-    """Transcode an oversized video into a compact proxy that fits under
-    Gemini's 2 GiB upload cap. Gemini samples video at ~1 fps at low
-    resolution regardless of input, so a downscaled / low-fps proxy carries
-    the same information at a fraction of the size. Audio is preserved for
-    speech timing. Returns (proxy_path, tmp_dir) — caller cleans up tmp_dir,
-    or (video_path, None) if compression isn't possible."""
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        return video_path, None
+TRANSCRIBE_ATTEMPTS = 3
+MIN_SPLIT_SECONDS = 75.0  # a blocked/truncated span is halved until pieces are this short
+SPLIT_OVERLAP = 2.0
 
-    video_dir = os.path.dirname(os.path.abspath(video_path))
-    cached_proxy = os.path.join(video_dir, "gemini_proxy.mp4")
-    if os.path.exists(cached_proxy) and os.path.getsize(cached_proxy) > 1000:
-        orig_dur = await _get_video_duration(video_path)
-        proxy_dur = await _get_video_duration(cached_proxy)
-        if orig_dur > 0 and proxy_dur > 0 and abs(orig_dur - proxy_dur) < 2.0:
-            return cached_proxy, None
-        try:
-            os.remove(cached_proxy)
-        except OSError:
-            pass
-
-    proxy_path = cached_proxy if os.access(video_dir, os.W_OK) else os.path.join(tempfile.mkdtemp(prefix="gemini_proxy_"), "proxy.mp4")
-    tmp_dir = None if proxy_path == cached_proxy else os.path.dirname(proxy_path)
-
-    cmd = [
-        ffmpeg, "-y",
-        "-i", video_path,
-        "-vf", "scale='min(640,iw)':-2,fps=2",
-        "-r", "2",
-        "-c:v", "libx264", "-crf", "32", "-preset", "ultrafast", "-tune", "fastdecode", "-threads", "0",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-        "-movflags", "+faststart",
-        proxy_path,
-    ]
-    try:
-        result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=3600
-        )
-    except Exception as e:
-        print(f"[gemini] proxy transcode failed to run: {e}")
-        if tmp_dir:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        return video_path, None
-
-    if result.returncode == 0 and os.path.exists(proxy_path) and os.path.getsize(proxy_path) > 0:
-        new_size = os.path.getsize(proxy_path)
-        print(f"[gemini] compressed video for upload: "
-              f"{os.path.getsize(video_path) / 1e9:.2f} GB -> {new_size / 1e9:.2f} GB")
-        if new_size < GEMINI_UPLOAD_LIMIT:
-            return proxy_path, tmp_dir
-        print("[gemini] proxy still exceeds upload limit")
-    else:
-        print(f"[gemini] proxy transcode failed: {result.stderr[-500:] if result.returncode else ''}")
-
-    if tmp_dir:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    return video_path, None
-
-
-async def _upload_and_wait(video_path: str, on_progress=None):
-    """Upload video to Gemini and wait for processing.
-
-    Large uploads occasionally die mid-transfer (BrokenPipeError /
-    connection reset) — retry a few times with backoff before giving up.
-    Files near the 2 GiB API limit are compressed to a proxy first.
-    """
-    proxy_dir = None
-    try:
-        if os.path.getsize(video_path) >= UPLOAD_COMPRESS_THRESHOLD:
-            if on_progress:
-                on_progress("Video is large — compressing for upload...")
-            video_path, proxy_dir = await _compress_for_upload(video_path)
-            if os.path.getsize(video_path) >= GEMINI_UPLOAD_LIMIT:
-                raise Exception(
-                    "Video is larger than Gemini's 2 GB upload limit and could not "
-                    "be compressed enough. Please shorten or re-encode the video."
-                )
-    except OSError:
-        pass
-
-    try:
-        last_err: Exception | None = None
-        for attempt in range(3):
-            try:
-                video_file = await asyncio.to_thread(genai.upload_file, video_path)
-                break
-            except (BrokenPipeError, ConnectionError, OSError) as e:
-                last_err = e
-                print(f"[gemini] upload attempt {attempt + 1}/3 failed: {e}")
-                await asyncio.sleep(2 * (attempt + 1))
-        else:
-            raise Exception(f"Video upload to Gemini failed after 3 attempts: {last_err}")
-
-        poll_count = 0
-        while video_file.state.name == "PROCESSING":
-            poll_count += 1
-            await asyncio.sleep(1)
-            video_file = await asyncio.to_thread(genai.get_file, video_file.name)
-
-        if video_file.state.name == "FAILED":
-            raise Exception("Video processing failed in Gemini API")
-
-        return video_file
-    finally:
-        if proxy_dir:
-            shutil.rmtree(proxy_dir, ignore_errors=True)
-
-
-def _safe_json_loads(text: str) -> list:
-    """Parse JSON with fallback repair for common Gemini issues
-    (trailing commas, unescaped newlines in strings, etc.)."""
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Fix 1: Remove trailing commas before ] or }
-    fixed = re.sub(r",\s*([}\]])", r"\1", text)
-    try:
-        return json.loads(fixed)
-    except json.JSONDecodeError:
-        pass
-
-    # Fix 2: Also escape unescaped newlines inside string values
-    fixed2 = re.sub(r'(?<=": ")((?:[^"\\]|\\.)*)(?=")', lambda m: m.group(0).replace("\n", "\\n"), fixed)
-    try:
-        return json.loads(fixed2)
-    except json.JSONDecodeError:
-        pass
-
-    # Fix 3: Salvage every complete top-level object from a truncated/malformed
-    # array. Gemini responses get cut off mid-array (token limits, dropped
-    # connections), which leaves a trailing half-written object that no repair
-    # above can fix. Scan brace-by-brace (respecting strings/escapes), json.loads
-    # each balanced {...}, and keep the ones that parse — discarding only the
-    # incomplete tail. This recovers nearly all segments instead of losing the
-    # whole chunk.
-    recovered = []
-    depth = 0
-    start = -1
-    in_str = False
-    escape = False
-    for i, ch in enumerate(text):
-        if in_str:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    obj = text[start:i + 1]
-                    try:
-                        recovered.append(json.loads(obj))
-                    except json.JSONDecodeError:
-                        try:
-                            recovered.append(json.loads(re.sub(r",\s*([}\]])", r"\1", obj)))
-                        except json.JSONDecodeError:
-                            pass
-                    start = -1
-    if recovered:
-        return recovered
-
-    raise ValueError(f"Could not parse Gemini JSON response: {text[:200]}")
-
-
-def _clean_khmer_spacing(text: str) -> str:
-    """Clean artificial spaces and broken glyph sequences from Khmer text while keeping natural clause structure."""
-    if not text:
-        return text
-    # Check if text contains Khmer characters
-    if not re.search(r'[\u1780-\u17FF]', text):
-        return text.strip()
-
-    # Fix split Khmer subscripts (e.g. consonant + space + ្ + consonant)
-    text = re.sub(r'([\u1780-\u17B3])\s+([\u17D2][\u1780-\u17B3])', r'\1\2', text)
-    text = re.sub(r'([\u1780-\u17B3][\u17D2])\s+([\u1780-\u17B3])', r'\1\2', text)
-    # Fix split vowels/diacritics
-    text = re.sub(r'([\u1780-\u17B3])\s+([\u17B4-\u17D1\u17D3])', r'\1\2', text)
-
-    # Normalize multiple whitespace into single space
-    text = re.sub(r'\s+', ' ', text)
-    # Remove spaces before Khmer punctuation (។, ៗ, ៕, etc.) and general punctuation
-    text = re.sub(r'\s+([។ៗ៕!?,:;])', r'\1', text)
-    text = re.sub(r'([!?,:;])\s*([។ៗ៕])', r'\1\2', text)
-    return text.strip()
-
-
-# Comprehensive set of music, instrumental, noise, and non-speech sound keywords
-_MUSIC_NOISE_TERMS = {
-    # Khmer terms (both spellings សម្លេង and សំឡេង, and common compound terms)
-    'ភ្លេង', 'តន្ត្រី', 'បទភ្លេង', 'ភ្លេងកំដរ', 'តន្ត្រីកំដរ', 'ចម្រៀង', 'ចម្រៀងកំដរ',
-    'សម្លេងភ្លេង', 'សំឡេងភ្លេង', 'សម្លេងតន្ត្រី', 'សំឡេងតន្ត្រី', 'សម្លេងកំដរ', 'សំឡេងកំដរ',
-    'សម្លេងចម្រៀង', 'សំឡេងចម្រៀង', 'ចង្វាក់ភ្លេង', 'ចង្វាក់តន្ត្រី', 'ភ្លេងរោទ៍', 'សំឡេងរោទ៍',
-    'សម្លេងរោទ៍', 'សំឡេងទះដៃ', 'សម្លេងទះដៃ', 'សំឡេងហ៊ោ', 'សម្លេងហ៊ោ', 'សំឡេងហ៊ោកញ្ជ្រៀវ',
-    'សំឡេងសើច', 'សម្លេងសើច', 'សំឡេងយំ', 'សម្លេងយំ', 'សើច', 'យំ', 'ទះដៃ', 'ហ៊ោ', 'កញ្ជ្រៀវ',
-    'សំឡេងខ្សឹប', 'សម្លេងខ្សឹប', 'សំឡេងដកដង្ហើម', 'សម្លេងដកដង្ហើម',
-    # English terms & compounds
-    'music', 'bgm', 'backgroundmusic', 'melody', 'instrumental', 'soundeffect', 'soundeffects',
-    'sfx', 'applause', 'cheer', 'cheers', 'cheering', 'tune', 'guitar', 'piano', 'drum', 'drums',
-    'beat', 'beats', 'singing', 'song', 'whistling', 'humming', 'laughter', 'laughing', 'crying',
-    'musicplaying', 'upbeatmusic', 'dramaticmusic', 'sadmusic', 'instrumentalmusic',
-    'bgmusic', 'ost', 'soundtrack', 'theme', 'thememusic', 'audionoise', 'ambientnoise',
-    'silence', 'nodialogue', 'actionmusic', 'softmusic', 'intensemusic', 'suspensemusic',
-    'intro', 'outro', 'intromusic', 'outromusic', 'sound', 'noise', 'audio',
-    # Chinese terms
-    '音乐', '背景音乐', '配乐', '乐声', '伴奏', '掌声', '欢呼声', '笑声', '哭声', '尖叫', '叹气', '无声',
-}
-
-_MUSIC_REGEX_KEYWORDS = (
-    r'ភ្លេង|តន្ត្រី|បទភ្លេង|ភ្លេងកំដរ|តន្ត្រីកំដរ|ចម្រៀង|ចម្រៀងកំដរ|សម្លេងភ្លេង|សំឡេងភ្លេង|'
-    r'សម្លេងតន្ត្រី|សំឡេងតន្ត្រី|សម្លេងកំដរ|សំឡេងកំដរ|សម្លេងចម្រៀង|សំឡេងចម្រៀង|ចង្វាក់ភ្លេង|ចង្វាក់តន្ត្រី|'
-    r'ភ្លេងរោទ៍|សំឡេងរោទ៍|សម្លេងរោទ៍|សំឡេងទះដៃ|សម្លេងទះដៃ|សំឡេងហ៊ោ|សម្លេងហ៊ោ|'
-    r'music|bgm|background\s*music|melody|instrumental|sound\s*effects?|sfx|applause|cheers?|cheering|'
-    r'tune|guitar|piano|drum|beat|singing|song|whistling|humming|laughter|laughing|crying|ost|soundtrack|'
-    r'theme\s*music|ambient|audio\s*noise|no\s*dialogue|silence|'
-    r'音乐|背景音乐|配乐|乐声|伴奏|掌声|欢呼声|笑声|哭声|尖叫|叹气|无声'
+_CHUNK_TIMING_NOTE = (
+    "\n\nCRITICAL MANDATE FOR TIME ALIGNMENT:\n"
+    "- This audio starts at exact time 0.0s relative to this clip.\n"
+    "- You MUST accurately measure any music, pause, or silence before speaking begins.\n"
+    "- Do NOT start the first segment at 0.0s unless speaking literally starts at the very first millisecond.\n"
+    "- Output readable 2.0 to 5.0 second segments, at most 80 characters and ONE sentence each, "
+    "with exact timestamps matching the speech."
 )
 
 
-def _is_music_or_noise_segment(text: str, orig_text: str = "") -> bool:
-    """Check if text is purely a background music, instrumental melody, or non-speech noise tag (e.g. [ភ្លេង], [តន្ត្រី], [Music])."""
-    for t in (text, orig_text):
-        if not t:
+def _fmt_clock(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _filter_boundary_duplicates(existing_segments: list, new_segments: list) -> list:
+    """Drop segments from new_segments that repeat the tail of existing_segments (overlap regions)."""
+    if not existing_segments:
+        return new_segments
+    clean_new = []
+    for n_seg in new_segments:
+        n_start = n_seg.get("start_time", 0.0)
+        n_end = n_seg.get("end_time", 0.0)
+        n_text = str(n_seg.get("text", "")).strip()
+        n_orig = str(n_seg.get("original_text", "")).strip()
+        if not n_text and not n_orig:
             continue
-        cleaned = str(t).strip()
-        if not cleaned:
-            continue
-
-        # 1. Check if entirely music notes / audio emoji symbols / noise punctuation
-        if re.fullmatch(r'[\s🎵🎶🎼🔊🔉🔈🔔🎸🎹🎺🎻🥁🎤🎧.,!?:;\-–—~`\'"“”«»\[\]\(\)（）【】「」『』《》⟨⟩‹›]+', cleaned):
-            return True
-
-        # 2. Check explicitly bracketed tags: [ភ្លេង], (តន្ត្រី), 【Music】, [Upbeat Music Playing], (ភ្លេងកំដរ...), etc.
-        # Must have an explicit opening bracket at start and closing bracket at end
-        bracket_match = re.match(
-            r'^\s*[\[\(（【「『《⟨\{](?P<inner>.+?)[\]\)）】」』》⟩\}][\s.,!?:;\-–—~`\'"“”«»]*$',
-            cleaned,
-            flags=re.IGNORECASE
-        )
-        if bracket_match:
-            inner = bracket_match.group("inner").strip()
-            inner_stripped = re.sub(r'[\s.,!?:;\-–—~`\'"“”«»🎵🎶🎼]+', '', inner).lower()
-            if (
-                inner_stripped in _MUSIC_NOISE_TERMS
-                or re.search(r'(?:' + _MUSIC_REGEX_KEYWORDS + r')', inner, flags=re.IGNORECASE)
-            ):
-                return True
-
-        # 3. Check standalone exact music terms (with or without trailing punctuation)
-        stripped_all = re.sub(r'[\[\]\(\)（）【】「」『』《》⟨⟩‹›\{\}\s.,!?:;\-–—~`\'"“”«»🎵🎶🎼]+', '', cleaned).lower()
-        if stripped_all in _MUSIC_NOISE_TERMS:
-            return True
-
-        # 4. Check standalone regex match for exact phrase
-        if re.fullmatch(r'[\s.,!?:;\-–—~`\'"“”«»🎵🎶🎼]*(?:' + _MUSIC_REGEX_KEYWORDS + r')[\s.,!?:;\-–—~`\'"“”«»🎵🎶🎼]*', cleaned, flags=re.IGNORECASE):
-            return True
-
-    return False
-
-
-def _strip_inline_music_tags(text: str) -> str:
-    """Remove inline music / noise bracket tags from within dialogue sentences."""
-    if not text:
-        return ""
-    # Strip bracketed tags containing music/noise keywords
-    cleaned = re.sub(
-        r'[\[\(（【「『《⟨\{]\s*[^\]\)）】」』》⟩\}]*?(?:' + _MUSIC_REGEX_KEYWORDS + r')[^\]\)）】」』》⟩\}]*?\s*[\]\)）】」』》⟩\}]',
-        '',
-        str(text),
-        flags=re.IGNORECASE
-    )
-    # Strip isolated music emojis
-    cleaned = re.sub(r'[🎵🎶🎼]', '', cleaned)
-    return re.sub(r'\s+', ' ', cleaned).strip()
-
-
-def _split_segment_into_subsegments(seg: dict) -> list[dict]:
-    """Split segments longer than 3.2 seconds at natural sentence, clause, or conjunction boundaries.
-    Preserves whole words, keeps punctuation bound to sentences, and avoids orphan punctuation chunks."""
-    text = seg.get("text", "").strip()
-    s = float(seg.get("start_time", 0))
-    e = float(seg.get("end_time", 0))
-    dur = e - s
-
-    # If duration is crisp and punchy (<= 3.2s), or text has no meaningful characters, do not split
-    if dur <= 3.2 or not text or not re.search(r'[\w\u1780-\u17FF\u4E00-\u9FFF]', text):
-        return [seg]
-
-    # Split on sentence punctuation boundaries while keeping punctuation attached to the preceding sentence
-    raw_sentences = [p.strip() for p in re.split(r'(?<=[!?,.។;:\n…，。！？、])\s+', text) if p.strip()]
-
-    # If no punctuation split or sentence is still long, split on Khmer conjunction boundaries
-    conj = ['ហើយ', 'ប៉ុន្តែ', 'ព្រោះ', 'ដូច្នេះ', 'បន្ទាប់មក', 'តែ', 'ប្រសិនបើ', 'ពីព្រោះ', 'ដោយសារ', 'ពេល']
-    sentences = []
-    for s_item in raw_sentences:
-        if len(s_item) > 20:
-            split_done = False
-            for c in conj:
-                if c in s_item and not s_item.startswith(c):
-                    sub = s_item.split(c, 1)
-                    if len(sub[0].strip()) >= 8 and len(sub[1].strip()) >= 6:
-                        sentences.append(sub[0].strip())
-                        sentences.append((c + sub[1]).strip())
-                        split_done = True
-                        break
-            if not split_done:
-                sentences.append(s_item)
-        else:
-            sentences.append(s_item)
-
-    # Filter out empty or punctuation-only pieces and merge them back with previous sentences
-    filtered = []
-    for piece in sentences:
-        p_clean = piece.strip()
-        if not p_clean:
-            continue
-        if not re.search(r'[\w\u1780-\u17FF\u4E00-\u9FFF]', p_clean):
-            if filtered:
-                filtered[-1] += p_clean
-            continue
-        filtered.append(p_clean)
-
-    if len(filtered) <= 1:
-        return [seg]
-
-    total_chars = sum(len(st) for st in filtered)
-    if total_chars == 0:
-        return [seg]
-
-    res = []
-    curr_s = s
-    for i, st in enumerate(filtered):
-        ratio = len(st) / total_chars
-        sub_dur = dur * ratio
-        sub_e = round(curr_s + sub_dur, 2)
-        if i == len(filtered) - 1:
-            sub_e = e
-        sub_seg = dict(seg)
-        sub_seg["start_time"] = round(curr_s, 2)
-        sub_seg["end_time"] = round(sub_e, 2)
-        sub_seg["text"] = st.strip()
-        if "original_text" not in sub_seg or not sub_seg["original_text"]:
-            sub_seg["original_text"] = seg.get("original_text", st.strip())
-        res.append(sub_seg)
-        curr_s = sub_e
-
-    return res
-
-
-def _clean_repetitive_text(text: str) -> str:
-    """Remove repetitive loop hallucinations (e.g. repeated Khmer/Chinese words or phrases)."""
-    if not text:
-        return ""
-    t = text
-    for _ in range(3):
-        t = re.sub(r'([\u1780-\u17FF\u4E00-\u9FFF\w\s]{3,30}?)(?:\s*\1){2,}', r'\1', t)
-        t = re.sub(r'(\b\S+\b(?:\s+\b\S+\b)?)(?:\s+\1){2,}', r'\1', t, flags=re.IGNORECASE)
-    words = t.split()
-    if len(words) > 6:
-        counts = {}
-        filtered = []
-        for w in words:
-            counts[w] = counts.get(w, 0) + 1
-            if counts[w] <= 2:
-                filtered.append(w)
-            elif counts[w] == 3 and w in ('និង', 'ហើយ', 'ដែល', 'ទៅ', 'មក', 'នៃ', 'the', 'and', 'to'):
-                filtered.append(w)
-        t = ' '.join(filtered)
-    return t.strip()
-
-
-def _parse_timestamp(val, prev_ref: float = 0.0) -> float:
-    """Parse float seconds from numbers or timecode strings (e.g. 12.34, '01:23.4', '1:05', '100.90')."""
-    if isinstance(val, (int, float)):
-        raw_val = float(val)
-    else:
-        val_str = str(val).strip()
-        if ":" in val_str:
-            parts = val_str.split(":")
-            try:
-                if len(parts) == 2:
-                    return float(parts[0]) * 60.0 + float(parts[1])
-                elif len(parts) == 3:
-                    return float(parts[0]) * 3600.0 + float(parts[1]) * 60.0 + float(parts[2])
-            except (ValueError, TypeError):
-                pass
-        try:
-            raw_val = float(val_str)
-        except (ValueError, TypeError):
-            return 0.0
-
-    # Auto-detect omitted-colon MMSS.ss format (e.g. 100.90 for 01:00.90, 102.70 for 01:02.70)
-    if raw_val >= 100.0:
-        int_p = int(raw_val)
-        sec_p = (int_p % 100) + (raw_val - int_p)
-        min_p = int_p // 100
-        if min_p >= 1 and (int_p % 100) < 60 and sec_p < 60.0:
-            converted = min_p * 60.0 + sec_p
-            if prev_ref > 0 and (raw_val - prev_ref) > 20.0 and abs(converted - prev_ref) < abs(raw_val - prev_ref):
-                return round(converted, 2)
-
-    return round(raw_val, 2)
-
-
-def sanitize_segments(segments: list) -> list:
-    """Sanitize, fix intra-chunk minute rollovers, deduplicate boundary copies, and strictly resolve all overlaps."""
-    if not segments:
-        return []
-
-    # Step 1: Fix minute rollovers per chunk and invalid timestamps
-    minute_offset = 0.0
-    prev_start = 0.0
-    fixed = []
-    for s in segments:
-        s_text = s.get("text", "") or ""
-        s_orig = s.get("original_text", "") or ""
-        if _is_music_or_noise_segment(s_text, s_orig):
-            continue
-
-        start = _parse_timestamp(s.get("start_time", 0), prev_ref=prev_start)
-        end = _parse_timestamp(s.get("end_time", 0), prev_ref=start)
-
-        # Check if timestamp rolled over a 60s boundary within a chunk response (e.g. 58.5s -> 1.2s)
-        while (start + minute_offset) < prev_start - 10.0 and start < 60.0:
-            minute_offset += 60.0
-
-        start += minute_offset
-        end += minute_offset
-        if end <= start + 0.2:
-            end = start + 1.2
-
-        # Prevent runaway subtitle segment duration (e.g. spanning minutes across the timeline)
-        text_str = s.get("text", "") or s.get("original_text", "") or ""
-        char_len = len(text_str.strip())
-        max_dur = max(2.5, min(char_len * 0.2, 12.0))
-        if (end - start) > 15.0:
-            end = start + max_dur
-
-        prev_start = start
-        item = dict(s)
-        item["start_time"] = round(start, 2)
-        item["end_time"] = round(end, 2)
-        fixed.append(item)
-
-    # Step 2: Sort strictly by start_time, then end_time
-    fixed.sort(key=lambda x: (x["start_time"], x["end_time"]))
-
-    # Step 3: Global sliding-window deduplication (eliminates chunk-overlap copies)
-    deduped = []
-    for seg in fixed:
         is_dup = False
-        s_text = seg.get("text", "").strip()
-        s_orig = seg.get("original_text", "").strip()
-        for ex in reversed(deduped[-40:]):
-            if abs(seg["start_time"] - ex["start_time"]) > 60.0:
+        for ex_seg in reversed(existing_segments[-40:]):
+            ex_start = ex_seg.get("start_time", 0.0)
+            ex_end = ex_seg.get("end_time", 0.0)
+            ex_text = str(ex_seg.get("text", "")).strip()
+            ex_orig = str(ex_seg.get("original_text", "")).strip()
+            time_diff = abs(n_start - ex_start)
+            if time_diff > (CHUNK_OVERLAP + 4.0):
                 continue
-            ex_text = ex.get("text", "").strip()
-            ex_orig = ex.get("original_text", "").strip()
-            # If text is identical and timestamps within 40s
-            if s_text and ex_text and s_text == ex_text and abs(seg["start_time"] - ex["start_time"]) < 40.0:
+            ov_len = max(0.0, min(n_end, ex_end) - max(n_start, ex_start))
+            overlap_ratio = ov_len / max(0.2, min(n_end - n_start, ex_end - ex_start))
+            if n_text and ex_text and (n_text == ex_text or n_text in ex_text or ex_text in n_text):
                 is_dup = True
-                break
-            # If original_text is identical and timestamps within 40s
-            if s_orig and ex_orig and s_orig == ex_orig and abs(seg["start_time"] - ex["start_time"]) < 40.0:
+            elif n_orig and ex_orig and (n_orig == ex_orig or n_orig in ex_orig or ex_orig in n_orig):
                 is_dup = True
-                break
-            # If start and end times are virtually identical
-            if abs(seg["start_time"] - ex["start_time"]) < 0.3 and abs(seg["end_time"] - ex["end_time"]) < 0.3:
+            elif overlap_ratio > 0.5 or (time_diff < 0.8 and overlap_ratio > 0.3):
                 is_dup = True
+            if is_dup:
                 break
         if not is_dup:
-            deduped.append(seg)
-
-    # Step 4: Re-sort and strictly eliminate any overlapping segment bounds
-    deduped.sort(key=lambda x: x["start_time"])
-    resolved = []
-    for seg in deduped:
-        if not resolved:
-            resolved.append(seg)
-            continue
-        prev = resolved[-1]
-
-        # If current segment starts before previous segment ends
-        if seg["start_time"] < prev["end_time"]:
-            if (prev["end_time"] - prev["start_time"]) > 1.2:
-                mid = round((prev["end_time"] + seg["start_time"]) / 2, 2)
-                prev["end_time"] = mid
-                seg["start_time"] = mid
-            else:
-                prev["end_time"] = round(seg["start_time"], 2)
-
-            if prev["end_time"] <= prev["start_time"]:
-                prev["end_time"] = round(prev["start_time"] + 0.5, 2)
-                seg["start_time"] = prev["end_time"]
-
-        if seg["end_time"] <= seg["start_time"]:
-            seg["end_time"] = round(seg["start_time"] + 1.0, 2)
-
-        resolved.append(seg)
-
-    # Step 5: Final strict monotonicity pass
-    final_pass = []
-    for seg in resolved:
-        if final_pass:
-            if seg["start_time"] < final_pass[-1]["end_time"]:
-                seg["start_time"] = final_pass[-1]["end_time"]
-            if seg["end_time"] <= seg["start_time"]:
-                seg["end_time"] = round(seg["start_time"] + 0.8, 2)
-        final_pass.append(seg)
-
-    # Re-index
-    for idx, s in enumerate(final_pass):
-        s["index"] = idx
-
-    return final_pass
-
-
-def _parse_segments(text: str) -> list:
-    """Parse JSON segments from Gemini response text and ensure granular sentence-level splitting."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\n?", "", text)
-        text = re.sub(r"\n?```$", "", text)
-
-    segments = _safe_json_loads(text)
-    raw_cleaned = []
-    minute_offset = 0.0
-    prev_start = 0.0
-
-    for i, seg in enumerate(segments):
-        raw_vp = str(seg.get("voice_profile", "")).lower().strip()
-        gender = str(seg.get("gender", "")).lower().strip()
-        raw_spk = seg.get("speaker")
-        if raw_spk and str(raw_spk).strip():
-            speaker = str(raw_spk).strip()
-        else:
-            speaker = "Speaker"
-        speaker_lower = speaker.lower()
-
-        # Detailed character voice profile mapping
-        if raw_vp in ("grandma", "elderly_female") or any(k in speaker_lower or k in gender for k in ["grandma", "grandmother", "madame", "mrs", "elderly woman", "old woman", "យាយ", "លោកយាយ", "ជីដូន", "ម៉ែ", "夫人", "婆婆", "老奶奶", "华夫人"]):
-            voice_profile = "grandma"
-        elif raw_vp in ("grandpa", "elderly_male") or any(k in speaker_lower or k in gender for k in ["grandpa", "grandfather", "master", "elder", "old man", "elderly man", "តា", "លោកតា", "ជីតា", "ឪ", "老爷", "老爷爷", "老太爷"]):
-            voice_profile = "grandpa"
-        elif raw_vp in ("child_boy", "boy") or any(k in speaker_lower for k in ["boy", "son", "young boy", "little boy", "ក្មេងប្រុស", "កូនប្រុស", "男孩", "童子"]):
-            voice_profile = "child_boy"
-        elif raw_vp in ("child_girl", "girl") or any(k in speaker_lower for k in ["girl", "daughter", "young girl", "little girl", "ក្មេងស្រី", "កូនស្រី", "女孩", "丫头"]):
-            voice_profile = "child_girl"
-        elif raw_vp == "child" or any(k in speaker_lower or k in gender for k in ["child", "kid", "baby", "young", "ក្មេង", "កូន", "小孩"]):
-            voice_profile = "child"
-        elif gender == "male" or any(k in speaker_lower for k in ["male", "man", "lord", "officer", "scholar", "swordsman", "leader", "boss", "father", "guy", "brother", "husband", "ប្រុស", "លោក", "បង", "男", "公子", "唐伯虎", "秀才"]):
-            voice_profile = "male"
-        else:
-            voice_profile = "female"
-
-        seg_text = str(seg.get("text", "")).strip()
-        orig_text = str(seg.get("original_text", "")).strip()
-
-        # Remove speaker prefixes like "Speaker 1:"
-        seg_text = re.sub(r"^(?:male|female|child|speaker\s*\d*)\s*:\s*", "", seg_text, flags=re.IGNORECASE).strip()
-        orig_text = re.sub(r"^(?:male|female|child|speaker\s*\d*)\s*:\s*", "", orig_text, flags=re.IGNORECASE).strip()
-
-        # Strip inline background music / sound effect tags
-        seg_text = _strip_inline_music_tags(seg_text)
-        orig_text = _strip_inline_music_tags(orig_text)
-
-        # Discard segments that are purely background music or noise tags (e.g. [ភ្លេង], [តន្ត្រី], [Music])
-        if _is_music_or_noise_segment(seg_text, orig_text):
-            continue
-
-        # Robust bidirectional fallback so neither text nor original_text is ever empty
-        if not orig_text and seg_text:
-            orig_text = seg_text
-        if not seg_text and orig_text:
-            seg_text = orig_text
-
-        # If seg_text has both Khmer and Chinese characters mixed together (e.g. "唐伯虎 (តាំងប៉ហូ)" or "唐兄: បងថាង"),
-        # clean the Chinese characters from the Khmer text field so it is 100% pure Khmer.
-        if re.search(r'[\u1780-\u17FF]', seg_text) and re.search(r'[\u4E00-\u9FFF]', seg_text):
-            cleaned_km = re.sub(r'[\u4E00-\u9FFF]+', '', seg_text)
-            cleaned_km = re.sub(r'\(\s*\)|\[\s*\]', '', cleaned_km)
-            cleaned_km = re.sub(r'^[:\s\-–—]+', '', cleaned_km).strip()
-            if cleaned_km:
-                seg_text = cleaned_km
-            elif orig_text:
-                seg_text = orig_text
-
-        seg_text = _clean_repetitive_text(_clean_khmer_spacing(seg_text))
-        if not seg_text and orig_text:
-            seg_text = _clean_repetitive_text(orig_text)
-
-        if not seg_text or _is_music_or_noise_segment(seg_text, orig_text):
-            continue
-
-        s_time = _parse_timestamp(seg.get("start_time", 0), prev_ref=prev_start)
-        e_time = _parse_timestamp(seg.get("end_time", 0), prev_ref=s_time)
-
-        # Auto-detect minute rollover within a chunk response (e.g. 59s -> 2s)
-        while (s_time + minute_offset) < prev_start - 10.0 and s_time < 60.0:
-            minute_offset += 60.0
-
-        s_fixed = s_time + minute_offset
-        e_fixed = e_time + minute_offset
-        if e_fixed <= s_fixed:
-            e_fixed = s_fixed + 1.2
-        prev_start = s_fixed
-
-        raw_cleaned.append({
-            "index": i,
-            "start_time": round(s_fixed, 2),
-            "end_time": round(e_fixed, 2),
-            "text": seg_text,
-            "original_text": orig_text,
-            "speaker": speaker,
-            "voice_profile": voice_profile,
-            "emotion": str(seg.get("emotion", "neutral")).lower().strip() or "neutral",
-        })
-
-    # Expand any multi-sentence segments into individual subsegments
-    final_segments = []
-    for seg in raw_cleaned:
-        txt = seg.get("text", "").strip()
-        orig = seg.get("original_text", "").strip()
-        if not txt and orig:
-            seg["text"] = orig
-            txt = orig
-        if not txt and not orig:
-            continue
-        sub_segs = _split_segment_into_subsegments(seg)
-        for s in sub_segs:
-            s_txt = s.get("text", "").strip()
-            s_orig = s.get("original_text", "").strip()
-            if not s_txt and s_orig:
-                s["text"] = s_orig
-                s_txt = s_orig
-            if s_txt:
-                final_segments.append(s)
-
-    # Re-index
-    for idx, s in enumerate(final_segments):
-        s["index"] = idx
-
-    return final_segments
-
-
-def _build_narration_prompt(
-    language: str = "km",
-    style: str = "summary",
-    prompt_hint: str = "",
-    video_duration: float = 0.0,
-) -> tuple[str, float]:
-    """Build a prompt for AI narration/voiceover of a video.
-    Returns (prompt, temperature) — temperature is part of the style."""
-    lang_map = {
-        "km": "Khmer", "en": "English", "zh": "Chinese (Mandarin)",
-        "ja": "Japanese", "ko": "Korean", "th": "Thai", "vi": "Vietnamese",
-        "fr": "French", "es": "Spanish", "de": "German",
-    }
-    lang_name = lang_map.get(language, language)
-
-    # Each style controls not just a description, but the actual OUTPUT SHAPE:
-    # tone, pacing/segment length, whether to weave in actor dialogue, and how
-    # to open. Keeping these style-specific (instead of one shared rule set) is
-    # what makes the styles come out genuinely different rather than converging.
-    styles = {
-        "recap_tiktok": {
-            "headline": "a VIRAL TIKTOK / REELS SHORT-FORM MOVIE RECAP (សម្រាយរឿងបែប TikTok & Reels) — ultra-fast, high-hook, punchy lines designed for short-form retention.",
-            "voice": [
-                "Open with a high-energy retention hook in the first 1-2 seconds ('តើអ្នកជឿទេថា...', 'កុំមើលរំលងឱ្យសោះ...', 'មើលទៅបុរសម្នាក់នេះ...').",
-                "Use humorous, catchy movie recap nicknames ('អាប្រុសខូច', 'ស្រីស្អាត', 'បុរសអាវខ្មៅ', 'លោកពូសក់វែង', 'មេបក្សកំណាច').",
-                "Keep sentences ultra-short and rapid-fire (1.8 to 3.2 seconds per line).",
-                "Insert high-suspense beat transitions ('តែស្រាប់តែពេលនោះ!', 'អ្វីដែលមិននឹកស្មានដល់នោះគឺ!', 'គ្រោះកាចបានមកដល់!').",
-                "Conclude with an irresistible call-to-action or cliffhanger ('តើគាត់អាចរួចខ្លួនដែរឬទេ? ចុច Like និង Follow ដើម្បីទស្សនាភាគបន្ត!').",
-            ],
-            "pacing": "Rapid-fire 1.8-3.2 second segments, energetic cadence matching fast cuts.",
-            "dialogue": "light",
-            "opening": "Start with an explosive hook question or shocking reveal in the very first sentence.",
-            "temperature": 0.82,
-        },
-        "recap_viral": {
-            "headline": "a VIRAL MOVIE RECAP (សម្រាយរឿងបែប Viral / ហ្វេសប៊ុក & យូធូប) — engaging, high-tension, addictive Cambodian movie recap style.",
-            "voice": [
-                "Hook the audience immediately in the first 2 seconds describing the opening situation.",
-                "Use classic Cambodian movie recap phrasing and nicknames ('មើលទៅបុរសម្នាក់នេះ', 'នារីកំសត់', 'មេបក្សកំណាច', 'ក្មេងទំនើង').",
-                "Keep suspense at maximum intensity between beats ('មិននឹកស្មានដល់ថា...', 'ស្រាប់តែពេលនោះ...', 'តើមានអ្វីកើតឡើងបន្ត?').",
-                "Directly follow the physical actions, fights, and reveals on screen.",
-                "End with an engaging call-to-action asking viewers their thoughts in the comments.",
-            ],
-            "pacing": "Short, rapid segments, 2.5-4.0 seconds each, synchronized with scene cuts.",
-            "dialogue": "light",
-            "opening": "The first line must shock the viewer and describe the opening visual hook.",
-            "temperature": 0.80,
-        },
-        "recap_comedy": {
-            "headline": "a COMEDY & FUNNY COMMENTARY RECAP (សម្រាយរឿងបែបកំប្លែង & សើចសប្បាយ) — humorous, witty, sarcastic, and energetic.",
-            "voice": [
-                "Tease the characters' silly decisions, dramatic facial expressions, and exaggerated actions with good-humored Khmer slang.",
-                "Give hilarious, creative nicknames to characters ('អាមុខងាប់', 'លោកពូកំពូលកូរ', 'ស្រីស្អាតចិត្តដាច់', 'អ្នកក្លាហានអត់បាយ').",
-                "Add witty punchlines and comical reaction commentary ('ដល់កហើយលោកអើយ!', 'ចាញ់បោកគេទៀតហើយ!', 'ឃើញមុខស្លូតតែខូចកប់!').",
-                "Keep the storytelling fun, lively, and entertaining throughout every scene.",
-            ],
-            "pacing": "Punchy 2.2-3.8 second segments with playful pauses and energetic punchlines.",
-            "dialogue": "light",
-            "opening": "Open with a hilarious observation or playful jab at the main character's situation.",
-            "temperature": 0.85,
-        },
-        "recap_action": {
-            "headline": "an ACTION & MARTIAL ARTS BATTLE RECAP (សម្រាយរឿងបែបវាយប្រហារ & ក្បាច់គុន) — explosive, high-adrenaline, strike-by-strike combat calls.",
-            "voice": [
-                "High-octane cadence describing strikes, sword moves, martial arts clashes, escapes, and showdowns.",
-                "Use powerful martial arts and combat action verbs ('ទាត់មួយជើង...', 'គេចផុតយ៉ាងរហ័ស...', 'ដកដាវទេពវាយប្រហារ...', 'ការប្រយុទ្ធដ៏ស្វិតស្វាញ').",
-                "Match every strike, explosion, and camera movement closely with high tension.",
-                "Emphasize the stakes: life-or-death survival, clan revenge, and ultimate martial mastery.",
-            ],
-            "pacing": "Rapid-fire 2.0-3.5 second segments matching physical action on screen.",
-            "dialogue": "light",
-            "opening": "Open directly into the heat of the action or imminent danger in the first frame.",
-            "temperature": 0.78,
-        },
-        "recap_cinema": {
-            "headline": "a CINEMATIC MOVIE RECAP (សម្រាយរឿងបែបភាពយន្ត & មនោសញ្ចេតនា) — dramatic, visually-grounded, scene-by-scene storytelling.",
-            "voice": [
-                "Narrate the exact physical actions, confrontations, and drama occurring on screen with cinematic flair.",
-                "Describe character gestures, expressions, weapon moves, and discoveries as they unfold in each shot.",
-                "Use smooth cinematic narration transitions ('ពេលនោះស្រាប់តែ...', 'ឈុតឆាកបន្ត...', 'តួអង្គបានសម្រេចចិត្ត...').",
-                "Keep every line concise and directly anchored to visible on-screen events.",
-            ],
-            "pacing": "Punchy 2.5-4.5 second segments, perfectly synchronized with visual scene changes.",
-            "dialogue": "light",
-            "opening": "Hook the viewer with a dramatic opening statement describing the initial scene.",
-            "temperature": 0.75,
-        },
-        "recap_suspense": {
-            "headline": "a MYSTERY & SUSPENSE THRILLER RECAP (សម្រាយរឿងបែបអាថ៌កំបាំង & ស៊ើបអង្កេត) — dark secrets, psychological tension, and shocking plot twists.",
-            "voice": [
-                "Build deep intrigue around clues, hidden identities, betrayals, and unexpected motives.",
-                "Use whisper/suspenseful phrasing ('តើការពិតនៅពីក្រោយរឿងនេះជាអ្វី?', 'មានអាថ៌កំបាំងមួយដែលគ្មានអ្នកណាដឹង...', 'ស្រមោលអន្ធការបានលេចឡើង...').",
-                "Highlight every suspicious look, background detail, and plot twist discovery.",
-                "Deliver mind-blowing revelation beats at the climax.",
-            ],
-            "pacing": "Measured 2.5-4.2 second segments with suspenseful pauses between revelations.",
-            "dialogue": "light",
-            "opening": "Open with an eerie, gripping question about the unsolved mystery seen on screen.",
-            "temperature": 0.76,
-        },
-        "documentary": {
-            "headline": "a FORMAL DOCUMENTARY / EDUCATIONAL VOICEOVER (ការអត្ថាធិប្បាយបែបផ្លូវការ) — refined, articulate, informative, and authoritative.",
-            "voice": [
-                "Polished, professional, and clear tone suited for documentaries, history, and scientific explainers.",
-                "Explain the context, background, and significance of what is visible on screen with precision.",
-                "Clear, measured cadence without artificial slang.",
-                "Cover the narrative in a structured, chronological manner.",
-            ],
-            "pacing": "Measured 3.2-4.8 second segments with natural academic clarity.",
-            "dialogue": "none",
-            "opening": "Open with an authoritative and captivating overview statement of the subject matter.",
-            "temperature": 0.40,
-        },
-        "summary": {
-            "headline": "a concise, factual SUMMARY (សង្ខេបសាច់រឿងខ្លីខ្លឹម) — clean, fast highlight reel of the main plot.",
-            "voice": [
-                "Clear, objective storytelling focusing strictly on key plot milestones and outcome.",
-                "Cover the beginning premise, major turning points, and final conclusion concisely.",
-                "Keep every sentence crisp and easy to follow.",
-            ],
-            "pacing": "Concise 2.5-4.0 second segments.",
-            "dialogue": "none",
-            "opening": "Open by stating plainly what the story or situation is about.",
-            "temperature": 0.50,
-        },
-    }
-
-    cfg = styles.get(style, styles.get("recap_viral", styles["summary"]))
-    voice_lines = "\n".join(f"- {v}" for v in cfg["voice"])
-
-    dialogue_directive = {
-        "none": (
-            "DIALOGUE: Do NOT create any \"dialogue\" segments. Use ONLY type \"narration\". "
-            "Describe what people say in your own words instead of quoting them."
-        ),
-        "light": (
-            "DIALOGUE: Mostly narration, but occasionally (roughly 1 out of every 5-6 segments) "
-            "quote an actor's strongest line as a type \"dialogue\" segment, timed to when they speak."
-        ),
-        "heavy": (
-            "DIALOGUE: Frequently (roughly 1 out of every 3 segments) weave in the actors' most dramatic "
-            "lines as type \"dialogue\" segments, timed to when they speak, to heighten the drama."
-        ),
-    }[cfg["dialogue"]]
-
-    custom_hint_section = f"\nUSER SPECIAL DIRECTION:\n- {prompt_hint}\n" if prompt_hint and prompt_hint.strip() else ""
-
-    duration_guide = ""
-    if video_duration and video_duration > 0:
-        total_min = int(video_duration // 60)
-        total_sec = int(video_duration % 60)
-        duration_str = f"{total_min:02d}:{total_sec:02d} ({video_duration:.1f} seconds)"
-        duration_guide = f"""
-CRITICAL TIMELINE & FULL COVERAGE RULES (ហាមឈប់មុនចប់វីដេអូ):
-- The video duration is EXACTLY {duration_str}.
-- You MUST write recap narration covering the ENTIRE duration from timestamp 0.0s all the way to {video_duration:.1f}s.
-- DO NOT finish early or stop at 1-2 minutes!
-- Distribute your segments evenly across all scenes:
-  * Opening Hook: 0.0s to {video_duration * 0.2:.1f}s
-  * Middle Story & Battles: {video_duration * 0.2:.1f}s to {video_duration * 0.7:.1f}s
-  * Climax & Final Conclusion / Outro: {video_duration * 0.7:.1f}s to {video_duration:.1f}s
-- The last segment MUST finish at or near {video_duration:.1f}s."""
-
-    khmer_specific_guide = ""
-    if language == "km":
-        khmer_specific_guide = """
-KHMER MOVIE RECAP SPECIFIC RULES (ភាសាសម្រាយរឿងខ្មែរអាជីព):
-- Use authentic, lively Cambodian movie recap vocabulary (e.g. នៅក្នុងឈុតឆាកនេះ, ភ្លាមនោះស្រាប់តែ, មិននឹកស្មានដល់ថា, គ្រោះកាចបានមកដល់, រឿងរ៉ាវកាន់តែតានតឹង, ចុងក្រោយ).
-- Standard continuous Khmer script with NO artificial spaces between syllables or words.
-- Natural spoken pronouns matching character relationships (ខ្ញុំ, ឯង, គាត់, នាង, បង, អូន, ពុក, ម៉ែ, មេ, លោកពូ, អាប្រុស).
-- Set appropriate 'emotion' on every segment (excited, serious, angry, fearful, sad, happy, whisper, neutral) so the voiceover speaks with full human feeling."""
-
-    prompt = f"""You are a master movie recap and video voiceover scriptwriter (អ្នកសម្រាយរឿងអាជីព).
-
-Watch this video carefully from beginning to end. Analyze the exact visual action and scene changes occurring at each second.
-
-NARRATION STYLE:
-Write {cfg['headline']}
-{voice_lines}
-- PACING: {cfg['pacing']}
-- OPENING: {cfg['opening']}
-{duration_guide}{custom_hint_section}{khmer_specific_guide}
-
-CRITICAL SCENE SYNCHRONIZATION RULES (ការផ្គូផ្គងសកម្មភាពក្នុងឈុតឆាក):
-1. EXACT SCENE MATCH: Every segment's start_time and end_time MUST align with the exact moment the action or scene happens on screen.
-   - If a character appears at 0:15 and runs away at 0:20, narrate that specific action between 15.0s and 20.0s.
-   - Do NOT narrate events before they appear on screen or after the scene has already changed.
-2. NATURAL DURATION & BREATH GAPS:
-   - Make each spoken line concise so it can be spoken comfortably within its allotted time slot (~3-4 words or 12-16 Khmer characters per second).
-   - Leave small natural breath gaps (0.5s - 1.0s) between distinct scenes.
-3. STORY ARC PROGRESSION:
-   - Accurately describe characters, weapons, plot twists, emotional stakes, and resolutions based directly on what is seen in the footage.
-
-Return a JSON array of segments. Two segment types are allowed:
-[
-  {{"start_time": 0.0, "end_time": 4.5, "type": "narration", "text": "narration text in {lang_name}", "emotion": "excited"}},
-  {{"start_time": 5.0, "end_time": 7.5, "type": "dialogue", "speaker": "Character Name", "gender": "female", "text": "the actor's line in {lang_name}", "emotion": "angry"}}
-]
-
-{dialogue_directive}
-- For dialogue segments: transcribe and translate the line, keep it short. Set "speaker" and "gender" ("male" or "female").
-- Narration and dialogue segments must NOT overlap.
-- "emotion": one of cheerful, happy, excited, sad, angry, calm, serious, fearful, whisper, neutral.
-
-Rules:
-- TEXT must be in natural {lang_name} suited for movie recap narration.
-- SHORT & CRISP: Each segment must be easy to speak comfortably within its timestamps.
-- COMPLETE COVERAGE: Cover the entire video from start to end ({duration_str if video_duration > 0 else 'full length'}).
-- JSON ONLY: Output ONLY the raw JSON array. No markdown fences, no explanation."""
-
-    return prompt, cfg["temperature"]
-
-
-async def generate_narration(
-    video_path: str,
-    language: str = "km",
-    style: str = "recap_viral",
-    prompt_hint: str = "",
-    video_duration: float = 0.0,
-) -> list:
-    """
-    Generate AI narration/voiceover script from video using lightweight media proxy for ultra-fast generation.
-    Returns a list of narration segments with timestamps and text.
-    """
-    prompt, temperature = _build_narration_prompt(
-        language, style, prompt_hint=prompt_hint, video_duration=video_duration
-    )
-    media_path, tmp_dir = await _build_media_proxy_for_gemini(video_path)
-
-    keys = await _get_active_keys()
-    if not keys:
-        if not settings.gemini_api_key or settings.gemini_api_key == "your_gemini_api_key_here":
-            raise RuntimeError("No API keys configured. Please add a Gemini API key in Settings.")
-        keys = [settings.gemini_api_key]
-
-    models_to_try = [
-        settings.gemini_model or "gemini-2.5-flash",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro",
-    ]
-    seen = set()
-    models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
-
-    last_err = None
-    response_text = ""
-
-    try:
-        for key_idx, key in enumerate(keys):
-            genai.configure(api_key=key)
-            uploaded_file = None
-            try:
-                uploaded_file = await asyncio.to_thread(genai.upload_file, media_path)
-                poll_count = 0
-                while uploaded_file.state.name == "PROCESSING":
-                    poll_count += 1
-                    if poll_count > 30:
-                        break
-                    await asyncio.sleep(0.5)
-                    uploaded_file = await asyncio.to_thread(genai.get_file, uploaded_file.name)
-
-                if uploaded_file.state.name == "FAILED":
-                    continue
-
-                for m_name in models_to_try:
-                    try:
-                        model = genai.GenerativeModel(m_name)
-                        response = await asyncio.to_thread(
-                            model.generate_content,
-                            [uploaded_file, prompt],
-                            generation_config=genai.types.GenerationConfig(
-                                temperature=temperature,
-                                response_mime_type="application/json",
-                                max_output_tokens=65536,
-                            ),
-                        )
-                        if response and response.text:
-                            response_text = response.text.strip()
-                            break
-                    except Exception as me:
-                        last_err = me
-                        continue
-
-                if response_text:
-                    break
-            except Exception as ke:
-                last_err = ke
-                continue
-            finally:
-                if uploaded_file:
-                    try:
-                        await asyncio.to_thread(genai.delete_file, uploaded_file.name)
-                    except Exception:
-                        pass
-
-        if not response_text:
-            raise RuntimeError(f"Narration generation failed: {last_err or 'No response from AI model'}")
-
-        # Parse response
-        text = response_text
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\n?", "", text)
-            text = re.sub(r"\n?```$", "", text)
-
-        raw_data = _safe_json_loads(text)
-        segments = []
-        if isinstance(raw_data, list):
-            segments = raw_data
-        elif isinstance(raw_data, dict):
-            for k in ["segments", "narration", "blocks", "scenes", "cues", "data", "script"]:
-                if isinstance(raw_data.get(k), list):
-                    segments = raw_data[k]
-                    break
-            else:
-                segments = [raw_data]
-
-        cleaned = []
-        for i, seg in enumerate(segments):
-            if not isinstance(seg, dict):
-                continue
-            seg_text = str(seg.get("text", "")).strip()
-            # Strip watermark URLs Gemini may have read off the video
-            seg_text = re.sub(r"(?:https?://|www\.)\S+", "", seg_text).strip()
-            if not seg_text:
-                continue
-            seg_type = str(seg.get("type") or "narration").lower()
-            cleaned.append({
-                "index": i,
-                "start_time": float(seg.get("start_time", 0)),
-                "end_time": float(seg.get("end_time", 0)),
-                "text": seg_text,
-                "type": seg_type if seg_type in ("narration", "dialogue") else "narration",
-                "speaker": str(seg.get("speaker") or "").strip(),
-                "gender": str(seg.get("gender") or "").strip().lower(),
-                "emotion": str(seg.get("emotion") or "").strip().lower(),
-            })
-        return cleaned
-
-    finally:
-        if tmp_dir and os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-async def _extract_audio_for_gemini(video_path: str) -> tuple[str, str | None]:
-    """Extract audio from video file to high-efficiency MP3 (16kHz Mono 64k).
-    Takes <0.1s and produces a tiny file (~200KB per 30s) that uploads to Gemini
-    instantly and processes with maximum accuracy."""
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        return video_path, None
-    tmp_dir = tempfile.mkdtemp(prefix="gemini_audio_")
-    audio_path = os.path.join(tmp_dir, "audio.mp3")
-    cmd = [
-        ffmpeg, "-y",
-        "-i", video_path,
-        "-vn",
-        "-acodec", "libmp3lame",
-        "-ar", "16000",
-        "-ac", "1",
-        "-b:a", "64k",
-        audio_path,
-    ]
-    res = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
-    if res.returncode == 0 and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-        return audio_path, tmp_dir
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    return video_path, None
-
-
-async def _build_media_proxy_for_gemini(video_path: str) -> tuple[str, str | None]:
-    """Extract audio directly for crystal-clear, fast, 100% complete dialogue recognition."""
-    audio_path, tmp_dir = await _extract_audio_for_gemini(video_path)
-    if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-        return audio_path, tmp_dir
-    return video_path, None
-
-
-async def _transcribe_media_with_fallback(media_path: str, prompt: str) -> list:
-    """Upload media file with key rotation and generate transcript segments with model fallback."""
-    keys = await _get_active_keys()
-    if not keys:
-        if not settings.gemini_api_key or settings.gemini_api_key == "your_gemini_api_key_here":
-            raise RuntimeError("No API keys configured. Please add a Gemini API key in Settings.")
-        keys = [settings.gemini_api_key]
-
-    models_to_try = [
-        settings.gemini_model or "gemini-3.1-flash-lite",
-        "gemini-3.1-flash-lite",
-        "gemini-3.5-flash-lite",
-        "gemini-3.5-flash",
-        "gemini-3.6-flash",
-        "gemini-flash-latest",
-        "gemini-flash-lite-latest",
-    ]
-    seen = set()
-    models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
-
-    last_err = None
-    for key_idx, key in enumerate(keys):
-        genai.configure(api_key=key)
-        uploaded_file = None
+            clean_new.append(n_seg)
+    return clean_new
+
+
+async def _cut_audio(src: str, start: float, length: float, tmp_dir: str) -> str:
+    out = os.path.join(tmp_dir, f"span_{uuid.uuid4().hex}.mp3")
+    cmd = [shutil.which("ffmpeg") or "ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", src, "-t", f"{length:.3f}",
+           "-vn", "-c:a", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k", out]
+    r = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0 or not os.path.exists(out):
+        raise RuntimeError(f"audio cut failed: {r.stderr[-200:]}")
+    return out
+
+
+async def _transcribe_span(path: str, offset: float, duration: float, prompt: str, tmp_dir: str, failed: list) -> list:
+    """Transcribe one audio file whose time 0 is `offset` in the video.
+    Content blocks and truncated responses are retried by halving the span, so one bad scene
+    only loses a short stretch. Spans that still fail are appended to `failed` and skipped."""
+    last_err: Exception | None = None
+    for attempt in range(TRANSCRIBE_ATTEMPTS):
         try:
-            uploaded_file = await asyncio.to_thread(genai.upload_file, media_path)
-            poll_count = 0
-            while uploaded_file.state.name == "PROCESSING":
-                poll_count += 1
-                if poll_count > 60:
-                    break
-                await asyncio.sleep(1)
-                uploaded_file = await asyncio.to_thread(genai.get_file, uploaded_file.name)
+            segs = await _transcribe_media_with_fallback(path, prompt)
+        except (GeminiBlocked, GeminiTruncated) as e:
+            if duration / 2 >= MIN_SPLIT_SECONDS:
+                half = duration / 2
+                print(f"[transcribe] {_fmt_clock(offset)}+{duration:.0f}s {e}; splitting in half", flush=True)
+                first = await _cut_audio(path, 0, half, tmp_dir)
+                second = await _cut_audio(path, half - SPLIT_OVERLAP, duration - half + SPLIT_OVERLAP, tmp_dir)
+                a = await _transcribe_span(first, offset, half, prompt, tmp_dir, failed)
+                b = await _transcribe_span(second, offset + half - SPLIT_OVERLAP, duration - half + SPLIT_OVERLAP, prompt, tmp_dir, failed)
+                return a + _filter_boundary_duplicates(a, b)
+            partial = e.segments if isinstance(e, GeminiTruncated) else []
+            failed.append((offset, offset + duration, str(e)))
+            segs = partial
+        except Exception as e:
+            last_err = e
+            quota = any(x in str(e).lower() for x in ["429", "quota", "exhausted"])
+            if attempt + 1 < TRANSCRIBE_ATTEMPTS:
+                await asyncio.sleep((10.0 if quota else 3.0) * (attempt + 1))
+            continue
+        for seg in segs:
+            seg["start_time"] = round(seg["start_time"] + offset, 2)
+            seg["end_time"] = round(seg["end_time"] + offset, 2)
+        return segs
 
-            if uploaded_file.state.name == "FAILED":
-                continue
-
-            for m_name in models_to_try:
-                try:
-                    model = genai.GenerativeModel(m_name)
-                    response = await asyncio.to_thread(
-                        model.generate_content,
-                        [uploaded_file, prompt],
-                        generation_config=genai.types.GenerationConfig(
-                            temperature=0,
-                            response_mime_type="application/json",
-                            max_output_tokens=65536,
-                        ),
-                    )
-                    segments = _parse_segments(response.text)
-                    if isinstance(segments, list):
-                        return segments
-                except Exception as me:
-                    last_err = me
-                    err_str = str(me).lower()
-                    print(f"[gemini] Key {key_idx+1} Model {m_name} failed: {me}", flush=True)
-                    if any(x in err_str for x in ["429", "quota", "exhausted", "resource"]):
-                        await asyncio.sleep(2.0)
-                    continue
-        except Exception as ke:
-            last_err = ke
-            print(f"[gemini] Key {key_idx+1} upload/transcribe failed: {ke}", flush=True)
-        finally:
-            if uploaded_file:
-                try:
-                    await asyncio.to_thread(genai.delete_file, uploaded_file.name)
-                except Exception:
-                    pass
-
-    raise last_err or Exception("All Gemini API keys and models failed to transcribe media")
+    reason = str(last_err)
+    if any(x in reason.lower() for x in ["429", "quota", "exhausted"]):
+        reason = "Gemini quota exceeded"
+    failed.append((offset, offset + duration, reason[:120]))
+    return []
 
 
-async def transcribe_video(video_path: str, language: str = "km") -> list:
-    """
-    Transcribe video using lightweight multimodal proxy with automatic multi-key and multi-model fallback.
-    Auto-detects source language, correlates visual speech & audio, and formats natural captions.
-    """
+def _missing_ranges_warning(failed: list) -> str | None:
+    if not failed:
+        return None
+    parts = [f"{_fmt_clock(a)}–{_fmt_clock(b)} ({why})" for a, b, why in sorted(failed)]
+    return "Some parts could not be transcribed: " + "; ".join(parts) + ". Use Fill gaps to retry them."
+
+
+async def transcribe_video(video_path: str, language: str = "km", shared_glossary: str = "") -> list:
+    """Transcribe a (short) video or clip in one pass; blocked scenes are split and skipped."""
     media_path, tmp_dir = await _build_media_proxy_for_gemini(video_path)
-    prompt = _build_prompt(language)
+    work_dir = tempfile.mkdtemp(prefix="gemini_spans_")
     try:
-        segments = await _transcribe_media_with_fallback(media_path, prompt)
+        duration = await _get_video_duration(media_path)
+        failed: list = []
+        segments = await _transcribe_span(media_path, 0.0, duration, _build_prompt(language) + shared_glossary, work_dir, failed)
+        if failed and not segments:
+            raise RuntimeError(_missing_ranges_warning(failed))
         return segments
     finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
         if tmp_dir and os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _iter_chunks_sync(model, content, prompt, chunk_queue: queue.Queue):
-    """Synchronous helper that pushes streaming chunks into a queue (runs in a thread)."""
-    try:
-        response = model.generate_content(
-            [content, prompt],
-            stream=True,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.1,
-                top_p=0.95,
-            ),
-        )
-        for chunk in response:
-            if chunk.text:
-                chunk_queue.put(chunk.text)
-    except Exception as e:
-        chunk_queue.put(e)
-    finally:
-        chunk_queue.put(None)  # sentinel: stream finished
-
-
-async def transcribe_video_streaming(video_path: str, language: str = "km", on_progress=None) -> AsyncGenerator:
+async def transcribe_video_streaming(video_path: str, language: str = "km", on_progress=None, shared_glossary: str = "") -> AsyncGenerator:
     """
-    Upload video/audio to Gemini and get transcription segments.
-    For long videos (>6 min), splits into ~5-minute chunks and transcribes each
-    separately for better coverage. Yields dicts: either {"_progress": "message"}
-    for status updates, or segment dicts with start_time/end_time/text/speaker.
+    Transcribe a video's audio with Gemini.
+    Long videos are split into CHUNK_DURATION parts (with CHUNK_OVERLAP lead-in) transcribed in
+    parallel; each part's segments stream out as soon as every earlier part is done. A part that
+    fails is skipped rather than aborting the whole run, and a final {"_warning": ...} item lists
+    the missing time ranges.
+    Yields {"_progress": ...}, segment dicts, and at most one {"_warning": ...}.
     """
+    yield {"_progress": "Analyzing video audio timeline...", "percent": 3}
     await _configure_genai()
-
-    yield {"_progress": "Analyzing video length..."}
 
     duration = await _get_video_duration(video_path)
-    prompt = _build_prompt(language)
-
-    if duration > CHUNK_THRESHOLD:
-        # ---- Long video: split into chunks and transcribe each ----
-        num_chunks = int(duration // CHUNK_DURATION) + (1 if duration % CHUNK_DURATION > 0 else 0)
-        yield {
-            "_progress": f"Video is {int(duration)}s ({int(duration//60)}m {int(duration%60)}s) — transcribing {num_chunks} parts with full speech coverage...",
-            "current_chunk": 0,
-            "total_chunks": num_chunks,
-            "percent": 5,
-        }
-
-        chunks, tmp_dir = await _split_video_chunks(video_path)
-        all_segments = []
-
-        chunk_prompt = prompt + (
-            "\n\nCRITICAL MANDATE: This audio segment is part of a full-length video transcription. "
-            "You MUST transcribe EVERY single spoken utterance from 0.0s to the very end of this clip. "
-            "Never omit whispers, background dialogue, rapid speech, voiceovers, or quiet remarks. "
-            "Output granular 1.0 to 3.5 second segments for every sentence."
-        )
-
-        def _filter_boundary_duplicates(existing_segments: list, new_segments: list) -> list:
-            if not existing_segments:
-                return new_segments
-            if not new_segments:
-                return []
-
-            clean_new = []
-            for n_seg in new_segments:
-                n_start = n_seg.get("start_time", 0.0)
-                n_end = n_seg.get("end_time", 0.0)
-                n_text = str(n_seg.get("text", "")).strip()
-                n_orig = str(n_seg.get("original_text", "")).strip()
-                if not n_text and not n_orig:
-                    continue
-
-                is_dup = False
-                # Check only the most recent boundary segments (within boundary window)
-                for ex_seg in reversed(existing_segments[-20:]):
-                    ex_start = ex_seg.get("start_time", 0.0)
-                    ex_end = ex_seg.get("end_time", 0.0)
-                    ex_text = str(ex_seg.get("text", "")).strip()
-                    ex_orig = str(ex_seg.get("original_text", "")).strip()
-
-                    # Only check segments within boundary overlap window (CHUNK_OVERLAP + 2.0s)
-                    if abs(n_start - ex_start) > (CHUNK_OVERLAP + 2.5):
-                        continue
-
-                    # Calculate temporal overlap
-                    ov_start = max(n_start, ex_start)
-                    ov_end = min(n_end, ex_end)
-                    ov_len = max(0.0, ov_end - ov_start)
-                    min_dur = max(0.2, min(n_end - n_start, ex_end - ex_start))
-
-                    # True boundary duplicate: high temporal overlap (>50%) AND matching text
-                    if ov_len / min_dur > 0.4:
-                        if (n_text and ex_text and n_text == ex_text) or (n_orig and ex_orig and n_orig == ex_orig):
-                            is_dup = True
-                            break
-                        if len(n_orig) > 6 and len(ex_orig) > 6 and (n_orig in ex_orig or ex_orig in n_orig):
-                            is_dup = True
-                            break
-
-                    # Boundary timestamp collision (< 0.8s apart) with identical text
-                    if abs(n_start - ex_start) < 0.8 and ((n_text and ex_text and n_text == ex_text) or (n_orig and ex_orig and n_orig == ex_orig)):
-                        is_dup = True
-                        break
-
-                if not is_dup:
-                    clean_new.append(n_seg)
-            return clean_new
-
-        async def _process_chunk(i: int, chunk_path: str, start_offset: float) -> tuple[int, list]:
-            """Upload, transcribe, and offset one chunk with automatic retry across keys and models."""
-            for attempt in range(4):
-                try:
-                    chunk_segments = await _transcribe_media_with_fallback(chunk_path, chunk_prompt)
-                    if isinstance(chunk_segments, list):
-                        for seg in chunk_segments:
-                            seg["start_time"] = round(seg["start_time"] + start_offset, 2)
-                            seg["end_time"] = round(seg["end_time"] + start_offset, 2)
-                        print(f"[transcribe] Chunk {i+1}/{len(chunks)}: offset={start_offset:.1f}s -> {len(chunk_segments)} segments", flush=True)
-                        return (i, chunk_segments)
-                except Exception as e:
-                    err_str = str(e).lower()
-                    sleep_s = 5.0 * (attempt + 1) if any(x in err_str for x in ["429", "quota", "exhausted", "resource"]) else (2.0 * (attempt + 1))
-                    print(f"[transcribe] Chunk {i+1} attempt {attempt+1} failed: {e} -> retrying in {sleep_s:.1f}s", flush=True)
-                    await asyncio.sleep(sleep_s)
-            return (i, [])
-
-        try:
-            total_c = len(chunks)
-            # Semaphore limits how many chunks upload+transcribe simultaneously
-            sem = asyncio.Semaphore(MAX_PARALLEL_CHUNKS)
-
-            async def _process_chunk_limited(i: int, chunk_path: str, start_offset: float) -> tuple[int, list]:
-                async with sem:
-                    return await _process_chunk(i, chunk_path, start_offset)
-
-            # Launch ALL chunks concurrently (semaphore controls actual parallelism)
-            tasks = [
-                asyncio.create_task(_process_chunk_limited(i, cp, off))
-                for i, (cp, off) in enumerate(chunks)
-            ]
-
-            # Yield progress updates as tasks complete
-            completed = 0
-            chunk_results: list[list] = [[] for _ in range(total_c)]
-
-            # Report initial progress
-            yield {
-                "_progress": f"Transcribing {total_c} parts in parallel (up to {MAX_PARALLEL_CHUNKS} at once)...",
-                "current_chunk": 0,
-                "total_chunks": total_c,
-                "percent": 8,
-            }
-
-            for future in asyncio.as_completed(tasks):
-                idx_done, segs = await future
-                chunk_results[idx_done] = segs
-                completed += 1
-                pct = round(8 + (completed / total_c) * 88)
-                yield {
-                    "_progress": f"Completed part {completed}/{total_c}...",
-                    "current_chunk": completed,
-                    "total_chunks": total_c,
-                    "percent": pct,
-                }
-
-            # Merge in time order and stream out
-            all_segments = []
-            for segs in chunk_results:
-                if segs:
-                    clean_segs = _filter_boundary_duplicates(all_segments, segs)
-                    all_segments.extend(clean_segs)
-                    for seg in clean_segs:
-                        yield seg
-
-            yield {
-                "_progress": f"Transcribed {len(all_segments)} total caption lines across full video",
-                "current_chunk": total_c,
-                "total_chunks": total_c,
-                "percent": 100,
-            }
-
-        finally:
-            if tmp_dir and os.path.isdir(tmp_dir):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-
+    prompt = _build_prompt(language) + shared_glossary
+    long_video = duration > CHUNK_THRESHOLD
+    if long_video:
+        prompt += _CHUNK_TIMING_NOTE
+        n = int(duration // CHUNK_DURATION) + (1 if duration % CHUNK_DURATION > 0 else 0)
+        yield {"_progress": f"Video is {_fmt_clock(duration)} — transcribing {n} parts...", "current_chunk": 0, "total_chunks": n, "percent": 5}
     else:
-        # ---- Short video: transcribe with multimodal video proxy ----
-        yield {
-            "_progress": "Preparing video for AI speech recognition...",
-            "current_chunk": 0,
-            "total_chunks": 1,
-            "percent": 20,
-        }
+        yield {"_progress": "Preparing audio for speech recognition...", "current_chunk": 0, "total_chunks": 1, "percent": 5}
 
-        media_path, tmp_dir = await _build_media_proxy_for_gemini(video_path)
-        try:
-            yield {
-                "_progress": "AI is analyzing visual speech and dialogue...",
-                "current_chunk": 1,
-                "total_chunks": 1,
-                "percent": 55,
-            }
-            segments = await _transcribe_media_with_fallback(media_path, prompt)
-            yield {
-                "_progress": f"Generated {len(segments)} caption lines",
-                "current_chunk": 1,
-                "total_chunks": 1,
-                "percent": 98,
-            }
+    chunks, tmp_dir = await _split_video_chunks(video_path)
+    work_dir = tempfile.mkdtemp(prefix="gemini_spans_")
+    failed: list = []
+    total_c = len(chunks)
+    sem = asyncio.Semaphore(MAX_PARALLEL_CHUNKS)
 
-            for seg in segments:
-                yield seg
-        finally:
-            if tmp_dir and os.path.exists(tmp_dir):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+    async def _run(i: int, path: str, offset: float) -> tuple[int, list]:
+        async with sem:
+            length = await _get_video_duration(path) or (duration - offset)
+            segs = await _transcribe_span(path, offset, length, prompt, work_dir, failed)
+            print(f"[transcribe] Part {i + 1}/{total_c} @ {_fmt_clock(offset)} -> {len(segs)} segments", flush=True)
+            return i, segs
 
+    tasks = [asyncio.create_task(_run(i, p, off)) for i, (p, off) in enumerate(chunks)]
+    try:
+        yield {"_progress": f"Transcribing {total_c} part(s), up to {MAX_PARALLEL_CHUNKS} at once...",
+               "current_chunk": 0, "total_chunks": total_c, "percent": 8}
+        results: list[list | None] = [None] * total_c
+        next_to_emit = 0
+        emitted: list = []
+        completed = 0
+        pending = set(tasks)
+        started_at = asyncio.get_running_loop().time()
+        while pending:
+            done, pending = await asyncio.wait(pending, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                elapsed = int(asyncio.get_running_loop().time() - started_at)
+                yield {"_progress": f"Waiting for AI speech recognition ({elapsed}s elapsed); {completed}/{total_c} parts processed...",
+                       "current_chunk": completed, "total_chunks": total_c,
+                       "percent": round(8 + (completed / total_c) * 88)}
+                continue
+            for task in done:
+                idx, segs = task.result()
+                results[idx] = segs
+                completed += 1
+            yield {"_progress": f"Processed {completed}/{total_c} parts; saving captions...", "current_chunk": completed,
+                   "total_chunks": total_c, "percent": round(8 + (completed / total_c) * 88)}
+            while next_to_emit < total_c and results[next_to_emit] is not None:
+                clean = _filter_boundary_duplicates(emitted, results[next_to_emit])
+                emitted.extend(clean)
+                results[next_to_emit] = []
+                next_to_emit += 1
+                for seg in clean:
+                    yield seg
 
-def _deduplicate_chunk_segments(segments: list) -> list:
-    """Remove duplicate segments that may appear at chunk boundary overlaps.
-    Preserves all dialogue turns, quick character replies, and distinct utterances."""
-    if not segments:
-        return []
+        if not emitted and failed:
+            raise RuntimeError(_missing_ranges_warning(failed))
+        yield {"_progress": f"Finalizing {len(emitted)} caption lines...", "current_chunk": total_c,
+               "total_chunks": total_c, "percent": 99}
+        warning = _missing_ranges_warning(failed)
+        if warning:
+            yield {"_warning": warning}
+    finally:
+        # On failure or client disconnect, stop remaining parts from burning API quota
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        if tmp_dir and os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    result = [segments[0]]
-    for seg in segments[1:]:
-        prev = result[-1]
-        cur_text = str(seg.get("text", "")).strip()
-        prev_text = str(prev.get("text", "")).strip()
-
-        # Only drop if it is truly the exact same text spoken at almost the exact same timestamp (< 0.6s difference)
-        if cur_text and prev_text and cur_text == prev_text and abs(seg["start_time"] - prev["start_time"]) < 0.6:
-            continue
-
-        # If huge overlap (>85%) with identical text
-        overlap_start = max(prev["start_time"], seg["start_time"])
-        overlap_end = min(prev["end_time"], seg["end_time"])
-        overlap = max(0, overlap_end - overlap_start)
-        seg_duration = max(0.1, seg["end_time"] - seg["start_time"])
-        if overlap / seg_duration > 0.85 and cur_text == prev_text:
-            continue
-
-        result.append(seg)
-
-    return result
-
-
-async def translate_text(text: str, target_language: str = "km") -> str:
-    """Translate a single text segment using Gemini."""
-    await _configure_genai()
-    lang_map = {
-        "km": "Khmer", "en": "English", "zh": "Chinese (Mandarin)",
-        "ja": "Japanese", "ko": "Korean", "th": "Thai",
-        "vi": "Vietnamese", "fr": "French", "es": "Spanish",
-        "de": "German", "pt": "Portuguese", "ru": "Russian",
-        "ar": "Arabic", "hi": "Hindi", "id": "Indonesian", "ms": "Malay",
-    }
-    lang_name = lang_map.get(target_language, target_language)
-    model = genai.GenerativeModel(settings.gemini_model)
-
-    prompt = f"""You are a professional translator. Translate the following text to {lang_name}.
-- The translation must be natural and fluent, not word-for-word literal.
-- Preserve the original meaning, tone, and intent.
-- Use vocabulary and grammar that native {lang_name} speakers would naturally use.
-- Keep proper nouns and brand names as-is.
-- Return ONLY the translated text, nothing else.
-
-{text}"""
-    response = await asyncio.to_thread(model.generate_content, prompt)
-    return response.text.strip()
-
-def _extract_translated_list(parsed, expected_len: int) -> list[str]:
-    """Robustly extract translated strings from any JSON structure returned by Gemini."""
-    out = [""] * expected_len
-    if isinstance(parsed, list):
-        for idx_item, item in enumerate(parsed):
-            if isinstance(item, dict):
-                raw_idx = item.get("index") or item.get("id") or item.get("line") or item.get("no") or (idx_item + 1)
-                try:
-                    idx = int(raw_idx) - 1
-                except (ValueError, TypeError):
-                    idx = idx_item
-
-                txt = ""
-                for key in ["text", "translation", "translated_text", "translated", "khmer", "target", "content", "msg", "line_text"]:
-                    if key in item and item[key]:
-                        txt = str(item[key]).strip()
-                        break
-                if not txt and len(item) == 1:
-                    txt = str(list(item.values())[0]).strip()
 
 def _extract_translated_list(parsed, expected_len: int) -> list[dict]:
     out = [{"text": "", "speaker": ""} for _ in range(expected_len)]
@@ -1748,20 +372,90 @@ def _extract_translated_list(parsed, expected_len: int) -> list[dict]:
     return out
 
 
-def _build_translation_prompt(chunk_segs: list, target_language: str, lang_name: str) -> str:
-    lines_formatted = []
-    for i, seg in enumerate(chunk_segs):
-        spk = seg.get("speaker") or ""
-        txt = seg.get("original_text") or seg.get("text", "")
-        if spk:
-            lines_formatted.append(f"{i+1}. [{spk}]: {txt}")
-        else:
-            lines_formatted.append(f"{i+1}. {txt}")
-    numbered = "\n".join(lines_formatted)
+# Khmer dubbing runs at about this many characters a second; a translation longer than its
+# slot allows has to be sped up, or runs into the next line.
+DUB_CHARS_PER_SECOND = 16.0
+CONTEXT_BEFORE = 4            # earlier lines shown to the translator for continuity
+CONTEXT_AFTER = 2
+GLOSSARY_MIN_LINES = 12       # below this the lines themselves are context enough
+GLOSSARY_MAX_CHARS = 60000    # dialogue sent to build the glossary
+_MALE_PROFILES = {"male", "grandpa", "child_boy"}
+_PROFILE_WORDS = {
+    "male": "man", "female": "woman", "grandpa": "old man", "grandma": "old woman",
+    "child_boy": "boy", "child_girl": "girl", "child": "child",
+}
 
-    if target_language in ("km", "auto", ""):
+
+def _source_text(seg: dict) -> str:
+    return (seg.get("original_text") or seg.get("text") or "").strip()
+
+
+def _line_label(seg: dict, with_gender: bool) -> str:
+    parts = [p for p in ((seg.get("speaker") or "").strip(),
+                         _PROFILE_WORDS.get((seg.get("voice_profile") or "").lower(), "") if with_gender else "") if p]
+    return f"[{', '.join(parts)}]: " if parts else ""
+
+
+def _time_budget(seg: dict, target: str) -> str:
+    try:
+        seconds = float(seg.get("end_time")) - float(seg.get("start_time"))
+    except (TypeError, ValueError):
+        return ""
+    if seconds <= 0.2:
+        return ""
+    if target == "km":
+        return f"({seconds:.1f}s, about {max(12, int(seconds * DUB_CHARS_PER_SECOND))} characters) "
+    return f"({seconds:.1f}s) "
+
+
+def _context_block(title: str, lines: list, with_gender: bool) -> str:
+    """Neighbouring lines, with the translation they already have when there is one."""
+    rows = []
+    for seg in lines or []:
+        source = _source_text(seg)
+        if not source:
+            continue
+        done = (seg.get("translation") or "").strip()
+        rows.append(f"- {_line_label(seg, with_gender)}{source}" + (f"  =>  {done}" if done and done != source else ""))
+    return f"\n{title}\n" + "\n".join(rows) + "\n" if rows else ""
+
+
+def _build_translation_prompt(
+    chunk_segs: list,
+    target_language: str,
+    lang_name: str,
+    glossary: str = "",
+    before: list | None = None,
+    after: list | None = None,
+    with_gender: bool = False,
+) -> str:
+    target = "km" if target_language in ("km", "auto", "") else target_language
+    numbered = "\n".join(
+        f"{i + 1}. {_time_budget(seg, target)}{_line_label(seg, with_gender)}{_source_text(seg)}"
+        for i, seg in enumerate(chunk_segs)
+    )
+    context = (
+        _context_block("EARLIER LINES — for understanding only, do not translate or return them:", before, with_gender)
+        + _context_block("LINES THAT FOLLOW — for understanding only, do not translate or return them:", after, with_gender)
+    )
+    if context:
+        context += ('Where an earlier line shows "source  =>  translation", keep names, pronouns and tone '
+                    "consistent with that translation.\n")
+    glossary_block = (
+        f"\nGLOSSARY AND CHARACTER NOTES — use these renderings exactly, every time:\n{glossary}\n" if glossary else ""
+    )
+    gender_rule = (
+        "\n   - The label after a speaker (man, woman, boy…) is the voice that was heard. Let it decide "
+        "gendered words; if the dialogue plainly contradicts it, trust the dialogue."
+        if with_gender else ""
+    )
+
+    if target == "km":
         return f"""You are a master cinematic subtitle and movie dubbing translator specializing in Cambodian Khmer (ភាសាខ្មែរ).
-Translate the following sequential video dialogue lines into natural, fluent, and expressive spoken Khmer (ភាសានិយាយភាពយន្ត / សម្រាយរឿង).
+Translate the following sequential video dialogue lines into natural, fluent spoken Khmer dialogue.
+These are existing subtitle cues: a sentence may continue across several cues. Read them together
+to understand the sentence, but return each cue separately with its own meaning and index.
+Do not turn dialogue into narration, add explanations, invent relationships, or move meaning between cues.
 
 CRITICAL LOCALIZATION & TRANSLATION RULES:
 1. NATURAL SPOKEN KHMER (ភាសាខ្មែរ):
@@ -1772,12 +466,19 @@ CRITICAL LOCALIZATION & TRANSLATION RULES:
 
 2. CHARACTER NAMES & SPEAKER TRANSLATION:
    - Localize all speaker and character names into Cambodian Khmer pronunciation (e.g. 唐伯虎 -> តាំង ប៉ូហ៊ូ, 秋香 -> ឈីវស៊ាង, 华夫人 -> លោកស្រី ហួ, 石榴姐 -> អ្នកបង ស៊ីលៀវ).
+   - A name is spelled the same way every time it appears. When a glossary is given, its spelling is the one to use.
    - NEVER output Chinese characters for speaker names.
    - DO NOT include speaker name prefixes in the "text" field.
 
 3. CONTEXTUAL PRONOUNS:
    - Use natural Khmer dialogue pronouns: បង/អូន (couples), ឯង/យើង (friends), ខ្ញុំ/លោក (polite), ឯង/អញ (rivals/enemies).
+   - A man answers បាទ and a woman ចាស; keep each character's way of speaking the same from line to line.{gender_rule}
 
+4. FIT THE TIME — THESE LINES WILL BE SPOKEN:
+   - Each line starts with how long the character speaks and roughly how many Khmer characters fit in that time.
+   - Stay within that length: choose the shorter natural phrasing and drop filler words. Never pad a short line.
+   - Meaning comes first. If a line cannot be said that briefly without losing what matters, go a little over rather than cut the meaning.
+{glossary_block}{context}
 Return a JSON array of objects:
 [
   {{"index": 1, "speaker": "Character name in Khmer (e.g. តាំង ប៉ូហ៊ូ)", "text": "Translated Khmer dialogue ONLY"}}
@@ -1787,15 +488,16 @@ Return ONLY valid JSON array without markdown formatting.
 
 Lines to translate:
 {numbered}"""
-    else:
-        return f"""You are a master video subtitle and film dialogue translator. Translate the following sequential dialogue lines into natural, fluent {lang_name}.
+    return f"""You are a master video subtitle and film dialogue translator. Translate the following sequential dialogue lines into natural, fluent {lang_name}.
 
 Translation rules:
 - Produce natural, fluent {lang_name} dialogue suited for cinematic subtitles and dubbing — NOT literal word-for-word machine translation.
 - Accurately preserve the original meaning, character emotion, and dramatic context.
 - Use vocabulary and phrasing that native {lang_name} speakers naturally use in films and videos.
+- Spell each name the same way every time. When a glossary is given, use its spelling.{gender_rule}
 - DO NOT include speaker name prefixes in your translated "text" output.
-- Keep each line concise and suitable for timed video subtitles.
+- Each line starts with how long it is on screen. Keep the translation short enough to be read or spoken in that time.
+{glossary_block}{context}
 - Return a JSON array of objects: [{{"index": 1, "speaker": "Character Name", "text": "translated dialogue"}}, ...] matching all {len(chunk_segs)} lines.
 Return ONLY valid JSON array without markdown formatting.
 
@@ -1803,1063 +505,401 @@ Lines to translate:
 {numbered}"""
 
 
-async def translate_segments(segments: list, target_language: str = "km") -> list:
-    """Translate all subtitle segments into the target language using Gemini."""
-    if not segments:
-        return []
+TRANSLATION_LANGUAGES = {
+    "km": "Khmer (ភាសាខ្មែរ)",
+    "en": "English",
+    "zh": "Chinese (Mandarin)",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "fr": "French",
+    "es": "Spanish",
+    "de": "German",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "ar": "Arabic",
+    "hi": "Hindi",
+    "id": "Indonesian",
+    "ms": "Malay",
+}
+TRANSLATE_CHUNK_SIZE = 30
+MAX_PARALLEL_TRANSLATIONS = 3
+TRANSLATE_ATTEMPTS = 2
+_TRANSLATION_CACHE_MAX = 500  # chunks
 
-    effective_target = "km" if target_language in ("km", "auto", "") else target_language
-
-    lang_map = {
-        "km": "Khmer (ភាសាខ្មែរ)",
-        "en": "English",
-        "zh": "Chinese (Mandarin)",
-        "ja": "Japanese",
-        "ko": "Korean",
-        "th": "Thai",
-        "vi": "Vietnamese",
-        "fr": "French",
-        "es": "Spanish",
-        "de": "German",
-        "pt": "Portuguese",
-        "ru": "Russian",
-        "ar": "Arabic",
-        "hi": "Hindi",
-        "id": "Indonesian",
-        "ms": "Malay",
-    }
-    lang_name = lang_map.get(effective_target, effective_target)
-
-    await _configure_genai()
-
-    CHUNK_SIZE = 35
-    translated_data = [{}] * len(segments)
-
-    for start_idx in range(0, len(segments), CHUNK_SIZE):
-        end_idx = min(start_idx + CHUNK_SIZE, len(segments))
-        chunk_segs = segments[start_idx:end_idx]
-        prompt = _build_translation_prompt(chunk_segs, effective_target, lang_name)
-
-        try:
-            response = await _generate_with_fallback(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.2,
-                    response_mime_type="application/json",
-                ),
-            )
-
-            raw = response.text.strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"^```(?:json)?\n?", "", raw)
-                raw = re.sub(r"\n?```$", "", raw)
-
-            parsed = _safe_json_loads(raw)
-            extracted = _extract_translated_list(parsed, len(chunk_segs))
-            for local_i, t_item in enumerate(extracted):
-                if t_item and (t_item.get("text") or t_item.get("speaker")):
-                    translated_data[start_idx + local_i] = t_item
-        except Exception as e:
-            print(f"[translate_segments] Chunk {start_idx}-{end_idx} failed: {e}", flush=True)
-
-    result = []
-    for i, seg in enumerate(segments):
-        new_seg = dict(seg)
-        t_item = translated_data[i] if i < len(translated_data) else {}
-        t_text = t_item.get("text") if isinstance(t_item, dict) else (t_item or "")
-        t_spk = t_item.get("speaker") if isinstance(t_item, dict) else ""
-        if not t_text:
-            t_text = seg.get("text", "")
-
-        if effective_target == "km":
-            clean_km = re.sub(r'[\u4E00-\u9FFF]+', '', t_text).strip()
-            new_seg["text"] = _clean_khmer_spacing(clean_km or t_text)
-            if t_spk and not re.search(r'[\u4E00-\u9FFF]', t_spk):
-                new_seg["speaker"] = t_spk
-        else:
-            new_seg["text"] = t_text
-            if t_spk:
-                new_seg["speaker"] = t_spk
-
-        result.append(new_seg)
-
-    return result
+# (target, prompt) -> [{"text", "speaker"}, ...]; repeat exports reuse it
+_translation_cache: OrderedDict = OrderedDict()
+_glossary_cache: OrderedDict = OrderedDict()
 
 
-async def translate_segments_stream(segments: list, target_language: str = "km"):
-    """Async generator that translates subtitle segments in chunks and yields progress + translated segments in real time."""
-    if not segments:
-        return
-
-    lang_map = {
-        "km": "Khmer (ភាសាខ្មែរ)",
-        "en": "English",
-        "zh": "Chinese (Mandarin)",
-        "ja": "Japanese",
-        "ko": "Korean",
-        "th": "Thai",
-        "vi": "Vietnamese",
-        "fr": "French",
-        "es": "Spanish",
-        "de": "German",
-        "pt": "Portuguese",
-        "ru": "Russian",
-        "ar": "Arabic",
-        "hi": "Hindi",
-        "id": "Indonesian",
-        "ms": "Malay",
-    }
-    lang_name = lang_map.get(target_language, target_language)
-
-    await _configure_genai()
-
-    CHUNK_SIZE = 30
-    total_segments = len(segments)
-    processed_count = 0
-
-    for start_idx in range(0, total_segments, CHUNK_SIZE):
-        end_idx = min(start_idx + CHUNK_SIZE, total_segments)
-        chunk_segs = segments[start_idx:end_idx]
-        effective_target = "km" if target_language in ("km", "auto", "") else target_language
-        prompt = _build_translation_prompt(chunk_segs, effective_target, lang_name)
-
-        chunk_translated = [{}] * len(chunk_segs)
-        try:
-            response = await _generate_with_fallback(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.2,
-                    response_mime_type="application/json",
-                ),
-            )
-
-            raw = response.text.strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"^```(?:json)?\n?", "", raw)
-                raw = re.sub(r"\n?```$", "", raw)
-
-            parsed = _safe_json_loads(raw)
-            extracted = _extract_translated_list(parsed, len(chunk_segs))
-            for local_i, t_item in enumerate(extracted):
-                if t_item and (t_item.get("text") or t_item.get("speaker")):
-                    chunk_translated[local_i] = t_item
-        except Exception as e:
-            print(f"[translate_segments_stream] Chunk {start_idx}-{end_idx} failed: {e}", flush=True)
-
-        for local_idx, orig_seg in enumerate(chunk_segs):
-            processed_count += 1
-            t_item = chunk_translated[local_idx] if local_idx < len(chunk_translated) else {}
-            if isinstance(t_item, dict):
-                t_text = t_item.get("text", "")
-                t_spk = t_item.get("speaker", "")
-            elif isinstance(t_item, str):
-                t_text = t_item
-                t_spk = ""
-            else:
-                t_text = ""
-                t_spk = ""
-
-            if not t_text:
-                t_text = orig_seg.get("text", "")
-
-            if effective_target == "km":
-                clean_km = re.sub(r'[\u4E00-\u9FFF]+', '', t_text).strip()
-                final_text = _clean_khmer_spacing(clean_km or t_text)
-            else:
-                final_text = t_text
-
-            yield {
-                "id": orig_seg.get("id"),
-                "index": start_idx + local_idx,
-                "text": final_text,
-                "speaker": t_spk,
-                "current": processed_count,
-                "total": total_segments,
-                "percent": round((processed_count / total_segments) * 100),
-            }
+def _effective_target(target_language: str) -> str:
+    return "km" if target_language in ("km", "auto", "") else target_language
 
 
-async def run_ai_agent(project_name: str, video_duration: float, segments: list[dict], action: str, custom_prompt: str = "") -> dict:
-    """Meatika AI Video Agent assistant for content creators."""
-    await _configure_genai()
-    model = genai.GenerativeModel(settings.gemini_model)
-
-    # Format transcript summary
-    transcript_text = "\n".join(
-        f"[{seg.get('start_time', 0):.1f}s - {seg.get('end_time', 0):.1f}s] ({seg.get('speaker', 'Speaker')}): {seg.get('text', '')}"
-        for seg in segments[:100]
-    )
-
-    system_instruction = f"""You are Meatika AI Video Assistant (មាតិកា AI), an expert video editor, content strategist, scriptwriter, and social media creator.
-Project: {project_name}
-Duration: {video_duration:.1f} seconds
-Total Subtitle Segments: {len(segments)}
-
-Transcript Context:
-{transcript_text if transcript_text else "(No subtitles loaded yet)"}
-"""
-
-    if action == "make_punchy":
-        prompt = f"""{system_instruction}
-TASK: Make this video script punchy and viral for TikTok / Instagram Reels / YouTube Shorts!
-1. Provide 3 high-converting viral hooks (first 3 seconds).
-2. Rewrite the key messages into high-energy, fast-paced talking points.
-3. Suggest 3 call-to-actions (CTA) in Khmer & English.
-4. Recommend optimal caption animation style and sound effect placement."""
-
-    elif action == "summarize":
-        prompt = f"""{system_instruction}
-TASK: Summarize this video.
-1. 1-sentence Executive Summary.
-2. 4-6 Key Bullet Point Takeaways.
-3. Target Audience & Core Value Proposition."""
-
-    elif action == "youtube_seo":
-        prompt = f"""{system_instruction}
-TASK: Generate complete YouTube / Facebook SEO package:
-1. 5 High-CTR Clickable Titles (in Khmer and English).
-2. Engaging Video Description with intro hook and structured chapters/timestamps.
-3. 25+ viral hashtags & search tags (comma-separated)."""
-
-    elif action == "highlight_moments":
-        prompt = f"""{system_instruction}
-TASK: Identify the top 3-5 best highlight moments for viral clips:
-For each moment provide:
-- Start Timestamp & End Timestamp
-- Clip Title & Why it's engaging
-- Suggested On-Screen Text / Caption Hook
-- Recommended Sound Effect (e.g. Whoosh, Boom, Ding)"""
-
-    elif action == "refine_khmer":
-        prompt = f"""{system_instruction}
-TASK: Review the Khmer subtitles and refine phrasing for natural, modern, and engaging speech:
-1. Identify awkward or literal phrasing and provide natural, colloquial Khmer alternatives.
-2. Point out spelling or punctuation improvements.
-3. Provide an updated polished version of the key dialogue."""
-
-    elif action == "translate_all":
-        target = custom_prompt or "English"
-        prompt = f"""{system_instruction}
-TASK: Translate the entire video transcript into {target}.
-Provide a clear, polished, and natural translation preserving timing and speaker intent."""
-
-    else:
-        # Custom prompt or chat
-        prompt = f"""{system_instruction}
-USER REQUEST:
-{custom_prompt}
-
-Provide a comprehensive, professional, and actionable response for the video creator."""
-
-    try:
-        response = await asyncio.to_thread(
-            model.generate_content,
-            prompt,
-        )
-        content_text = ""
-        try:
-            content_text = response.text.strip()
-        except Exception:
-            if hasattr(response, "parts") and response.parts:
-                content_text = "\n".join(p.text for p in response.parts if hasattr(p, "text")).strip()
-            elif hasattr(response, "candidates") and response.candidates:
-                first_cand = response.candidates[0]
-                if hasattr(first_cand, "content") and hasattr(first_cand.content, "parts"):
-                    content_text = "\n".join(p.text for p in first_cand.content.parts if hasattr(p, "text")).strip()
-
-        if not content_text:
-            content_text = "I have completed processing your request."
-
-        return {
-            "action": action,
-            "content": content_text,
-        }
-    except Exception as e:
-        logger.error(f"Error in run_ai_agent: {e}")
-        return {
-            "action": action,
-            "content": f"AI Assistant Notice: {str(e)}",
-        }
+def _clean_translation(item: dict, target: str) -> dict:
+    text = item.get("text") or ""
+    speaker = item.get("speaker") or ""
+    if target == "km":
+        # A mixed-language answer is incomplete, not text to repair by deleting words.
+        # Leave it pending so the caller retries it without losing source meaning.
+        if any(char.isalpha() and not "\u1780" <= char <= "\u17ff" for char in text):
+            return {"text": "", "speaker": ""}
+        text = _clean_khmer_spacing(text.strip())
+        if re.search(r'[一-鿿]', speaker):
+            speaker = ""
+    return {"text": text, "speaker": speaker}
 
 
-def _normalize_title_items(raw_data, original_title: str = "", language: str = "km") -> list[dict]:
-    """Robustly normalize various JSON output formats from Gemini into standard title objects."""
-    categories_meta = {
-        "youtube_long": "ចំណងជើង YouTube កម្រិតខ្ពស់ & SEO (YouTube Standard)",
-        "youtube_shorts": "YouTube Shorts ខ្លីខ្លឹម & Emojis",
-        "viral_hook": "ចំណងជើងទាក់ទាញ (Viral Hook)",
-        "comedy_nickname": "កំប្លុកកំប្លែង & ឈ្មោះតួអង្គ (Comedy)",
-        "action_battle": "វាយប្រហារ & ក្បាច់គុន (Action & Battle)",
-        "drama_mystery": "មនោសញ្ចេតនា & អាថ៌កំបាំង (Drama & Mystery)",
-        "tiktok_short": "ខ្លីខ្លឹមបែប TikTok (TikTok / Reels Short)",
-        "suspense": "រន្ធត់ & ភ្ញាក់ផ្អើល (Suspense)",
-    }
-
-    items = []
-    if isinstance(raw_data, list):
-        items = raw_data
-    elif isinstance(raw_data, dict):
-        if "titles" in raw_data and isinstance(raw_data["titles"], list):
-            items = raw_data["titles"]
-        elif "movie_titles" in raw_data and isinstance(raw_data["movie_titles"], list):
-            items = raw_data["movie_titles"]
-        elif "data" in raw_data and isinstance(raw_data["data"], list):
-            items = raw_data["data"]
-        elif "results" in raw_data and isinstance(raw_data["results"], list):
-            items = raw_data["results"]
-        else:
-            for k, v in raw_data.items():
-                if isinstance(v, str) and v.strip():
-                    items.append({"category": k, "title": v.strip()})
-                elif isinstance(v, dict) and "title" in v:
-                    items.append(v)
-                elif isinstance(v, list):
-                    for sub in v:
-                        if isinstance(sub, (str, dict)):
-                            items.append(sub)
-
-    normalized = []
-    cat_keys = list(categories_meta.keys())
-    for i, it in enumerate(items):
-        if isinstance(it, str) and it.strip():
-            cat = cat_keys[i % len(cat_keys)]
-            normalized.append({
-                "category": cat,
-                "category_label": categories_meta.get(cat, "ចំណងជើងទាក់ទាញ"),
-                "title": it.strip(),
-                "description": "ចំណងជើងទាក់ទាញបង្កើតការចង់ដឹងចង់ឃើញខ្ពស់"
-            })
-        elif isinstance(it, dict):
-            title = it.get("title") or it.get("text") or it.get("headline") or it.get("name") or ""
-            if not title or not str(title).strip():
-                continue
-            cat = str(it.get("category") or cat_keys[i % len(cat_keys)]).strip()
-            cat_label = str(it.get("category_label") or categories_meta.get(cat) or cat).strip()
-            desc = str(it.get("description") or it.get("reason") or "ចំណងជើងទាក់ទាញសម្រាប់ការចែករំលែក").strip()
-            normalized.append({
-                "category": cat,
-                "category_label": cat_label,
-                "title": str(title).strip(),
-                "description": desc
-            })
-
-    if normalized:
-        return normalized
-
-    # Contextual Fallback if no valid titles parsed
-    topic = original_title.strip() if original_title else "វីដេអូ"
-    if language in ("km", "auto", ""):
-        return [
-            {
-                "category": "youtube_long",
-                "category_label": "ចំណងជើង YouTube ស្តង់ដារ & SEO",
-                "title": f"សម្រាយរឿង {topic} ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តពីដើមដល់ចប់ (Full Movie Recap)",
-                "description": "ចំណងជើងស្តង់ដារ YouTube Long-form មានពាក្យគន្លឹះ SEO ពេញលេញ បង្កើនការស្វែងរក"
-            },
-            {
-                "category": "viral_hook",
-                "category_label": "ចំណងជើងទាក់ទាញ (Viral Headline)",
-                "title": f"សម្រាយរឿង៖ {topic} - ការពិតដ៏រន្ធត់ដែលលាក់ទុកអស់ជាច្រើនឆ្នាំ!",
-                "description": "ចំណងជើងបែបភ្ញាក់ផ្អើល បង្កើតការចង់ដឹងចង់ឃើញខ្ពស់ និងជំរុញឱ្យចុចទស្សនាភ្លាមៗ"
-            },
-            {
-                "category": "action_battle",
-                "category_label": "ចំណងជើងបែបវាយប្រហារ & ក្បាច់គុន",
-                "title": f"កំពូលក្បាច់គុនកក្រើកពិភពគុណ | សម្រាយរឿង {topic} ភាគបញ្ចប់",
-                "description": "ចំណងជើងបែបវាយប្រហារ ក្បាច់គុន និងសកម្មភាពប្រយុទ្ធស្វិតស្វាញ"
-            },
-            {
-                "category": "comedy_nickname",
-                "category_label": "ចំណងជើងបែបកំប្លែង & សម្មតិនាមតួអង្គ",
-                "title": f"អាប្រុសខូចប៉ះស្រីស្អាតចិត្តដាច់ | សម្រាយរឿងកំប្លែង {topic}",
-                "description": "ចំណងជើងបែបកំប្លែង សើចសប្បាយ ប្រើសម្មតិនាមតួអង្គទាក់ទាញ"
-            },
-            {
-                "category": "drama_mystery",
-                "category_label": "ចំណងជើងបែបអាថ៌កំបាំង & មនោសញ្ចេតនា",
-                "title": f"រឿង៖ {topic} - ការក្បត់ដែលនឹកស្មានមិនដល់ និងការលះបង់ដ៏ធំធេង",
-                "description": "ចំណងជើងបែបអាថ៌កំបាំង រឿងរ៉ាវពិត និងមនោសញ្ចេតនាជ្រាលជ្រៅ"
-            },
-            {
-                "category": "facebook_post",
-                "category_label": "ចំណងជើង Facebook Watch & Reels",
-                "title": f"🔥 {topic} ភាគបញ្ចប់ | ឈុតឆាកកក្រើកដែលកំពុងផ្ទុះការគាំទ្រខ្លាំងលើ Facebook 🎬",
-                "description": "ចំណងជើងស្តង់ដារ Facebook Watch និង Facebook Reels មាន Emojis ទាក់ទាញ"
-            },
-            {
-                "category": "youtube_shorts",
-                "category_label": "ចំណងជើង YouTube Shorts & TikTok",
-                "title": f"សម្រាយរឿងខ្លី | {topic} ភាគ១ #shorts #movierecap",
-                "description": "ចំណងជើងខ្លីខ្លឹម ស័ក្តិសមសម្រាប់ YouTube Shorts និង TikTok"
-            },
-            {
-                "category": "suspense",
-                "category_label": "ចំណងជើងបែបតក់ស្លុត & Climax",
-                "title": f"វិនាទីចុងក្រោយដែលគ្មានអ្នកណាដឹង! | សម្រាយរឿង {topic}",
-                "description": "ចំណងជើងបែបតក់ស្លុត និងទាក់ទាញការចែករំលែកខ្ពស់"
-            }
-        ]
-    else:
-        return [
-            {
-                "category": "youtube_long",
-                "category_label": "YouTube Standard & SEO",
-                "title": f"{topic} Full Movie Recap & Ending Explained (2024)",
-                "description": "High-CTR search-optimized YouTube video headline"
-            },
-            {
-                "category": "facebook_post",
-                "category_label": "Facebook Watch & Reels",
-                "title": f"🔥 {topic} - The full breakdown everyone is talking about! 🎬",
-                "description": "Engaging Facebook video post headline"
-            },
-            {
-                "category": "viral_hook",
-                "category_label": "Viral Headline",
-                "title": f"The Dark Secret Behind {topic} That Everyone Missed!",
-                "description": "High-suspense curiosity gap video title"
-            },
-            {
-                "category": "action_battle",
-                "category_label": "Action & Climax",
-                "title": f"Ultimate Battle & Climax | {topic} Full Breakdown",
-                "description": "Action-packed, adrenaline-filled headline"
-            },
-            {
-                "category": "youtube_shorts",
-                "category_label": "YouTube Shorts",
-                "title": f"{topic} Best Scene Recap #shorts #movierecap",
-                "description": "Punchy short-form title optimized for Shorts and Reels"
-            }
-        ]
+def _glossary_text(parsed) -> str:
+    """The model's glossary as the plain lines that go into each translation prompt."""
+    if not isinstance(parsed, dict):
+        return ""
+    rows = []
+    for term in (parsed.get("terms") or [])[:80]:
+        if isinstance(term, dict):
+            source, rendered = str(term.get("source") or "").strip(), str(term.get("target") or "").strip()
+            if source and rendered and source != rendered:
+                rows.append(f"{source} = {rendered}")
+    notes = str(parsed.get("notes") or "").strip()
+    if notes:
+        rows.append(f"Notes: {notes[:1200]}")
+    return "\n".join(rows)
 
 
-async def generate_movie_titles(
-    original_title: str = "",
-    transcript_text: str = "",
-    video_path: str = "",
-    language: str = "km",
-) -> list[dict]:
-    """Generate viral, high-CTR movie recap titles in multiple popular styles."""
-    prompt = f"""You are an elite YouTube & Facebook growth strategist and viral video metadata specialist.
+async def _build_glossary(lines: list, target: str) -> str:
+    """One pass over the whole dialogue to fix how names are written and who everyone is.
 
-Target Language: {language} (use authentic Cambodian Khmer for 'km', or English for 'en').
-Movie / Video Topic: {original_title or 'Untitled Video'}
+    The lines are translated thirty at a time, and each batch used to choose
+    its own spelling for a name and its own guess at who was speaking to whom. Deciding that
+    once, up front, is what keeps a character's name and manner the same across the video.
+    Returns "" when it cannot be built; translation then carries on without it.
+    """
+    with_gender = len({(s.get("voice_profile") or "").lower() in _MALE_PROFILES for s in lines}) > 1
+    dialogue = [f"{_line_label(seg, with_gender)}{_source_text(seg)}" for seg in lines if _source_text(seg)]
+    if len(dialogue) < GLOSSARY_MIN_LINES:
+        return ""
+    text = "\n".join(dialogue)
+    if len(text) > GLOSSARY_MAX_CHARS:
+        # a long film: sample evenly, the cast is the same throughout
+        step = len(text) / GLOSSARY_MAX_CHARS
+        text = "\n".join(dialogue[int(i * step)] for i in range(int(len(dialogue) / step)))
+    key = (target, text)
+    if key in _glossary_cache:
+        _glossary_cache.move_to_end(key)
+        return _glossary_cache[key]
 
-Dialogue Transcript Summary:
-{transcript_text[:5000] if transcript_text else 'No dialogue available'}
+    lang_name = TRANSLATION_LANGUAGES.get(target, target)
+    prompt = f"""You are preparing a film's dialogue for translation into {lang_name}.
+Read the dialogue below and return a JSON object:
+{{
+  "terms": [{{"source": "name or term exactly as written in the dialogue", "target": "the one {lang_name} rendering to use every time"}}],
+  "notes": "two to five short sentences: who the main characters are, whether each is a man or a woman, and how they relate (family, rank, lovers, rivals) — whatever decides the pronouns and forms of address between them"
+}}
+Include every character name, nickname, title, place and recurring special term (at most 60). Do not include ordinary words.
+Only state genders and relationships supported by the dialogue; leave uncertain ones unknown.
+Write "target" and "notes" for a translator working into {lang_name}{"; render names in Khmer script by their sound" if target == "km" else ""}.
+Return ONLY the JSON object.
 
-CRITICAL DISTINCTION BETWEEN VIDEO TITLES AND SPOKEN HOOKS:
-- DO NOT generate spoken narrator voiceover sentences (e.g. do not write "Don't look down on this guy...").
-- YOU MUST generate actual VIDEO HEADLINES (the title text that appears under the YouTube thumbnail, Facebook post title, or TikTok caption).
-
-Standard Title Formats to Follow (Khmer):
-1. YouTube Standard & SEO: `សម្រាយរឿង [Title] ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តពីដើមដល់ចប់ (Full Movie Recap)`
-2. Facebook Watch & Reels: `🔥 [Title] ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តដែលកំពុងល្បីខ្លាំងលើ Facebook 🎬`
-3. High-CTR Viral Title: `សម្រាយរឿង៖ [Title] - [Shocking Climax / Hidden Secret]!`
-4. Action & Battle Title: `កំពូលក្បាច់គុនកក្រើកពិភពគុណ | សម្រាយរឿង [Title] ភាគបញ្ចប់`
-5. Comedy & Nicknames: `អាប្រុសខូចប៉ះស្រីស្អាតចិត្តដាច់ | សម្រាយរឿងកំប្លែង [Title]`
-6. Drama & Mystery: `រឿង៖ [Title] - ការក្បត់ដែលនឹកស្មានមិនដល់ និងការលះបង់ដ៏ធំធេង`
-7. YouTube Shorts / TikTok: `សម្រាយរឿងខ្លី | [Title] #shorts #movierecap`
-8. Suspense & Shock: `វិនាទីចុងក្រោយដែលគ្មានអ្នកណាដឹង! | សម្រាយរឿង [Title]`
-
-Return ONLY a valid JSON array of objects matching this exact schema:
-[
-  {{
-    "category": "youtube_long",
-    "category_label": "ចំណងជើង YouTube ស្តង់ដារ & SEO",
-    "title": "សម្រាយរឿង {original_title or 'វីដេអូ'} ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តពីដើមដល់ចប់ (Full Movie Recap)",
-    "description": "ចំណងជើងស្តង់ដារ YouTube Long-form មានពាក្យគន្លឹះ SEO ពេញលេញ"
-  }},
-  {{
-    "category": "facebook_post",
-    "category_label": "ចំណងជើង Facebook Watch & Reels",
-    "title": "🔥 {original_title or 'វីដេអូ'} ភាគបញ្ចប់ | ឈុតឆាកកក្រើកដែលកំពុងផ្ទុះការគាំទ្រខ្លាំងលើ Facebook 🎬",
-    "description": "ចំណងជើង Facebook Watch និង Reels ទាក់ទាញការចុចទស្សនា និងចែករំលែក"
-  }}
-]"""
-
+Dialogue:
+{text}"""
+    glossary = ""
     try:
         response = await _generate_with_fallback(
             prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.85,
-                response_mime_type="application/json",
-            )
+            generation_config=genai.types.GenerationConfig(temperature=0.1, response_mime_type="application/json"),
         )
-        if response and response.text:
-            text = response.text.strip()
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?\n?", "", text)
-                text = re.sub(r"\n?```$", "", text)
-            parsed = _safe_json_loads(text)
-            titles = _normalize_title_items(parsed, original_title=original_title, language=language)
-            if titles:
-                return titles
+        glossary = _glossary_text(_safe_json_loads(response.text.strip()))
     except Exception as e:
-        print(f"[generate_movie_titles] Gemini call failed: {e}", flush=True)
-
-    return _normalize_title_items(None, original_title=original_title, language=language)
-
-
-async def generate_social_media_script(
-    original_title: str = "",
-    transcript_text: str = "",
-    video_path: str = "",
-    language: str = "km",
-    platform: str = "tiktok",
-    tone: str = "suspense",
-    duration_target: str = "30-60s",
-    custom_notes: str = "",
-) -> dict:
-    """Generate a complete social media caption, synopsis, CTA, pinned comment, and viral hashtags."""
-    keys = await _get_active_keys()
-    if not keys:
-        if not settings.gemini_api_key or settings.gemini_api_key == "your_gemini_api_key_here":
-            raise RuntimeError("No active Gemini API keys configured. Please add an API key in Settings.")
-        keys = [settings.gemini_api_key]
-
-    platform_guide = {
-        "tiktok": "TikTok & Douyin short-form (ultra-punchy 3-second hook, fast cut cues, trending sound cue, hashtag stack)",
-        "youtube_shorts": "YouTube Shorts (high retention curve, cliffhanger pacing, subscribe & comment CTA)",
-        "facebook_reels": "Facebook Reels (emotionally resonant Khmer storytelling, community shareability, debate starter)",
-        "instagram_reels": "Instagram Reels (aesthetic visual notes, engaging caption formatting, save & share CTA)",
-    }.get(platform, "Universal Short-Form (TikTok, Shorts, Reels)")
-
-    tone_guide = {
-        "suspense": "Fast-paced, high-tension, intense thriller/action suspense",
-        "humor": "Humorous, witty, sarcastic commentary with lively punchlines",
-        "dramatic": "Emotional, deeply dramatic, inspiring, and cinematic",
-        "twist": "Mysterious, mind-blowing plot twist and shocking revelation",
-        "fast_action": "High-octane, adrenaline-fueled, explosive martial arts/battle breakdown",
-    }.get(tone, "Fast-paced, cinematic, high-retention")
-
-    system_instruction = f"""You are a master short-form video director, creative copywriter, and scriptwriter specialized in {platform_guide}.
-
-Target Platform: {platform_guide}
-Target Tone: {tone_guide}
-Target Video Duration: {duration_target}
-Language: {language} (use natural conversational Khmer with standard continuous script and engaging emojis if language is 'km', or English if 'en').
-
-CRITICAL REQUIREMENT:
-You MUST generate between 4 to 8 sequential timeline scene blocks in the "blocks" array covering the entire duration from 0:00 to the end. Every block MUST have a non-empty, compelling voiceover script line in natural Khmer, visual direction, on-screen text, sound effect cue, and accurate start_time and end_time.
-
-Generate a complete, high-converting Short-Form Video Production Script package matching this exact JSON schema:
-{{
-  "title": "Movie Title / Topic",
-  "total_duration": "{duration_target}",
-  "platform": "{platform}",
-  "tone": "{tone_guide}",
-  "bgm_suggestion": "Heavy epic dark cinematic drumbeat / fast battle music with BPM suggestion",
-  "hook": "Opening viral hook line (first 3-5 seconds)",
-  "synopsis": "Engaging story summary with emojis and highlights",
-  "call_to_action": "Engaging CTA for comments, likes, and follows",
-  "pinned_comment": "Curiosity/debate question to pin in comments to trigger viewer replies",
-  "editing_tips": [
-    "Tip 1: e.g. Add sudden zoom-in on the 2nd second beat",
-    "Tip 2: e.g. Lower BGM by -12dB during voiceover punchline",
-    "Tip 3: e.g. Flash red vignette on the shocking climax cut"
-  ],
-  "blocks": [
-    {{
-      "time_range": "[00:00 - 00:05]",
-      "start_time": 0.0,
-      "end_time": 5.0,
-      "block_name": "THE HOOK",
-      "visual": "Opening dramatic shock frame / intense close-up",
-      "text_on_screen": "ចំណុចចាប់ផ្តើមដ៏រន្ធត់! 😱",
-      "sound_effect": "Dramatic bass drop / whoosh SFX",
-      "voiceover": "រឿងរ៉ាវដ៏រន្ធត់មួយបានកើតឡើង នៅពេលដែលបុរសម្នាក់នេះ...",
-      "voiceover_tone": "Hyped / Intense"
-    }},
-    {{
-      "time_range": "[00:05 - 00:18]",
-      "start_time": 5.0,
-      "end_time": 18.0,
-      "block_name": "THE BUILDUP",
-      "visual": "Fast cuts showing the dark secret and escalating conflict",
-      "text_on_screen": "ការពិតដែលលាក់កំបាំង... ⚔️",
-      "sound_effect": "Heartbeat tension / rising cinematic strings",
-      "voiceover": "គាត់មិនបានដឹងខ្លួនទេថា ការសម្រេចចិត្តមួយនេះនឹងផ្លាស់ប្តូរជីវិតរបស់គាត់ជារៀងរហូត...",
-      "voiceover_tone": "Suspenseful / Dramatic"
-    }},
-    {{
-      "time_range": "[00:18 - 00:35]",
-      "start_time": 18.0,
-      "end_time": 35.0,
-      "block_name": "THE TURNING POINT",
-      "visual": "Confrontation and shocking plot twist reveal",
-      "text_on_screen": "ការក្បត់ដែលគ្មានអ្នកណាដឹង! 💥",
-      "sound_effect": "Explosion / Glass Shatter / High tension riser",
-      "voiceover": "ស្រាប់តែស្រមោលខ្មៅមួយបានលេចឡើង ហើយការពិតទាំងអស់ក៏ត្រូវបានលាតត្រដាង!",
-      "voiceover_tone": "Shocking / Emotional"
-    }},
-    {{
-      "time_range": "[00:35 - 00:50]",
-      "start_time": 35.0,
-      "end_time": 50.0,
-      "block_name": "THE CLIMAX",
-      "visual": "High-stakes battle and decisive showdown",
-      "text_on_screen": "ការតស៊ូដល់ដង្ហើមចុងក្រោយ! 🔥",
-      "sound_effect": "Heavy impact boom / crescendo",
-      "voiceover": "គាត់ត្រូវប្រយុទ្ធដើម្បីរស់ និងការពារអ្នកដែលគាត់ស្រឡាញ់បំផុត!",
-      "voiceover_tone": "Heroic / High Energy"
-    }},
-    {{
-      "time_range": "[00:50 - 01:00]",
-      "start_time": 50.0,
-      "end_time": 60.0,
-      "block_name": "OUTRO & CTA",
-      "visual": "Lingering cliffhanger face shot with text overlay",
-      "text_on_screen": "តើអ្នកយល់យ៉ាងណាដែរ? ខមមិនមក! 👇",
-      "sound_effect": "Cinematic drum fade",
-      "voiceover": "តើគាត់អាចរួចផុតពីគ្រោះថ្នាក់នេះបានដែរឬទេ? ខមមិនប្រាប់ខាងក្រោម ហើយកុំភ្លេច Follow ផងណា!",
-      "voiceover_tone": "Engaging / Question"
-    }}
-  ],
-  "description": "Formatted YouTube Shorts / TikTok description",
-  "hashtags": ["#Tag1", "#Tag2", "#Tag3", "#Tag4", "#Tag5", "#Tag6", "#Tag7", "#Tag8"],
-  "seo_tags": ["keyword 1", "keyword 2", "keyword 3", "keyword 4"],
-  "full_post": "Ready-to-copy social media caption combining hook, synopsis, CTA, and hashtags",
-  "full_script_markdown": "Full formatted production cue sheet table in markdown"
-}}
-
-Output ONLY the raw JSON object."""
-
-    user_content = f"Original Movie Title / Topic: {original_title or 'Movie Recap'}\nTarget Duration: {duration_target}\nTone: {tone_guide}\n"
-    if custom_notes:
-        user_content += f"Additional Creator Directives: {custom_notes}\n"
-    if transcript_text:
-        user_content += f"\nSubtitles / Dialogue Transcript Content:\n{transcript_text[:7500]}\n"
-
-    models_to_try = [
-        settings.gemini_model or "gemini-2.5-flash",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro",
-    ]
-    seen = set()
-    models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
-
-    media_path = None
-    tmp_dir = None
-    if video_path and os.path.exists(video_path):
-        media_path, tmp_dir = await _build_media_proxy_for_gemini(video_path)
-
-    last_err = None
-    try:
-        for api_key in keys:
-            for model_name in models_to_try:
-                try:
-                    genai.configure(api_key=api_key)
-                    uploaded_file = None
-                    if media_path and os.path.exists(media_path):
-                        try:
-                            uploaded_file = await asyncio.to_thread(genai.upload_file, media_path)
-                            poll_count = 0
-                            while uploaded_file.state.name == "PROCESSING":
-                                poll_count += 1
-                                if poll_count > 30:
-                                    break
-                                await asyncio.sleep(0.5)
-                                uploaded_file = await asyncio.to_thread(genai.get_file, uploaded_file.name)
-                        except Exception:
-                            uploaded_file = None
-
-                    model = genai.GenerativeModel(
-                        model_name=model_name,
-                        system_instruction=system_instruction,
-                        generation_config=genai.GenerationConfig(
-                            temperature=0.75,
-                            response_mime_type="application/json",
-                        ),
-                    )
-
-                    inputs = [uploaded_file, user_content] if uploaded_file else [user_content]
-                    response = await asyncio.wait_for(
-                        asyncio.to_thread(model.generate_content, inputs),
-                        timeout=50.0,
-                    )
-                    if response and response.text:
-                        text = response.text.strip()
-                        if text.startswith("```"):
-                            text = re.sub(r"^```(?:json)?\n?", "", text)
-                            text = re.sub(r"\n?```$", "", text)
-                        data = _safe_json_loads(text)
-                        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
-                            data = data[0]
-
-                    if isinstance(data, dict):
-                        # Normalize blocks array from alternate keys
-                        if not data.get("blocks") or not isinstance(data.get("blocks"), list) or len(data.get("blocks")) == 0:
-                            for alt_key in ["scenes", "script_blocks", "scene_blocks", "cues", "segments", "script"]:
-                                if isinstance(data.get(alt_key), list) and len(data.get(alt_key)) > 0:
-                                    data["blocks"] = data[alt_key]
-                                    break
-
-                        # If blocks missing or only 1 single block returned, construct full 4-stage structured blocks from hook + synopsis + CTA
-                        if not data.get("blocks") or not isinstance(data.get("blocks"), list) or len(data.get("blocks")) <= 1:
-                            data["blocks"] = [
-                                {
-                                    "time_range": "[00:00 - 00:05]",
-                                    "start_time": 0.0,
-                                    "end_time": 5.0,
-                                    "block_name": "THE HOOK",
-                                    "visual": "Fast dramatic cut to the most intense moment of the scene",
-                                    "text_on_screen": (data.get("hook") or "DO NOT MISS THIS! 🔥")[:45],
-                                    "sound_effect": "Dramatic bass drop / whoosh SFX",
-                                    "voiceover": data.get("hook") or f"រឿងរ៉ាវដ៏ភ្ញាក់ផ្អើលបំផុតដែលអ្នកមិនធ្លាប់ដឹងពី {original_title or 'Movie'}!",
-                                    "voiceover_tone": "Intense / Suspense"
-                                },
-                                {
-                                    "time_range": "[00:05 - 00:30]",
-                                    "start_time": 5.0,
-                                    "end_time": 30.0,
-                                    "block_name": "THE STORY",
-                                    "visual": "Montage of the main conflict, character tension, and action",
-                                    "text_on_screen": "ការពិតដ៏អាថ៌កំបាំង...",
-                                    "sound_effect": "Cinematic tension build-up",
-                                    "voiceover": data.get("synopsis") or "តួអង្គសំខាន់ត្រូវប្រឈមមុខនឹងឧបសគ្គដ៏ធំធេង...",
-                                    "voiceover_tone": "Dramatic"
-                                },
-                                {
-                                    "time_range": "[00:30 - 00:45]",
-                                    "start_time": 30.0,
-                                    "end_time": 45.0,
-                                    "block_name": "THE CLIMAX",
-                                    "visual": "High-stakes turning point and confrontation",
-                                    "text_on_screen": "ចំណុចកំពូលដែលគ្មានអ្នកណាស្មានដល់!",
-                                    "sound_effect": "Heartbeat tension / sharp crescendo",
-                                    "voiceover": "ពេលវេលាសម្រេចចិត្តបានមកដល់ តើអ្នកណានឹងជាអ្នកឈ្នះ?",
-                                    "voiceover_tone": "High-energy / Climax"
-                                },
-                                {
-                                    "time_range": "[00:45 - 00:55]",
-                                    "start_time": 45.0,
-                                    "end_time": 55.0,
-                                    "block_name": "CLOSING & CTA",
-                                    "visual": "Final lingering shot with suspense cliffhanger",
-                                    "text_on_screen": "ខមមិនយោបល់របស់អ្នក! 👇",
-                                    "sound_effect": "Fading cinematic drone",
-                                    "voiceover": data.get("call_to_action") or "តើអ្នកគិតយ៉ាងណាដែរ? កុំភ្លេចចុច Follow និងខមមិនខាងក្រោមណា!",
-                                    "voiceover_tone": "Engaging"
-                                }
-                            ]
-
-                        # Ensure each block inside blocks has standard keys and valid timestamps
-                        normalized_blocks = []
-                        for idx, blk in enumerate(data.get("blocks", [])):
-                            if not isinstance(blk, dict):
-                                continue
-                            start_t = float(blk.get("start_time", idx * 10))
-                            end_t = float(blk.get("end_time", (idx + 1) * 10))
-                            normalized_blocks.append({
-                                "time_range": blk.get("time_range") or f"[{start_t:.0f}s - {end_t:.0f}s]",
-                                "start_time": start_t,
-                                "end_time": end_t,
-                                "block_name": blk.get("block_name") or blk.get("name") or blk.get("title") or f"SCENE {idx+1}",
-                                "visual": blk.get("visual") or blk.get("shot") or blk.get("video") or "Camera shot / action",
-                                "text_on_screen": blk.get("text_on_screen") or blk.get("caption") or blk.get("overlay") or "",
-                                "sound_effect": blk.get("sound_effect") or blk.get("sfx") or "Cinematic SFX",
-                                "voiceover": blk.get("voiceover") or blk.get("narration") or blk.get("script") or blk.get("text") or "",
-                                "voiceover_tone": blk.get("voiceover_tone") or blk.get("tone") or "Intense"
-                            })
-                        data["blocks"] = normalized_blocks
-
-                        if not data.get("full_post"):
-                            parts = [p for p in [data.get("hook"), data.get("synopsis"), data.get("call_to_action"), " ".join(data.get("hashtags", []))] if p]
-                            data["full_post"] = "\n\n".join(parts)
-                except Exception as e:
-                    last_err = e
-                    continue
-    finally:
-        if tmp_dir and os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    # Fallback template if models fail
-    fallback_title = original_title or "Exciting Short-Form Video"
-    return {
-        "title": fallback_title,
-        "total_duration": duration_target,
-        "platform": platform,
-        "tone": tone_guide,
-        "bgm_suggestion": "Epic dark cinematic drumbeat / high-tempo trailer music",
-        "hook": f"The untold truth behind {fallback_title} that everyone missed! 🔥⚔️",
-        "synopsis": f"A deep dive into the most intense scene of {fallback_title}, revealing secret details and turning points.",
-        "call_to_action": "Follow and share your thoughts in the comments below! 🚀",
-        "pinned_comment": f"Did you expect this twist in {fallback_title}? Let's debate in the comments! 👇",
-        "editing_tips": [
-            "Start immediately with the high-action shot within the first 1.5 seconds.",
-            "Use sound effects (whoosh, hit) on every text overlay pop-in.",
-            "Maintain fast pacing with cuts every 2 to 3.5 seconds."
-        ],
-        "blocks": [
-            {
-                "time_range": "[00:00 - 00:03]",
-                "start_time": 0.0,
-                "end_time": 3.0,
-                "block_name": "THE HOOK",
-                "visual": "Close-up action / suspense climax scene",
-                "text_on_screen": "YOU WON'T BELIEVE THIS! 😱",
-                "sound_effect": "Dramatic bass drop / whoosh",
-                "voiceover": f"This is the moment that changed everything in {fallback_title}!",
-                "voiceover_tone": "Hyped / Intense"
-            }
-        ],
-        "description": f"{fallback_title} - Short-form recap and review.",
-        "hashtags": ["#fyp", "#viral", "#movierecap", "#trending", "#khmermovie", "#cinema"],
-        "seo_tags": [fallback_title, "movie recap", "viral short", "action scene"],
-        "full_post": f"The untold truth behind {fallback_title}! 🔥\n\nFollow and share your thoughts below!\n\n#fyp #viral #movierecap #trending #cinema",
-        "full_script_markdown": f"# {fallback_title} - Short-Form Cue Sheet\n\nPlatform: {platform} | Tone: {tone_guide}\n"
-    }
+        print(f"[translate] glossary skipped: {e}", flush=True)
+    if glossary:
+        _glossary_cache[key] = glossary
+        if len(_glossary_cache) > 50:
+            _glossary_cache.popitem(last=False)
+    return glossary
 
 
-async def generate_viral_metadata_package(
-    original_title: str,
-    transcript_text: str,
-    language: str = "km",
-    tone: str = "viral",
-    platform: str = "all",
-) -> dict:
-    """Generate high-CTR viral titles, descriptions, hashtags, and social metadata."""
-    prompt = f"""You are a top-tier viral YouTube growth specialist and movie recap metadata copywriter.
-Analyze this video content and generate an ultra-high-converting, professional metadata package.
-
-Title/Topic: {original_title or 'Untitled Video'}
-Language: {language} (use authentic Cambodian Khmer if 'km', or English if 'en')
-Tone: {tone}
-Platform: {platform}
-
-Dialogue Transcript:
-{transcript_text[:5000] if transcript_text else 'No dialogue available'}
-
-Generate a structured JSON object with:
-{{
-  "titles": [
-    "🔥 [High-CTR Clickable Title 1]",
-    "⚡ [Suspense Hook Title 2]",
-    "💥 [Curiosity Gap Title 3]",
-    "🎬 [Story / Dramatic Title 4]",
-    "🌟 [Short Punchy Title 5]"
-  ],
-  "description": "Comprehensive, professional YouTube video description formatted in 3-4 sections:\\n\\n1. Hook & Introduction (1-2 punchy sentences)\\n2. Synopsis & Story Highlights (2 natural paragraphs detailing key conflict, character struggle, and turning points)\\n3. Call To Action (Like, Share, Subscribe, and leave your thoughts in comments)\\n4. Disclaimer & Hashtags: ⚠️ ការរក្សាសិទ្ធិ (Copyright Disclaimer under Fair Use) & #សម្រាយរឿង #MovieRecap #KhmerMovie #Cinema",
-  "short_caption": "1-2 sentence TikTok/Reels caption with emoji hooks and viral hashtags.",
-  "facebook_caption": "Engaging 2-paragraph Facebook Watch / Reels caption with movie hook, emojis, follow call-to-action, and hashtags.",
-  "hashtags": [
-    "#សម្រាយរឿង", "#សម្រាយរឿងពេញ", "#សម្រាយរឿងចិន", "#សម្រាយរឿងថៃ", "#សម្រាយសាច់រឿង",
-    "#រឿងពេញ", "#ភាពយន្ត", "#ភាពយន្តភាគ", "#movierecap", "#filmrecap",
-    "#movieexplained", "#cinemakhmer", "#khmermovie", "#endingexplained", "#fullmovierecap",
-    "#fyp", "#viral", "#trending", "#reels", "#shorts", "#tiktokkhmer", "#fbreels", "#facebookwatch", "#youtubeshorts"
-  ],
-  "seo_keywords": [
-    "សម្រាយរឿង", "សម្រាយរឿងពេញ", "{original_title or 'វីដេអូ'}", "សម្រាយរឿង {original_title or 'វីដេអូ'} ភាគបញ្ចប់",
-    "{original_title or 'វីដេអូ'} full movie", "movie recap khmer", "{original_title or 'វីដេអូ'} recap",
-    "រឿងចិននិយាយខ្មែរ", "ភាពយន្តភាគចិន", "ក្បាច់គុនបុរាណ", "film review khmer",
-    "cinema khmer", "រឿងពេញ 2024", "movie recap 2024", "ending explained khmer"
-  ],
-  "pinned_comment": "Curiosity debate question to pin in the comments section to boost viewer comments.",
-  "thumbnail_text_ideas": [
-    "នឹកស្មានមិនដល់! 😱",
-    "ការពិតត្រូវបានទម្លាយ! 💥",
-    "កុំមើលរំលងឱ្យសោះ! 🔥",
-    "ស្ដេចសង្គ្រាមត្រឡប់មកវិញ! ⚔️"
-  ]
-}}
-
-Return ONLY valid JSON."""
-
-    try:
-        response = await _generate_with_fallback(prompt)
-        if response and response.text:
-            text = response.text.strip()
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?\n?", "", text)
-                text = re.sub(r"\n?```$", "", text)
-            data = _safe_json_loads(text)
-            if isinstance(data, dict):
-                # Ensure every hashtag strictly has a leading '#' and no spaces
-                raw_tags = data.get("hashtags", [])
-                if isinstance(raw_tags, list):
-                    clean_tags = []
-                    for t in raw_tags:
-                        c = str(t).strip().lstrip("#").replace(" ", "")
-                        if c:
-                            clean_tags.append(f"#{c}")
-                    if clean_tags:
-                        data["hashtags"] = clean_tags
-                return data
-    except Exception as e:
-        print(f"Error generating viral metadata: {e}")
-
-    fallback_t = original_title or "វីដេអូសម្រាយរឿង"
-    tag_clean = fallback_t.replace(" ", "")
-    return {
-        "titles": [
-          f"សម្រាយរឿង {fallback_t} ភាគបញ្ចប់ | ឈុតឆាកជក់ចិត្តពីដើមដល់ចប់ (Full Movie Recap)",
-          f"🔥 {fallback_t} ភាគបញ្ចប់ | ឈុតឆាកកក្រើកដែលកំពុងផ្ទុះការគាំទ្រខ្លាំងលើ Facebook 🎬",
-          f"⚡ ឈុតឆាកដ៏ភ្ញាក់ផ្អើលបំផុតនៅក្នុង {fallback_t}",
-          f"🎬 សម្រាយរឿង៖ {fallback_t} - កំពូលឈុតឆាកជក់ចិត្ត",
-          f"🌟 {fallback_t} - រឿងរ៉ាវនឹកស្មានមិនដល់!"
-        ],
-        "description": (
-            f"🎬 សូមស្វាគមន៍មកកាន់ការសម្រាយរឿងពេញនៃខ្សែភាពយន្ត៖ {fallback_t}\n\n"
-            f"📖 សាច់រឿងសង្ខេប៖\n"
-            f"ខ្សែភាពយន្តនេះរៀបរាប់ពីរឿងរ៉ាវដ៏អស្ចារ្យ និងការតស៊ូដ៏ស្វិតស្វាញរបស់តួអង្គសំខាន់ ក្នុងការជម្នះឧបសគ្គ "
-            f"ព្រមទាំងការលាតត្រដាងការពិតដ៏អាថ៌កំបាំងដែលលាក់ទុកជាយូរមកហើយ។ រាល់ឈុតឆាកពោរពេញដោយភាពរំជួលចិត្ត "
-            f"ការក្បត់ និងការប្រយុទ្ធដ៏រំភើបញាប់ញ័រដែលមិនគួររំលង!\n\n"
-            f"🔔 កុំភ្លេចចុច Like, Share និង Subscribe រួចចុចសញ្ញាកណ្ដឹង ដើម្បីទទួលបានវីដេអូសម្រាយរឿងថ្មីៗជារៀងរាល់ថ្ងៃ!\n\n"
-            f"⚠️ Copyright Disclaimer:\n"
-            f"This video is created for movie review, recap, and educational commentary purposes under the Fair Use guidelines.\n\n"
-            f"#សម្រាយរឿង #{tag_clean} #movierecap #khmermovie #cinema #trending"
-        ),
-        "short_caption": f"ឈុតឆាកដ៏អស្ចារ្យដែលអ្នកមិនគួររំលង! 🔥✨ #{tag_clean} #សម្រាយរឿង #movierecap #viral #fyp",
-        "facebook_caption": (
-            f"🔥 សម្រាយរឿងពេញ៖ {fallback_t} ភាគបញ្ចប់ 🎬\n\n"
-            f"ឈុតឆាកប្រយុទ្ធដ៏ស្វិតស្វាញ និងអាថ៌កំបាំងដ៏រន្ធត់ដែលមិនធ្លាប់ដឹងពីមុនមក! "
-            f"តើចុងបញ្ចប់នឹងទៅជាយ៉ាងណា? ទស្សនាទាំងអស់គ្នា!\n\n"
-            f"👉 ចុច Like & Follow Page ដើម្បីកុំឱ្យរំលងវីដេអូសម្រាយរឿងល្អៗជាច្រើនទៀត! 🍿✨\n\n"
-            f"#សម្រាយរឿង #{tag_clean} #fbreels #facebookwatch #movierecap #viral #trending"
-        ),
-        "hashtags": [
-            "#សម្រាយរឿង", f"#{tag_clean}", "#សម្រាយរឿងពេញ", "#សម្រាយរឿងចិន", "#សម្រាយរឿងថៃ",
-            "#សម្រាយរឿងហូលីវូដ", "#សម្រាយសាច់រឿង", "#រឿងពេញ", "#ភាពយន្ត", "#ភាពយន្តភាគ",
-            "#movierecap", "#filmrecap", "#movieexplained", "#cinemakhmer", "#khmermovie",
-            "#endingexplained", "#fullmovierecap", "#fyp", "#viral", "#trending",
-            "#reels", "#shorts", "#tiktokkhmer", "#fbreels", "#facebookwatch", "#youtubeshorts"
-        ],
-        "seo_keywords": [
-            "សម្រាយរឿង",
-            f"សម្រាយរឿង {fallback_t}",
-            f"សម្រាយរឿង {fallback_t} ភាគបញ្ចប់",
-            "សម្រាយរឿងពេញ",
-            fallback_t,
-            f"{fallback_t} full movie recap",
-            f"{fallback_t} ending explained",
-            f"{fallback_t} និយាយខ្មែរ",
-            "movie recap khmer",
-            "រឿងចិននិយាយខ្មែរ",
-            "ភាពយន្តភាគចិន",
-            "ក្បាច់គុនបុរាណ",
-            "cinema khmer",
-            "film recap khmer",
-            "សម្រាយរឿងល្អមើល",
-            "រឿងពេញ 2024",
-            "viral movie recap"
-        ],
-        "pinned_comment": f"តើអ្នកយល់យ៉ាងណាដែរចំពោះសាច់រឿង {fallback_t} មួយនេះ? ចែករំលែកមតិរបស់អ្នកនៅខាងក្រោម! 👇",
-        "thumbnail_text_ideas": [
-            "នឹកស្មានមិនដល់! 😱",
-            "ការពិតត្រូវបានទម្លាយ! 💥",
-            "កុំមើលរំលងឱ្យសោះ! 🔥",
-            "ស្ដេចសង្គ្រាមត្រឡប់មកវិញ! ⚔️"
-        ]
-    }
-
-
-async def generate_catchy_hooks(
-    original_title: str,
-    transcript_text: str,
-    language: str = "km",
-    duration_seconds: float = 4.0,
-    tone: str = "viral",
+async def _translate_chunk(
+    chunk_segs: list,
+    target: str,
+    glossary: str = "",
+    before: list | None = None,
+    after: list | None = None,
+    with_gender: bool = False,
 ) -> list[dict]:
-    """Generate high-retention viral opening hook scripts (~3-8s) before starting a video."""
-    prompt = f"""You are a master viral video hook creator for TikTok, YouTube Shorts, and Reels.
-Create 5 distinctly styled, viral opening hooks (length ~{duration_seconds:.1f}s) designed to stop viewers from scrolling in the first 3-5 seconds.
+    """Translate one chunk with retries. Returns one {"text", "speaker"} per line;
+    text is "" for lines Gemini did not translate."""
+    lang_name = TRANSLATION_LANGUAGES.get(target, target)
 
-Title/Topic: {original_title or 'Video'}
-Target Duration: ~{duration_seconds:.1f} seconds (around {max(8, int(duration_seconds * 3.5))} to {max(12, int(duration_seconds * 5.5))} Khmer words)
-Language: {language} (Authentic, natural, expressive spoken Cambodian Khmer)
-Tone: {tone}
+    def prompt_for(segs):
+        return _build_translation_prompt(segs, target, lang_name, glossary, before, after, with_gender)
 
-Content Context:
-{transcript_text[:3500] if transcript_text else 'Exciting movie scene / story'}
+    key = (target, prompt_for(chunk_segs))
+    if key in _translation_cache:
+        _translation_cache.move_to_end(key)
+        return _translation_cache[key]
 
-Generate a JSON array with 5 hook variations:
-[
-  {{
-    "hook_id": "hook_1",
-    "category": "curiosity_gap",
-    "category_label": "Viral Curiosity Hook",
-    "text": "តើអ្នកដឹងទេថា ហេតុអ្វីបានជា...",
-    "estimated_seconds": {duration_seconds:.1f},
-    "why_it_works": "Piques immediate curiosity by asking an unexpected question."
-  }},
-  {{
-    "hook_id": "hook_2",
-    "category": "action_shock",
-    "category_label": "Action Shock Hook",
-    "text": "ត្រឹមតែមួយពព្រិចភ្នែក អ្វីៗទាំងអស់ត្រូវបានផ្លាស់ប្តូរទាំងស្រុង!",
-    "estimated_seconds": {duration_seconds:.1f},
-    "why_it_works": "Creates high stakes and sudden tension."
-  }},
-  {{
-    "hook_id": "hook_3",
-    "category": "drama_rage",
-    "category_label": "Drama & Mystery Hook",
-    "text": "គ្មានអ្នកណាស្មានដល់ថា រឿងនេះនឹងកើតឡើងនោះទេ!",
-    "estimated_seconds": {duration_seconds:.1f},
-    "why_it_works": "Emotional appeal that triggers intrigue."
-  }},
-  {{
-    "hook_id": "hook_4",
-    "category": "world_building",
-    "category_label": "World-Building Question",
-    "text": "តើមានអ្វីកើតឡើង នៅពេលដែល...",
-    "estimated_seconds": {duration_seconds:.1f},
-    "why_it_works": "Immerses viewer into the scene instantly."
-  }},
-  {{
-    "hook_id": "hook_5",
-    "category": "cliffhanger",
-    "category_label": "Suspense Cliffhanger",
-    "text": "មុនពេលដែលអ្នកសម្រេចចិត្ត សូមមើលឈុតនេះសិន!",
-    "estimated_seconds": {duration_seconds:.1f},
-    "why_it_works": "Commands attention and delays drop-off."
-  }}
-]
+    out = [{"text": "", "speaker": ""} for _ in chunk_segs]
+    pending = list(range(len(chunk_segs)))
+    for attempt in range(TRANSLATE_ATTEMPTS):
+        try:
+            # a retry asks only for the lines that are still missing
+            response = await _generate_with_fallback(
+                prompt_for([chunk_segs[i] for i in pending]),
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                ),
+            )
+            raw = response.text.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+            extracted = _extract_translated_list(_safe_json_loads(raw), len(pending))
+            for i, item in zip(pending, extracted):
+                if item and item.get("text"):
+                    out[i] = _clean_translation(item, target)
+            pending = [i for i in pending if not out[i]["text"]]
+            if not pending:
+                break
+        except Exception as e:
+            print(f"[translate] chunk attempt {attempt + 1} failed: {e}", flush=True)
 
-Return ONLY the raw JSON array."""
+    if not pending:
+        _translation_cache[key] = out
+        if len(_translation_cache) > _TRANSLATION_CACHE_MAX:
+            _translation_cache.popitem(last=False)
+    return out
 
+
+async def _iter_translated_chunks(segments: list, target: str, context: list | None = None, shared_glossary: str = ""):
+    """Translate chunks in sequence so earlier translations inform subsequent dialogue.
+
+    `context` is the whole dialogue in order (the lines being translated may be only some of
+    it). It supplies the glossary and the lines either side of each chunk."""
+    await _configure_genai()
+    story = [dict(s) for s in (context or segments)]
+    # The heard voice is only worth telling the translator when it was actually detected:
+    # an imported subtitle file leaves every line on the same default.
+    with_gender = len({(s.get("voice_profile") or "").lower() in _MALE_PROFILES for s in story}) > 1
+    glossary = (await _build_glossary(story, target)) + shared_glossary
+    position = {s.get("id"): i for i, s in enumerate(story) if s.get("id")}
+    def _around(chunk, start):
+        first, last = position.get(chunk[0].get("id")), position.get(chunk[-1].get("id"))
+        if first is None or last is None:
+            if context:
+                return [], []
+            first, last = start, start + len(chunk) - 1
+        return story[max(0, first - CONTEXT_BEFORE):first], story[last + 1:last + 1 + CONTEXT_AFTER]
+
+    for start in range(0, len(segments), TRANSLATE_CHUNK_SIZE):
+        chunk = segments[start:start + TRANSLATE_CHUNK_SIZE]
+        before, after = _around(chunk, start)
+        translated = await _translate_chunk(chunk, target, glossary, before, after, with_gender)
+        for offset, (seg, result) in enumerate(zip(chunk, translated)):
+            at = position.get(seg.get("id"))
+            if at is None and not context:
+                at = start + offset
+            if at is not None and result["text"]:
+                story[at]["translation"] = result["text"]
+        yield start, chunk, translated
+
+
+async def translate_segments(segments: list, target_language: str = "km", context: list | None = None, shared_glossary: str = "") -> list:
+    """Translate all subtitle segments; lines that fail keep their original text."""
+    if not segments:
+        return []
+    target = _effective_target(target_language)
+    result = []
+    async for _, chunk_segs, translated in _iter_translated_chunks(segments, target, context, shared_glossary):
+        for seg, t in zip(chunk_segs, translated):
+            new_seg = dict(seg)
+            if t["text"]:
+                new_seg["text"] = t["text"]
+                if t["speaker"]:
+                    new_seg["speaker"] = t["speaker"]
+            result.append(new_seg)
+    return result
+
+
+async def translate_segments_stream(segments: list, target_language: str = "km", context: list | None = None, shared_glossary: str = ""):
+    """Yield one progress item per segment as chunks finish (in order).
+    Failed lines have text "" and failed=True so callers don't overwrite them."""
+    if not segments:
+        return
+    target = _effective_target(target_language)
+    total = len(segments)
+    processed = 0
+    async for start, chunk_segs, translated in _iter_translated_chunks(segments, target, context, shared_glossary):
+        for local_idx, (orig_seg, t) in enumerate(zip(chunk_segs, translated)):
+            processed += 1
+            yield {
+                "id": orig_seg.get("id"),
+                "index": start + local_idx,
+                "text": t["text"],
+                "speaker": t["speaker"],
+                "failed": not t["text"],
+                "current": processed,
+                "total": total,
+                "percent": round((processed / total) * 100),
+            }
+
+
+SHORTEN_CHUNK_SIZE = 30
+
+
+async def shorten_lines(items: list, target_language: str = "km") -> list[str]:
+    """Rewrite lines that are too long to say in their time, each within its own limit.
+
+    `items` are {"source": original dialogue, "text": current line, "max_chars": limit}.
+    Returns the rewritten text for each, or "" where no usable rewrite came back. Only the
+    wording changes; the caller decides what to keep.
+    """
+    if not items:
+        return []
+    await _configure_genai()
+    target = _effective_target(target_language)
+    lang_name = TRANSLATION_LANGUAGES.get(target, target)
+    out = [""] * len(items)
+
+    async def one(start: int) -> None:
+        chunk = items[start:start + SHORTEN_CHUNK_SIZE]
+        numbered = "\n".join(
+            f"{i + 1}. (limit {int(it['max_chars'])} characters; now {len(it['text'])})"
+            + (f" original: {it['source']} |" if it.get("source") and it["source"] != it["text"] else "")
+            + f" current: {it['text']}"
+            for i, it in enumerate(chunk)
+        )
+        prompt = f"""These lines of dubbed film dialogue are too long: the voice cannot say them in the time the
+character is speaking. Rewrite each one shorter, in natural spoken {lang_name}.
+
+Rules:
+- Each rewrite must be no longer than its limit, counted in characters.
+- Keep what the line is for: the point, the feeling, who is addressed. Cut filler, repetition,
+  and detail the scene already shows. Prefer the short everyday way of saying it.
+- Keep names exactly as they are written in the current line.
+- Write only {lang_name}{" in Khmer script" if target == "km" else ""}. No notes, no speaker labels.
+- If a line cannot be said any shorter without losing its meaning, return it unchanged.
+
+Return a JSON array, one object per line, in order: [{{"index": 1, "text": "shorter line"}}]
+Return ONLY the JSON array.
+
+Lines:
+{numbered}"""
+        try:
+            response = await _generate_with_fallback(
+                prompt,
+                generation_config=genai.types.GenerationConfig(temperature=0.2, response_mime_type="application/json"),
+            )
+            raw = re.sub(r"^```(?:json)?\n?|\n?```$", "", response.text.strip())
+            for i, item in enumerate(_extract_translated_list(_safe_json_loads(raw), len(chunk))):
+                if item.get("text"):
+                    out[start + i] = _clean_translation(item, target)["text"]
+        except Exception as e:
+            print(f"[shorten] chunk failed: {e}", flush=True)
+
+    sem = asyncio.Semaphore(MAX_PARALLEL_TRANSLATIONS)
+
+    async def limited(start: int) -> None:
+        async with sem:
+            await one(start)
+
+    await asyncio.gather(*[limited(i) for i in range(0, len(items), SHORTEN_CHUNK_SIZE)])
+    return out
+
+
+# --- Who speaks each line of an imported subtitle -----------------------------------------
+# A subtitle file gives the words and the times but almost never the speakers, and without a
+# speaker and a gender every line is dubbed in the same default voice. The audio does know:
+# the model is given each stretch of it with the lines that fall there and asked to label them.
+
+def _label_prompt(numbered: str, cast: dict[str, str]) -> str:
+    known = (
+        "CHARACTERS ALREADY IDENTIFIED earlier in this film or in earlier episodes of the same "
+        "series — when the same person speaks, use exactly the same name, and only make up a new "
+        "name for someone who is not on this list:\n" + "\n".join(f"- {name} ({profile})" for name, profile in cast.items()) + "\n\n"
+        if cast else ""
+    )
+    return f"""You are a film dialogue diarization expert. The audio is a stretch of a film. Below are the
+subtitle lines spoken in it, each with a label (L1, L2…), its time in seconds from the start of
+this audio, and its words. The words and times are already correct — do not change them.
+
+Listen to the audio and decide, for EVERY line, who is speaking it.
+
+{known}RULES:
+- "speaker": the character's name if it is said in the dialogue, otherwise who they are in the
+  scene ("Young Man", "Mother", "Guard", "Narrator"). Never "Unknown", "Speaker" or "?".
+  Use the SAME name every time the same voice speaks.
+- Write every name in ENGLISH letters, whatever language the dialogue is in: a Chinese name in
+  pinyin ("Xiao Feng", "Shopkeeper Gu"), never in Chinese characters. The people editing this
+  dub cannot read the original script.
+- "voice_profile": exactly one of "male", "female", "grandpa", "grandma", "child_boy",
+  "child_girl" — judged from the voice you hear, not from the name.
+- "gender": "male" or "female", matching voice_profile.
+- "emotion": one of "neutral", "angry", "happy", "sad", "crying", "laughing", "fearful",
+  "excited", "surprised", "serious", "calm", "whisper", "scream" — from how the line is delivered.
+- Return one object per line, in the same order, and no others.
+- "text" and "original_text" must be the line's LABEL (for example "L7"), not its words.
+
+Return ONLY a JSON array:
+[{{"start_time": 1.2, "end_time": 3.0, "text": "L1", "original_text": "L1", "speaker": "Tang Bohu", "gender": "male", "voice_profile": "male", "emotion": "angry"}}]
+
+LINES:
+{numbered}"""
+
+
+async def label_speakers(video_path: str, lines: list[dict], on_progress=None,
+                         known_cast: dict[str, str] | None = None) -> dict[str, dict]:
+    """Label each timed line with who speaks it. `lines` are {"id", "start_time", "end_time",
+    "text"} in the video's own time. Returns {id: {"speaker", "voice_profile", "emotion"}} for
+    the lines that could be labelled; a stretch that fails is left out, not guessed.
+
+    The film is worked through in order, one stretch at a time, so each stretch is told the
+    names used so far — in parallel, every stretch would name the same man differently.
+    `known_cast` ({name: voice profile}) starts that list with the people the series already
+    knows, so episode 40 calls a man what episode 1 called him.
+    """
+    if not lines:
+        return {}
+    await _configure_genai()
+    chunks, tmp_dir = await _split_video_chunks(video_path)
+    out: dict[str, dict] = {}
+    cast: dict[str, str] = dict(known_cast or {})
     try:
-        response = await _generate_with_fallback(prompt)
-        if response and response.text:
-            text = response.text.strip()
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?\n?", "", text)
-                text = re.sub(r"\n?```$", "", text)
-            data = _safe_json_loads(text)
-            if isinstance(data, list) and len(data) > 0:
-                return data
-    except Exception as e:
-        print(f"Error generating catchy hooks: {e}")
-
-    # Fallback hooks
-    return [
-        {
-            "hook_id": "hook_1",
-            "category": "curiosity_gap",
-            "category_label": "Viral Curiosity Hook",
-            "text": f"តើអ្នកដឹងទេថា ហេតុអ្វីបានជារឿងរ៉ាវក្នុង {original_title or 'រឿងនេះ'} ធ្វើឱ្យមនុស្សគ្រប់គ្នាភ្ញាក់ផ្អើល?",
-            "estimated_seconds": duration_seconds,
-            "why_it_works": "Piques instant viewer curiosity."
-        },
-        {
-            "hook_id": "hook_2",
-            "category": "action_shock",
-            "category_label": "Action Shock Hook",
-            "text": "ត្រឹមតែមួយពព្រិចភ្នែក អ្វីៗទាំងអស់ត្រូវបានផ្លាស់ប្តូរទាំងស្រុង!",
-            "estimated_seconds": duration_seconds,
-            "why_it_works": "High energy opening hook."
-        },
-        {
-            "hook_id": "hook_3",
-            "category": "drama_rage",
-            "category_label": "Drama & Mystery Hook",
-            "text": "រឿងរ៉ាវអាថ៌កំបាំងដែលគ្មាននរណាដឹង ត្រូវបានលាតត្រដាងនៅទីនេះ!",
-            "estimated_seconds": duration_seconds,
-            "why_it_works": "Deep curiosity hook."
-        }
-    ]
+        for index, (path, offset) in enumerate(chunks):
+            # a stretch owns the lines that start in its own two minutes, not in its lead-in
+            lo = index * CHUNK_DURATION if len(chunks) > 1 else 0.0
+            hi = (index + 1) * CHUNK_DURATION if index + 1 < len(chunks) else float("inf")
+            mine = [l for l in lines if lo <= l["start_time"] < hi]
+            if on_progress:
+                on_progress(index, len(chunks))
+            if not mine:
+                continue
+            numbered = "\n".join(
+                f"L{n + 1} [{max(0.0, l['start_time'] - offset):.1f}s–{max(0.0, l['end_time'] - offset):.1f}s] {l['text']}"
+                for n, l in enumerate(mine)
+            )
+            try:
+                answers = await _transcribe_media_with_fallback(path, _label_prompt(numbered, cast))
+            except Exception as e:
+                print(f"[speakers] stretch {index + 1}/{len(chunks)} failed: {type(e).__name__}", flush=True)
+                continue
+            for answer in answers or []:
+                m = re.search(r"\bL\s*(\d+)\b", f"{answer.get('text', '')} {answer.get('original_text', '')}")
+                if not m or not (1 <= int(m.group(1)) <= len(mine)):
+                    continue
+                speaker = str(answer.get("speaker") or "").strip()
+                if not speaker or speaker.lower() in ("speaker", "unknown", "unnamed", "?"):
+                    continue
+                profile = str(answer.get("voice_profile") or "female")
+                out[mine[int(m.group(1)) - 1]["id"]] = {
+                    "speaker": speaker, "voice_profile": profile, "emotion": str(answer.get("emotion") or "neutral"),
+                }
+                cast.setdefault(speaker, profile)
+        if on_progress:
+            on_progress(len(chunks), len(chunks))
+        return out
+    finally:
+        if tmp_dir and os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 

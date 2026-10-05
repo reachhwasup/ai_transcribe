@@ -8,6 +8,7 @@ AI-powered video transcription and translation to Khmer (ខ្មែរ) using 
 - **AI Transcription** — Automatic transcription using Google Gemini (2.5 Flash by default, configurable in Settings)
 - **Khmer Translation** — Transcribe and translate audio to Khmer language
 - **AI Narration (TTS)** — Emotion-aware speech per segment: edge-tts (fast) or VoxCPM2 (expressive AI voices, local)
+- **Capture Voice** — In the timeline editor toolbar → Capture Voice, mark 3–30 seconds in the original movie, preview the selection, and save a VoxCPM voice profile. Optionally assign it to a character and regenerate their dubbing. Choose clear solo speech; capture includes any background audio. Local VoxCPM is required for cloned speech generation.
 - **Audio Separation** — Isolate vocals from background music (Demucs), for dubbing over the original music
 - **Timeline Editor** — Visual drag-and-resize timeline for adjusting segment timing
 - **Transcript Editor** — Edit text, timestamps, and speaker labels

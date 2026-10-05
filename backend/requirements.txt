@@ -8,7 +8,7 @@ pydantic==2.10.4
 pydantic-settings==2.7.1
 python-dotenv==1.0.1
 moviepy==2.1.2
-aiofiles==24.1.0
 edge-tts>=7.0.0
 demucs>=4.0.0
 voxcpm>=1.0.3
+silero-vad>=6.0  # tells speech from sound effects in the vocal stem

@@ -1,8 +1,13 @@
 import { create } from 'zustand';
+import { toast } from '../utils/toast';
+import { nameParts } from '../utils/names';
 import type { Project, ProjectListItem, Segment, VideoClip } from '../types';
 import type { SubtitleStyle } from '../types/subtitleStyle';
 import { DEFAULT_SUBTITLE_STYLE } from '../types/subtitleStyle';
+import { saveProjectSetting, PROJECT_SETTINGS_SYNCED } from '../utils/projectSettings';
 import * as api from '../api/client';
+import { SPLIT_SUGGEST_SECONDS } from '../utils/splitting';
+import { closeTab } from '../utils/openTabs';
 
 interface CachedProjectState {
   project: Project;
@@ -17,6 +22,7 @@ interface CachedProjectState {
 // In-memory global caches so switching projects is instantaneous and background tasks never stop
 const _projectCache = new Map<string, CachedProjectState>();
 const _transcribeAbortMap = new Map<string, AbortController>();
+const _voiceGenAbortMap = new Map<string, AbortController>();
 const _transcribeStatusMap = new Map<
   string,
   { progress: string; percent: number; chunkInfo: { current: number; total: number } | null }
@@ -48,6 +54,8 @@ interface ProjectStore {
   selectedSegmentIds: Set<string>;
   videoMuted: boolean;
   uploadProgress: number;
+  /** Project id whose freshly uploaded video is long enough to offer splitting into parts. */
+  splitPromptProjectId: string | null;
   error: string | null;
   subtitleStyle: SubtitleStyle;
   subtitlesVisible: boolean;
@@ -63,22 +71,16 @@ interface ProjectStore {
   setAudioSeparated: (separated: boolean, vocalsUrl?: string | null, bgmUrl?: string | null) => void;
   checkAudioSeparation: (id?: string) => Promise<void>;
   setAspectRatio: (aspectRatio: string) => void;
-  setCanvasZoom: (canvasZoom: string) => void;
   setSubtitleStyle: (style: Partial<SubtitleStyle>) => void;
-  setSubtitlesVisible: (visible: boolean) => void;
   toggleSubtitlesVisible: () => void;
-  setVideoVisible: (visible: boolean) => void;
-  toggleVideoVisible: () => void;
   toggleTrackVisibility: (trackId: string) => void;
   loadProjects: () => Promise<void>;
   loadProject: (id: string) => Promise<void>;
   createProject: (name: string, description?: string, language?: string) => Promise<Project>;
-  updateProjectName: (name: string) => Promise<void>;
   deleteProject: (id: string) => Promise<void>;
   uploadVideo: (file: File) => Promise<void>;
-  removeVideo: () => Promise<void>;
+  setSplitPrompt: (projectId: string | null) => void;
   generateTranscript: (language?: string) => void;
-  cancelTranscription: () => void;
   updateSegment: (segmentId: string, updates: Partial<Segment>) => Promise<void>;
   deleteSegment: (segmentId: string) => Promise<void>;
   deleteMultipleSegments: (segmentIds: string[]) => Promise<void>;
@@ -86,13 +88,15 @@ interface ProjectStore {
   rechunkSegments: (wordsPerSegment: number) => Promise<void>;
   addSegment: (segment: Partial<Segment>) => Promise<void>;
   bulkSetVoice: (voice: string, segmentIds?: string[]) => Promise<void>;
+  cancelVoiceGeneration: (projectId?: string) => void;
   generateVoiceForSegments: (
     segmentIds?: string[],
     speed?: number,
     fitMode?: string,
     voiceName?: string,
     emotion?: string,
-    skipExisting?: boolean
+    skipExisting?: boolean,
+    voiceFx?: string
   ) => Promise<void>;
   setActiveSegment: (id: string | null) => void;
   setCurrentTime: (time: number) => void;
@@ -103,6 +107,9 @@ interface ProjectStore {
   setVideoMuted: (muted: boolean) => void;
   clearError: () => void;
 }
+
+/** Episodes share a long series name; the part that tells them apart is what a toast shows */
+const shortName = (name: string) => nameParts(name).tail || name;
 
 export const useProjectStore = create<ProjectStore>((set, get) => {
   return {
@@ -126,6 +133,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     selectedSegmentIds: new Set<string>(),
     videoMuted: false,
     uploadProgress: 0,
+    splitPromptProjectId: null,
     subtitleStyle: DEFAULT_SUBTITLE_STYLE,
     subtitlesVisible: true,
     videoVisible: true,
@@ -182,6 +190,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       if (cur) {
         localStorage.setItem(`aspect-ratio-${cur.id}`, aspectRatio);
         localStorage.setItem('meatika-user-aspect-ratio', aspectRatio);
+        saveProjectSetting(cur.id, 'aspect_ratio', aspectRatio);
         const cached = _projectCache.get(cur.id);
         if (cached) {
           _projectCache.set(cur.id, { ...cached, aspectRatio });
@@ -190,20 +199,8 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         localStorage.setItem('meatika-user-aspect-ratio', aspectRatio);
       }
     },
-    setCanvasZoom: (canvasZoom: string) => {
-      set({ canvasZoom });
-    },
-    setSubtitlesVisible: (subtitlesVisible: boolean) => {
-      set({ subtitlesVisible });
-    },
     toggleSubtitlesVisible: () => {
       set((state) => ({ subtitlesVisible: !state.subtitlesVisible }));
-    },
-    setVideoVisible: (videoVisible: boolean) => {
-      set({ videoVisible });
-    },
-    toggleVideoVisible: () => {
-      set((state) => ({ videoVisible: !state.videoVisible }));
     },
     toggleTrackVisibility: (trackId: string) => {
       set((state) => {
@@ -290,6 +287,9 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         try {
           const raw = localStorage.getItem(`subtitle-style-${id}`);
           if (raw) subtitleStyle = { ...subtitleStyle, ...JSON.parse(raw) };
+          // Size used to be a fixed pixel value the export never read; sizePct is the one
+          // setting both use now, so drop the stale one.
+          delete subtitleStyle.fontSize;
         } catch { /* ignore */ }
 
         const audioSeparated = !!(sep?.separated && sep?.vocals_url && sep?.bgm_url);
@@ -343,6 +343,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         const cached = _projectCache.get(cur.id);
         if (cached) _projectCache.set(cur.id, { ...cached, subtitleStyle: merged });
         localStorage.setItem(`subtitle-style-${cur.id}`, JSON.stringify(merged));
+        saveProjectSetting(cur.id, 'caption_style', merged);
       }
       set({ subtitleStyle: merged });
     },
@@ -370,23 +371,11 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       }
     },
 
-    updateProjectName: async (name: string) => {
-      const { currentProject } = get();
-      if (!currentProject) return;
-      try {
-        const updated = await api.updateProject(currentProject.id, { name });
-        const cached = _projectCache.get(currentProject.id);
-        if (cached) _projectCache.set(currentProject.id, { ...cached, project: updated });
-        set({ currentProject: updated });
-        await get().loadProjects();
-      } catch (e: any) {
-        set({ error: e.message });
-      }
-    },
-
     deleteProject: async (id: string) => {
       try {
         await api.deleteProject(id);
+        // A tab left pointing at a deleted project loads a 404, so it goes with it
+        closeTab(id);
         _projectCache.delete(id);
         _transcribeAbortMap.get(id)?.abort();
         _transcribeAbortMap.delete(id);
@@ -417,35 +406,22 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
             videoClips: updated.video_clips || [],
           });
         }
-        set({ currentProject: updated, uploadProgress: 100, videoClips: updated.video_clips || [] });
+        set({
+          currentProject: updated,
+          uploadProgress: 100,
+          videoClips: updated.video_clips || [],
+          // Long uploads are offered a split into part projects; short ones are left alone.
+          splitPromptProjectId:
+            (updated.duration || 0) >= SPLIT_SUGGEST_SECONDS && !updated.part_index
+              ? updated.id
+              : null,
+        });
       } catch (e: any) {
         set({ error: e.message, uploadProgress: 0 });
       }
     },
 
-    removeVideo: async () => {
-      const project = get().currentProject;
-      if (!project) return;
-      try {
-        const updated = await api.removeProjectVideo(project.id);
-        const cached = _projectCache.get(project.id);
-        if (cached) {
-          _projectCache.set(project.id, {
-            ...cached,
-            project: updated,
-            videoClips: [],
-          });
-        }
-        set({
-          currentProject: updated,
-          videoClips: [],
-          currentTime: 0,
-          isPlaying: false,
-        });
-      } catch (e: any) {
-        set({ error: e.message });
-      }
-    },
+    setSplitPrompt: (projectId: string | null) => set({ splitPromptProjectId: projectId }),
 
     generateTranscript: (language?: string) => {
       const project = get().currentProject;
@@ -455,10 +431,11 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
 
       // Cancel any prior transcription for this project
       _transcribeAbortMap.get(targetProjectId)?.abort();
+      toast({ tone: 'working', title: 'Writing captions', detail: shortName(project.name) });
 
       const initialStatus = {
         progress: 'Initializing AI Speech Recognition...',
-        percent: 5,
+        percent: 0,
         chunkInfo: null,
       };
       _transcribeStatusMap.set(targetProjectId, initialStatus);
@@ -506,7 +483,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
           }
         },
         // onDone
-        () => {
+        (_total, warning) => {
+          toast(warning
+            ? { tone: 'warning', title: 'Captions written, with gaps', detail: `${shortName(project.name)} — ${warning}` }
+            : { tone: 'success', title: 'Captions written', detail: shortName(project.name) });
           _transcribeAbortMap.delete(targetProjectId);
           _transcribeStatusMap.delete(targetProjectId);
           const c = _projectCache.get(targetProjectId);
@@ -524,11 +504,13 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
               transcribeProgress: '',
               transcribePercent: 100,
               transcribeChunkInfo: null,
+              ...(warning ? { error: warning } : {}),
             });
           }
         },
         // onError
         (errMsg) => {
+          toast({ tone: 'error', title: 'Writing captions failed', detail: `${shortName(project.name)} — ${errMsg}` });
           _transcribeAbortMap.delete(targetProjectId);
           _transcribeStatusMap.delete(targetProjectId);
           if (get().currentProject?.id === targetProjectId) {
@@ -544,9 +526,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         },
         // onProgress
         (prog) => {
+          const previousPercent = _transcribeStatusMap.get(targetProjectId)?.percent ?? 0;
           const newStatus = {
             progress: prog.message || '',
-            percent: prog.percent || (prog.currentChunk && prog.totalChunks ? Math.round((prog.currentChunk / prog.totalChunks) * 100) : 10),
+            percent: Math.min(99, Math.max(previousPercent, Number.isFinite(prog.percent) ? prog.percent : previousPercent)),
             chunkInfo: prog.totalChunks > 0 ? { current: prog.currentChunk, total: prog.totalChunks } : null,
           };
           _transcribeStatusMap.set(targetProjectId, newStatus);
@@ -562,22 +545,6 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       );
 
       _transcribeAbortMap.set(targetProjectId, abortCtrl);
-    },
-
-    cancelTranscription: () => {
-      const cur = get().currentProject;
-      if (cur) {
-        _transcribeAbortMap.get(cur.id)?.abort();
-        _transcribeAbortMap.delete(cur.id);
-        _transcribeStatusMap.delete(cur.id);
-      }
-      set({
-        transcribingProjectId: null,
-        isTranscribing: false,
-        transcribeProgress: '',
-        transcribePercent: 0,
-        transcribeChunkInfo: null,
-      });
     },
 
     updateSegment: async (segmentId: string, updates: Partial<Segment>) => {
@@ -779,19 +746,44 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       }
     },
 
+    cancelVoiceGeneration: (projectId?: string) => {
+      const id = projectId || get().generatingVoiceProjectId || get().currentProject?.id;
+      if (!id) return;
+      _voiceGenAbortMap.get(id)?.abort();
+      // Keep ownership until the aborted request finishes its cleanup.
+      _voiceGenStatusMap.delete(id);
+      set({
+        generatingVoiceProjectId: null,
+        ...(get().currentProject?.id === id
+          ? { isGeneratingAudio: false, activeGeneratingSegmentId: null }
+          : {}),
+      });
+    },
+
     generateVoiceForSegments: async (
       segmentIds?: string[],
       speed: number = 1.0,
-      fitMode: string = 'A',
+      fitMode: string = 'B',
       voiceName?: string,
       emotion?: string,
-      skipExisting: boolean = true
+      skipExisting: boolean = true,
+      voiceFx?: string
     ) => {
       const project = get().currentProject;
       if (!project) return;
       const targetProjectId = project.id;
+      if (_voiceGenAbortMap.has(targetProjectId)) {
+        throw new Error('Voice generation is already running or stopping for this project. Wait for it to finish before starting again.');
+      }
 
       _voiceGenStatusMap.set(targetProjectId, { progress: 0, total: 0, activeSegmentId: null });
+      const lines = segmentIds?.length;
+      toast({ tone: 'working', title: lines === 1 ? 'Dubbing a line' : lines ? `Dubbing ${lines} lines` : 'Dubbing', detail: shortName(project.name) });
+
+      // Dubbing a long project can run for hours, so it has to be interruptible. Aborting the
+      // fetch drops the connection, which is what tells the server to stop synthesising.
+      const abortCtrl = new AbortController();
+      _voiceGenAbortMap.set(targetProjectId, abortCtrl);
 
       set({
         generatingVoiceProjectId: targetProjectId,
@@ -813,10 +805,15 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
             voice_name: voiceName || null,
             emotion: emotion || null,
             skip_existing: skipExisting,
+            voice_fx: voiceFx ?? null,
           }),
+          signal: abortCtrl.signal,
         });
 
-        if (!resp.ok) throw new Error('Failed to generate voice audio');
+        if (!resp.ok) {
+          const detail = await resp.json().catch(() => null);
+          throw new Error(detail?.detail || 'Failed to generate voice audio');
+        }
 
         const reader = resp.body?.getReader();
         if (!reader) throw new Error('No stream');
@@ -873,6 +870,9 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
 
                 if (isCurrent) {
                   set({ audioGenProgress: evt.completed, audioGenTotal: evt.total });
+                  if (evt.status === 'error') {
+                    set({ error: evt.message || 'Voice generation failed for a line. Please retry.' });
+                  }
                   if (evt.status === 'done' && evt.audio_url) {
                     const cur = get().currentProject;
                     if (cur && cur.id === targetProjectId) {
@@ -895,8 +895,14 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
                   }
                 }
               } else if (evt.type === 'done') {
+                toast(evt.failed > 0
+                  ? { tone: 'warning', title: `Dubbing finished — ${evt.failed} line${evt.failed === 1 ? '' : 's'} failed`, detail: shortName(project.name) }
+                  : { tone: 'success', title: 'Dubbing finished', detail: shortName(project.name) });
                 _voiceGenStatusMap.delete(targetProjectId);
                 if (isCurrent) set({ activeGeneratingSegmentId: null, isGeneratingAudio: false });
+                if (isCurrent && evt.failed > 0 && !get().error) {
+                  set({ error: `${evt.failed} voice clips failed to generate. Please retry those lines.` });
+                }
               } else if (evt.type === 'error') {
                 _voiceGenStatusMap.delete(targetProjectId);
                 throw new Error(evt.message);
@@ -908,11 +914,19 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         }
       } catch (e: any) {
         _voiceGenStatusMap.delete(targetProjectId);
+        if (e?.name === 'AbortError') {
+          // Stopped on purpose: lines dubbed so far are already saved.
+          toast({ tone: 'info', title: 'Dubbing stopped', detail: `${shortName(project.name)} — voiced lines are kept` });
+          if (get().currentProject?.id === targetProjectId) set({ isGeneratingAudio: false });
+          return;
+        }
+        toast({ tone: 'error', title: 'Dubbing failed', detail: `${shortName(project.name)} — ${e.message}` });
         if (get().currentProject?.id === targetProjectId) {
           set({ error: e.message, isGeneratingAudio: false });
         }
         throw e;
       } finally {
+        _voiceGenAbortMap.delete(targetProjectId);
         _voiceGenStatusMap.delete(targetProjectId);
         if (get().generatingVoiceProjectId === targetProjectId) {
           set({
@@ -923,9 +937,9 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       }
     },
 
-    setActiveSegment: (id) => set({ activeSegmentId: id }),
-    setCurrentTime: (time) => set({ currentTime: time }),
-    setIsPlaying: (playing) => set({ isPlaying: playing }),
+    setActiveSegment: (id) => { if (get().activeSegmentId !== id) set({ activeSegmentId: id }); },
+    setCurrentTime: (time) => { if (get().currentTime !== time) set({ currentTime: time }); },
+    setIsPlaying: (playing) => { if (get().isPlaying !== playing) set({ isPlaying: playing }); },
     setVideoClips: (clips) => {
       const cur = get().currentProject;
       if (cur) {
@@ -970,3 +984,25 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     clearError: () => set({ error: null }),
   };
 });
+
+// Settings pulled from the server may differ from what was loaded from the browser copy
+if (typeof window !== 'undefined') {
+  window.addEventListener(PROJECT_SETTINGS_SYNCED, (e) => {
+    const id = (e as CustomEvent).detail?.projectId;
+    const st = useProjectStore.getState();
+    if (!id || st.currentProject?.id !== id) return;
+    try {
+      const raw = localStorage.getItem(`subtitle-style-${id}`);
+      const style = { ...DEFAULT_SUBTITLE_STYLE, ...(raw ? JSON.parse(raw) : {}) };
+      delete (style as { fontSize?: number }).fontSize;
+      const aspect = localStorage.getItem(`aspect-ratio-${id}`);
+      useProjectStore.setState({ subtitleStyle: style, ...(aspect ? { aspectRatio: aspect } : {}) });
+    } catch {
+      /* keep what is loaded */
+    }
+  });
+}
+
+// The API client names the project in its start/finish toasts; it reads the store through this
+// instead of importing it, which would be a circular import.
+(globalThis as any).__projectStoreForToasts = useProjectStore;

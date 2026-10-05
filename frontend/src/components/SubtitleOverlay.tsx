@@ -15,18 +15,14 @@ import {
   Minus,
   Plus,
   MoreHorizontal,
-  Sparkles,
   Sliders,
-  CornerDownRight,
   Trash2,
-  Copy,
 } from 'lucide-react';
 
 interface Props {
   text: string;
   style: SubtitleStyle;
   frameHeight?: number;
-  segmentId?: string;
   currentTime?: number;
   segmentStart?: number;
   segmentEnd?: number;
@@ -43,7 +39,6 @@ export default function SubtitleOverlay({
   text,
   style,
   frameHeight = 360,
-  segmentId,
   currentTime,
   segmentStart,
   segmentEnd,
@@ -91,12 +86,14 @@ export default function SubtitleOverlay({
       ? 'top-1/2 -translate-y-1/2'
       : 'bottom-[8%]';
 
-  // Calculate pixel font size based on frame height or explicit fontSize
-  const calcFontSize = style.fontSize
-    ? style.fontSize
-    : Math.max(12, Math.round((frameHeight * (style.sizePct || 4.5)) / 100));
+  // Same sizing as the export (caption_render.py): the font is sizePct of the frame height
+  // (×0.75, the export's em), and every other pixel value is a "design px" on a 720-high
+  // frame scaled by k — so what shows here is what renders, at any player size.
+  const k = frameHeight / 720;
+  const calcFontSize = Math.max(6, (frameHeight * (style.sizePct || 4.5) * 0.75) / 100);
+  const weight = style.fontWeight === '900' ? 900 : style.fontWeight === 'bold' ? 700 : 400;
 
-  const ow = style.outlineWidth || 0;
+  const ow = (style.outlineWidth || 0) * k;
   let stroke =
     ow > 0
       ? [
@@ -114,13 +111,15 @@ export default function SubtitleOverlay({
       : undefined;
 
   // Add custom shadow if selected
-  if (style.textShadow === 'soft') {
-    stroke = stroke ? `${stroke}, 0 2px 8px rgba(0,0,0,0.8)` : '0 2px 8px rgba(0,0,0,0.8)';
-  } else if (style.textShadow === 'hard') {
-    stroke = stroke ? `${stroke}, 3px 3px 0px rgba(0,0,0,0.95)` : '3px 3px 0px rgba(0,0,0,0.95)';
-  } else if (style.textShadow === 'glow') {
-    stroke = stroke ? `${stroke}, 0 0 12px ${style.textColor || '#38bdf8'}` : `0 0 12px ${style.textColor || '#38bdf8'}`;
-  }
+  const shadow =
+    style.textShadow === 'soft'
+      ? `0 ${2 * k}px ${8 * k}px rgba(0,0,0,0.8)`
+      : style.textShadow === 'hard'
+      ? `${3 * k}px ${3 * k}px 0px rgba(0,0,0,0.95)`
+      : style.textShadow === 'glow'
+      ? `0 0 ${12 * k}px ${style.textColor || '#38bdf8'}`
+      : '';
+  if (shadow) stroke = stroke ? `${stroke}, ${shadow}` : shadow;
 
   const handleFontChange = (fontVal: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
@@ -132,8 +131,9 @@ export default function SubtitleOverlay({
   const handleFontSizeChange = (delta: number, e?: React.MouseEvent) => {
     e?.stopPropagation();
     e?.preventDefault();
-    const nextSize = Math.max(12, Math.min(80, calcFontSize + delta));
-    onChangeStyle?.({ fontSize: nextSize, sizePct: (nextSize / frameHeight) * 100 });
+    // ± buttons nudge the size by half a percent of the frame
+    const pct = Math.max(2, Math.min(12, (style.sizePct || 4.5) + (delta > 0 ? 0.5 : -0.5)));
+    onChangeStyle?.({ sizePct: Number(pct.toFixed(2)) });
   };
 
   const currentFontLabel =
@@ -153,7 +153,7 @@ export default function SubtitleOverlay({
       {/* Floating Caption Quick Toolbar (Visible when caption is selected) */}
       {isSelected && onChangeStyle && (
         <div
-          className="mb-2 bg-[#181a1f]/95 backdrop-blur-md border border-[#2f333d] rounded-xl shadow-2xl p-1.5 flex items-center gap-1.5 text-xs text-zinc-200 z-50 pointer-events-auto animate-in fade-in slide-in-from-bottom-1 relative"
+          className="mb-2 bg-[rgb(var(--s3-rgb)/0.95)] backdrop-blur-md border border-[var(--s6)] rounded-xl shadow-2xl p-1.5 flex items-center gap-1.5 text-xs text-zinc-200 z-50 pointer-events-auto animate-in fade-in slide-in-from-bottom-1 relative"
           onMouseDown={(e) => e.stopPropagation()}
           onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => e.stopPropagation()}
@@ -167,17 +167,17 @@ export default function SubtitleOverlay({
                 setShowOtherMenu(false);
               }}
               onMouseDown={(e) => e.stopPropagation()}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-[#22252c] hover:bg-[#2c3039] text-white font-medium text-[11px] transition-colors border border-zinc-700/50"
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-[var(--s4)] hover:bg-[var(--s6)] text-white font-medium text-[11px] transition-colors border border-zinc-700/50"
               title="Change Font Family"
             >
-              <Type className="w-3 h-3 text-pink-400" />
+              <Type className="w-3 h-3 text-zinc-400" />
               <span className="truncate max-w-[90px]">{currentFontLabel}</span>
               <ChevronDown className="w-3 h-3 text-zinc-400" />
             </button>
 
             {showFontDropdown && (
               <div
-                className="absolute bottom-full left-0 mb-1.5 w-48 bg-[#1a1c22] border border-[#2e323b] rounded-xl shadow-2xl py-1 z-50 max-h-56 overflow-y-auto"
+                className="absolute bottom-full left-0 mb-1.5 w-48 bg-[var(--s3)] border border-[var(--s6)] rounded-xl shadow-2xl py-1 z-50 max-h-56 overflow-y-auto"
                 onMouseDown={(e) => e.stopPropagation()}
                 onClick={(e) => e.stopPropagation()}
               >
@@ -189,13 +189,13 @@ export default function SubtitleOverlay({
                     key={f.label}
                     onClick={(e) => handleFontChange(f.value, e)}
                     onMouseDown={(e) => e.stopPropagation()}
-                    className={`w-full px-3 py-1.5 text-left text-xs flex items-center justify-between hover:bg-[#252830] transition-colors ${
-                      style.fontFamily === f.value ? 'text-pink-400 font-bold bg-[#252830]' : 'text-zinc-300'
+                    className={`w-full px-3 py-1.5 text-left text-xs flex items-center justify-between hover:bg-[var(--s5)] transition-colors ${
+                      style.fontFamily === f.value ? 'text-zinc-400 font-bold bg-[var(--s5)]' : 'text-zinc-300'
                     }`}
                     style={{ fontFamily: f.value }}
                   >
                     <span>{f.label}</span>
-                    {style.fontFamily === f.value && <Check className="w-3 h-3 text-pink-400" />}
+                    {style.fontFamily === f.value && <Check className="w-3 h-3 text-zinc-400" />}
                   </button>
                 ))}
               </div>
@@ -206,25 +206,25 @@ export default function SubtitleOverlay({
 
           {/* Font Size Minus / Plus */}
           <div
-            className="flex items-center gap-0.5 bg-[#22252c] rounded-lg border border-zinc-700/50 px-1 py-0.5"
+            className="flex items-center gap-0.5 bg-[var(--s4)] rounded-lg border border-zinc-700/50 px-1 py-0.5"
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
           >
             <button
               onClick={(e) => handleFontSizeChange(-2, e)}
               onMouseDown={(e) => e.stopPropagation()}
-              className="p-1 hover:bg-[#2c3039] rounded text-zinc-400 hover:text-white transition-colors"
+              className="p-1 hover:bg-[var(--s6)] rounded text-zinc-400 hover:text-white transition-colors"
               title="Decrease Font Size"
             >
               <Minus className="w-2.5 h-2.5" />
             </button>
             <span className="font-mono text-[11px] font-bold text-white px-1.5 min-w-[28px] text-center">
-              {calcFontSize}px
+              {(style.sizePct || 4.5).toFixed(1)}%
             </span>
             <button
               onClick={(e) => handleFontSizeChange(2, e)}
               onMouseDown={(e) => e.stopPropagation()}
-              className="p-1 hover:bg-[#2c3039] rounded text-zinc-400 hover:text-white transition-colors"
+              className="p-1 hover:bg-[var(--s6)] rounded text-zinc-400 hover:text-white transition-colors"
               title="Increase Font Size"
             >
               <Plus className="w-2.5 h-2.5" />
@@ -244,8 +244,8 @@ export default function SubtitleOverlay({
             onMouseDown={(e) => e.stopPropagation()}
             className={`p-1.5 rounded-lg border transition-colors ${
               style.fontWeight === 'bold'
-                ? 'bg-pink-500/20 text-pink-300 border-pink-500/50'
-                : 'bg-[#22252c] border-zinc-700/50 text-zinc-400 hover:text-white'
+                ? 'bg-white/10 text-zinc-200 border-white/10'
+                : 'bg-[var(--s4)] border-zinc-700/50 text-zinc-400 hover:text-white'
             }`}
             title="Toggle Bold"
           >
@@ -254,7 +254,7 @@ export default function SubtitleOverlay({
 
           {/* Text Color Input Swatch */}
           <label
-            className="flex items-center gap-1 cursor-pointer bg-[#22252c] border border-zinc-700/50 rounded-lg px-1.5 py-1 hover:bg-[#2c3039] transition-colors"
+            className="flex items-center gap-1 cursor-pointer bg-[var(--s4)] border border-zinc-700/50 rounded-lg px-1.5 py-1 hover:bg-[var(--s6)] transition-colors"
             title="Text Color"
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
@@ -273,7 +273,7 @@ export default function SubtitleOverlay({
 
           {/* Box / Background Color Swatch */}
           <label
-            className="flex items-center gap-1 cursor-pointer bg-[#22252c] border border-zinc-700/50 rounded-lg px-1.5 py-1 hover:bg-[#2c3039] transition-colors"
+            className="flex items-center gap-1 cursor-pointer bg-[var(--s4)] border border-zinc-700/50 rounded-lg px-1.5 py-1 hover:bg-[var(--s6)] transition-colors"
             title="Background Box Color"
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
@@ -292,7 +292,7 @@ export default function SubtitleOverlay({
 
           {/* Position Top / Middle / Bottom */}
           <div
-            className="flex items-center gap-0.5 bg-[#22252c] rounded-lg border border-zinc-700/50 p-0.5"
+            className="flex items-center gap-0.5 bg-[var(--s4)] rounded-lg border border-zinc-700/50 p-0.5"
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
           >
@@ -306,7 +306,7 @@ export default function SubtitleOverlay({
                 onMouseDown={(e) => e.stopPropagation()}
                 className={`px-1.5 py-0.5 rounded text-[10px] capitalize transition-colors ${
                   style.position === p
-                    ? 'bg-pink-500 text-white font-bold'
+                    ? 'bg-white/10 text-white font-bold'
                     : 'text-zinc-400 hover:text-white'
                 }`}
                 title={`Position: ${p}`}
@@ -329,7 +329,7 @@ export default function SubtitleOverlay({
               className={`p-1.5 rounded-lg border transition-colors ${
                 isSubtitlesVisible
                   ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50'
-                  : 'bg-[#22252c] text-zinc-500 border-zinc-700/50'
+                  : 'bg-[var(--s4)] text-zinc-500 border-zinc-700/50'
               }`}
               title={isSubtitlesVisible ? 'Hide Caption on Screen' : 'Show Caption on Screen'}
             >
@@ -349,7 +349,7 @@ export default function SubtitleOverlay({
               className={`p-1.5 rounded-lg border transition-colors ${
                 showOtherMenu
                   ? 'bg-blue-600 text-white border-blue-500'
-                  : 'bg-[#22252c] border-zinc-700/50 text-zinc-300 hover:text-white hover:bg-[#2c3039]'
+                  : 'bg-[var(--s4)] border-zinc-700/50 text-zinc-300 hover:text-white hover:bg-[var(--s6)]'
               }`}
               title="More Caption Settings (Other)"
             >
@@ -359,7 +359,7 @@ export default function SubtitleOverlay({
             {/* "Other" Advanced Settings Popover */}
             {showOtherMenu && (
               <div
-                className="absolute bottom-full right-0 mb-2 w-64 bg-[#181a20] border border-[#2e323b] rounded-2xl shadow-2xl p-3 z-50 space-y-3 animate-in fade-in slide-in-from-bottom-2 text-zinc-300 font-sans"
+                className="absolute bottom-full right-0 mb-2 w-64 bg-[var(--s3)] border border-[var(--s6)] rounded-2xl shadow-2xl p-3 z-50 space-y-3 animate-in fade-in slide-in-from-bottom-2 text-zinc-300 font-sans"
                 onMouseDown={(e) => e.stopPropagation()}
                 onClick={(e) => e.stopPropagation()}
               >
@@ -379,7 +379,7 @@ export default function SubtitleOverlay({
                 {/* Text Alignment */}
                 <div className="space-y-1">
                   <span className="text-[10px] text-zinc-400 block font-medium">Text Alignment</span>
-                  <div className="grid grid-cols-3 gap-1 bg-[#121316] p-1 rounded-xl border border-zinc-800">
+                  <div className="grid grid-cols-3 gap-1 bg-[var(--s2)] p-1 rounded-xl border border-zinc-800">
                     {[
                       { id: 'left', icon: AlignLeft, label: 'Left' },
                       { id: 'center', icon: AlignCenter, label: 'Center' },
@@ -408,7 +408,7 @@ export default function SubtitleOverlay({
                 {/* Capitalization / Transform */}
                 <div className="space-y-1">
                   <span className="text-[10px] text-zinc-400 block font-medium">Capitalization</span>
-                  <div className="grid grid-cols-4 gap-1 bg-[#121316] p-1 rounded-xl border border-zinc-800 text-[10px]">
+                  <div className="grid grid-cols-4 gap-1 bg-[var(--s2)] p-1 rounded-xl border border-zinc-800 text-[10px]">
                     {[
                       { id: 'none', label: 'Default' },
                       { id: 'uppercase', label: 'ALL CAPS' },
@@ -422,7 +422,7 @@ export default function SubtitleOverlay({
                           onClick={() => onChangeStyle({ textTransform: item.id as any })}
                           className={`py-1 rounded-lg transition-colors truncate px-1 text-center ${
                             isActive
-                              ? 'bg-pink-500 text-white font-bold'
+                              ? 'bg-white/10 text-white font-bold'
                               : 'text-zinc-400 hover:text-white hover:bg-zinc-800'
                           }`}
                         >
@@ -436,7 +436,7 @@ export default function SubtitleOverlay({
                 {/* Text Shadow & Glow */}
                 <div className="space-y-1">
                   <span className="text-[10px] text-zinc-400 block font-medium">Text Shadow / Glow</span>
-                  <div className="grid grid-cols-4 gap-1 bg-[#121316] p-1 rounded-xl border border-zinc-800 text-[10px]">
+                  <div className="grid grid-cols-4 gap-1 bg-[var(--s2)] p-1 rounded-xl border border-zinc-800 text-[10px]">
                     {[
                       { id: 'none', label: 'None' },
                       { id: 'soft', label: 'Soft Blur' },
@@ -450,7 +450,7 @@ export default function SubtitleOverlay({
                           onClick={() => onChangeStyle({ textShadow: item.id as any })}
                           className={`py-1 rounded-lg transition-colors truncate px-1 text-center ${
                             isActive
-                              ? 'bg-purple-600 text-white font-bold'
+                              ? 'bg-white/10 text-white font-bold'
                               : 'text-zinc-400 hover:text-white hover:bg-zinc-800'
                           }`}
                         >
@@ -484,7 +484,7 @@ export default function SubtitleOverlay({
                     <span>Box Corner Radius</span>
                     <span className="font-mono text-white">{style.borderRadius || 6}px</span>
                   </div>
-                  <div className="grid grid-cols-4 gap-1 bg-[#121316] p-1 rounded-xl border border-zinc-800 text-[10px]">
+                  <div className="grid grid-cols-4 gap-1 bg-[var(--s2)] p-1 rounded-xl border border-zinc-800 text-[10px]">
                     {[
                       { val: 0, label: '0px' },
                       { val: 6, label: '6px' },
@@ -512,7 +512,7 @@ export default function SubtitleOverlay({
                 {/* Motion / Animation */}
                 <div className="space-y-1">
                   <span className="text-[10px] text-zinc-400 block font-medium">Animation Effect</span>
-                  <div className="grid grid-cols-2 gap-1 bg-[#121316] p-1 rounded-xl border border-zinc-800 text-[10px]">
+                  <div className="grid grid-cols-2 gap-1 bg-[var(--s2)] p-1 rounded-xl border border-zinc-800 text-[10px]">
                     {[
                       { id: 'none', label: 'Static (None)' },
                       { id: 'karaoke', label: '🎤 Word Highlight' },
@@ -561,7 +561,7 @@ export default function SubtitleOverlay({
       <div
         className={`relative inline-block cursor-pointer transition-all duration-150 pointer-events-auto max-w-[90%] mx-auto text-center ${
           isSelected
-            ? 'ring-2 ring-pink-500 ring-offset-2 ring-offset-black/50 rounded-lg shadow-2xl'
+            ? 'ring-2 ring-white/20 ring-offset-2 ring-offset-black/50 rounded-lg shadow-2xl'
             : 'rounded'
         }`}
         onMouseDown={(e) => {
@@ -595,7 +595,7 @@ export default function SubtitleOverlay({
                 if (editText !== text) onUpdateText?.(editText);
               }
             }}
-            className="bg-black/80 text-white border-2 border-pink-500 rounded px-2 py-1 text-center outline-none font-semibold max-w-full"
+            className="bg-black/80 text-white border-2 border-white/10 rounded px-2 py-1 text-center outline-none font-semibold max-w-full"
             style={{
               fontSize: `${calcFontSize}px`,
               fontFamily: style.fontFamily || "'Kantumruy Pro', sans-serif",
@@ -607,8 +607,8 @@ export default function SubtitleOverlay({
             style={{
               fontFamily: style.fontFamily || "'Kantumruy Pro', sans-serif",
               fontSize: `${calcFontSize}px`,
-              fontWeight: style.fontWeight === 'bold' ? 700 : 400,
-              letterSpacing: `${style.letterSpacing || 0}px`,
+              fontWeight: weight,
+              letterSpacing: `${(style.letterSpacing || 0) * k}px`,
               lineHeight: style.lineHeight || 1.3,
               textAlign: (style.textAlign as any) || 'center',
               whiteSpace: 'pre-wrap',
@@ -622,9 +622,9 @@ export default function SubtitleOverlay({
                   : 'transparent',
               border:
                 (style.boxOutlineWidth || 0) > 0
-                  ? `${style.boxOutlineWidth}px solid ${style.boxOutlineColor || '#000000'}`
+                  ? `${(style.boxOutlineWidth || 0) * k}px solid ${style.boxOutlineColor || '#000000'}`
                   : undefined,
-              borderRadius: `${style.borderRadius ?? 6}px`,
+              borderRadius: `${(style.borderRadius ?? 6) * k}px`,
             }}
           >
             {words.map((w, idx) => {
@@ -646,7 +646,7 @@ export default function SubtitleOverlay({
                     opacity: isActive ? 1 : isPast ? 0.95 : 0.65,
                     padding: isActive && isBadge ? '1px 6px' : '0 2px',
                     borderRadius: isActive && isBadge ? '6px' : undefined,
-                    fontWeight: isActive ? 900 : style.fontWeight === 'bold' ? 700 : 400,
+                    fontWeight: isActive ? 900 : weight,
                     textShadow: isActive && !isBadge ? (stroke ? `${stroke}, 0 0 14px ${activeColor}` : `0 0 14px ${activeColor}`) : stroke,
                     transform: isActive && isScale ? 'scale(1.18)' : isActive ? 'scale(1.06)' : 'none',
                     margin: '0 2px',
@@ -673,8 +673,8 @@ export default function SubtitleOverlay({
             style={{
               fontFamily: style.fontFamily || "'Kantumruy Pro', sans-serif",
               fontSize: `${calcFontSize}px`,
-              fontWeight: style.fontWeight === 'bold' ? 700 : 400,
-              letterSpacing: `${style.letterSpacing || 0}px`,
+              fontWeight: weight,
+              letterSpacing: `${(style.letterSpacing || 0) * k}px`,
               lineHeight: style.lineHeight || 1.3,
               textAlign: (style.textAlign as any) || 'center',
               whiteSpace: 'pre-wrap',
@@ -690,9 +690,9 @@ export default function SubtitleOverlay({
                   : 'transparent',
               border:
                 (style.boxOutlineWidth || 0) > 0
-                  ? `${style.boxOutlineWidth}px solid ${style.boxOutlineColor || '#000000'}`
+                  ? `${(style.boxOutlineWidth || 0) * k}px solid ${style.boxOutlineColor || '#000000'}`
                   : undefined,
-              borderRadius: `${style.borderRadius ?? 6}px`,
+              borderRadius: `${(style.borderRadius ?? 6) * k}px`,
             }}
           >
             {text}
@@ -702,10 +702,10 @@ export default function SubtitleOverlay({
         {/* Selection Bounding Box Resize & Move Handles */}
         {isSelected && !isEditingText && (
           <>
-            <div className="absolute -top-1.5 -left-1.5 w-3 h-3 bg-pink-500 border-2 border-white rounded-full shadow" />
-            <div className="absolute -top-1.5 -right-1.5 w-3 h-3 bg-pink-500 border-2 border-white rounded-full shadow" />
-            <div className="absolute -bottom-1.5 -left-1.5 w-3 h-3 bg-pink-500 border-2 border-white rounded-full shadow" />
-            <div className="absolute -bottom-1.5 -right-1.5 w-3 h-3 bg-pink-500 border-2 border-white rounded-full shadow" />
+            <div className="absolute -top-1.5 -left-1.5 w-3 h-3 bg-white/10 border-2 border-white rounded-full shadow" />
+            <div className="absolute -top-1.5 -right-1.5 w-3 h-3 bg-white/10 border-2 border-white rounded-full shadow" />
+            <div className="absolute -bottom-1.5 -left-1.5 w-3 h-3 bg-white/10 border-2 border-white rounded-full shadow" />
+            <div className="absolute -bottom-1.5 -right-1.5 w-3 h-3 bg-white/10 border-2 border-white rounded-full shadow" />
           </>
         )}
       </div>

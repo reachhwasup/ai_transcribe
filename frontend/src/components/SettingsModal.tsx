@@ -13,6 +13,8 @@ import {
   uploadVoiceSampleAudio,
 } from '../api/client';
 import type { AppSettings, ApiKeyInfo, VoiceProfileItem } from '../api/client';
+import AppUpdate from './AppUpdate';
+import { fetchPronunciations, savePronunciations, fetchStalePronunciations, redubStalePronunciations, listenToPronunciation, type Pronunciation } from '../api/client';
 import {
   X,
   Key,
@@ -26,7 +28,6 @@ import {
   Trash2,
   ToggleLeft,
   ToggleRight,
-  Settings,
   Palette,
   Keyboard,
   Info,
@@ -38,19 +39,18 @@ import {
   Sliders,
   ShieldCheck,
   Volume2,
+  Mic,
   Layers,
   Play,
   Square,
   Edit2,
   UploadCloud,
-  Music,
-  User,
   CheckCircle2,
   Wand2,
 } from 'lucide-react';
 import { useThemeStore } from '../stores/themeStore';
 
-type Tab = 'general' | 'voices' | 'theme' | 'apikeys' | 'shortcuts' | 'about';
+type Tab = 'general' | 'voices' | 'pronunciation' | 'theme' | 'apikeys' | 'shortcuts' | 'about';
 
 interface ThemeColors {
   bgBase: string;
@@ -67,10 +67,10 @@ interface ThemeColors {
 }
 
 const DEFAULT_THEME: ThemeColors = {
-  bgBase: '#0f1117',
-  bgPanel: '#18181b',
-  bgHover: '#27272a',
-  borderColor: '#3f3f46',
+  bgBase: 'var(--s1)',
+  bgPanel: 'var(--s2)',
+  bgHover: 'var(--s4)',
+  borderColor: 'var(--s8)',
   borderLight: '#52525b',
   textBright: '#ffffff',
   textPrimary: '#e4e4e7',
@@ -124,13 +124,13 @@ applyTheme(loadTheme());
 function ThemeModeToggle() {
   const { mode, toggle } = useThemeStore();
   return (
-    <div className="inline-flex p-1 rounded-xl bg-[#181a20] border border-[#272b35] gap-1 shadow-inner">
+    <div className="inline-flex p-1 rounded-xl bg-[var(--s3)] border border-[var(--s5)] gap-1 shadow-inner">
       <button
         onClick={() => mode !== 'dark' && toggle()}
         className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
           mode === 'dark'
-            ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-md shadow-blue-900/30'
-            : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#20242e]'
+            ? 'bg-blue-600 text-white shadow-md shadow-blue-900/30'
+            : 'text-zinc-400 hover:text-zinc-200 hover:bg-[var(--s4)]'
         }`}
       >
         <Moon className="w-3.5 h-3.5" />
@@ -140,8 +140,8 @@ function ThemeModeToggle() {
         onClick={() => mode !== 'light' && toggle()}
         className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
           mode === 'light'
-            ? 'bg-gradient-to-r from-amber-500 to-orange-500 text-white shadow-md shadow-orange-900/30'
-            : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#20242e]'
+            ? 'bg-blue-600 text-white shadow-md shadow-blue-900/30'
+            : 'text-zinc-400 hover:text-zinc-200 hover:bg-[var(--s4)]'
         }`}
       >
         <Sun className="w-3.5 h-3.5" />
@@ -151,27 +151,11 @@ function ThemeModeToggle() {
   );
 }
 
+// Khmer only: Edge TTS ships two Khmer neural voices and the backend refuses anything
+// else, so offering other languages here would just be ignored.
 const EDGE_NEURAL_VOICES = [
   { id: 'km-KH-PisethNeural', name: 'Piseth (Khmer Male · ពិសិដ្ឋ)', lang: 'km', gender: 'male', engine: 'edge-tts' as const },
   { id: 'km-KH-SreymomNeural', name: 'Sreymom (Khmer Female · ស្រីមុំ)', lang: 'km', gender: 'female', engine: 'edge-tts' as const },
-  { id: 'en-US-AndrewMultilingualNeural', name: 'Andrew (English / Multilingual Male)', lang: 'en', gender: 'male', engine: 'edge-tts' as const },
-  { id: 'en-US-AvaMultilingualNeural', name: 'Ava (English / Multilingual Female)', lang: 'en', gender: 'female', engine: 'edge-tts' as const },
-  { id: 'en-US-BrianMultilingualNeural', name: 'Brian (English Documentary Male)', lang: 'en', gender: 'male', engine: 'edge-tts' as const },
-  { id: 'en-US-JennyNeural', name: 'Jenny (English Expressive Female)', lang: 'en', gender: 'female', engine: 'edge-tts' as const },
-  { id: 'en-US-GuyNeural', name: 'Guy (English News Anchor Male)', lang: 'en', gender: 'male', engine: 'edge-tts' as const },
-  { id: 'en-US-AnaNeural', name: 'Ana (English Child Female)', lang: 'en', gender: 'child', engine: 'edge-tts' as const },
-  { id: 'zh-CN-XiaoxiaoNeural', name: 'Xiaoxiao (Chinese Female · 晓晓)', lang: 'zh', gender: 'female', engine: 'edge-tts' as const },
-  { id: 'zh-CN-YunxiNeural', name: 'Yunxi (Chinese Male · 云希)', lang: 'zh', gender: 'male', engine: 'edge-tts' as const },
-  { id: 'zh-CN-XiaoyiNeural', name: 'Xiaoyi (Chinese Child · 晓依)', lang: 'zh', gender: 'child', engine: 'edge-tts' as const },
-  { id: 'zh-CN-YunjianNeural', name: 'Yunjian (Chinese Elderly · 云健)', lang: 'zh', gender: 'elderly', engine: 'edge-tts' as const },
-  { id: 'ja-JP-NanamiNeural', name: 'Nanami (Japanese Female · 七海)', lang: 'ja', gender: 'female', engine: 'edge-tts' as const },
-  { id: 'ja-JP-KeitaNeural', name: 'Keita (Japanese Male · 圭太)', lang: 'ja', gender: 'male', engine: 'edge-tts' as const },
-  { id: 'ko-KR-SunHiNeural', name: 'Sun-Hi (Korean Female · 선희)', lang: 'ko', gender: 'female', engine: 'edge-tts' as const },
-  { id: 'ko-KR-InJoonNeural', name: 'In-Joon (Korean Male · 인준)', lang: 'ko', gender: 'male', engine: 'edge-tts' as const },
-  { id: 'th-TH-PremwadeeNeural', name: 'Premwadee (Thai Female · เปรมวดี)', lang: 'th', gender: 'female', engine: 'edge-tts' as const },
-  { id: 'th-TH-NiwatNeural', name: 'Niwat (Thai Male · นิวัฒน์)', lang: 'th', gender: 'male', engine: 'edge-tts' as const },
-  { id: 'vi-VN-HoaiMyNeural', name: 'Hoai My (Vietnamese Female · Hoài My)', lang: 'vi', gender: 'female', engine: 'edge-tts' as const },
-  { id: 'vi-VN-NamMinhNeural', name: 'Nam Minh (Vietnamese Male · Nam Minh)', lang: 'vi', gender: 'male', engine: 'edge-tts' as const },
 ];
 
 const VOXCPM_NEURAL_VOICES = [
@@ -199,8 +183,6 @@ export default function SettingsModal({ open, onClose }: Props) {
   const [showNewKey, setShowNewKey] = useState(false);
   const [selectedModel, setSelectedModel] = useState('');
   const [ttsEngine, setTtsEngine] = useState('edge-tts');
-  const [voxcpmPath, setVoxcpmPath] = useState('openbmb/VoxCPM2');
-  const [voxcpmSteps, setVoxcpmSteps] = useState(10);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [addingKey, setAddingKey] = useState(false);
@@ -209,6 +191,58 @@ export default function SettingsModal({ open, onClose }: Props) {
 
   // Voice Profiles state
   const [voiceProfiles, setVoiceProfiles] = useState<VoiceProfileItem[]>([]);
+  const [pronunciations, setPronunciations] = useState<Pronunciation[]>([]);
+  const [savingPronunciations, setSavingPronunciations] = useState(false);
+  // dubbed lines that still say a word the way it was said before it was changed here
+  const [stale, setStale] = useState<{ lines: number; projects: number } | null>(null);
+  const [redubbing, setRedubbing] = useState(false);
+  const [listening, setListening] = useState<number | null>(null);
+  const checkStale = () => fetchStalePronunciations().then(setStale).catch(() => setStale(null));
+  const listen = async (idx: number, word: string) => {
+    if (!word.trim() || listening !== null) return;
+    setListening(idx);
+    try {
+      await persistPronunciations(pronunciations);      // heard as it is written now
+      const url = await listenToPronunciation(word);
+      const audio = new Audio(url);
+      audio.onended = () => URL.revokeObjectURL(url);
+      await audio.play();
+    } catch {
+      setRedubNote('The voice could not be played. Check the voice engine and try again.');
+    } finally { setListening(null); }
+  };
+  const redub = async () => {
+    setRedubbing(true);
+    try {
+      const done = await redubStalePronunciations();
+      setRedubNote(`${done.lines} line${done.lines === 1 ? '' : 's'} in ${done.projects} video${done.projects === 1 ? '' : 's'} queued for dubbing again.${done.busy ? ` ${done.busy} being dubbed right now were left alone.` : ''}`);
+    } catch {
+      setRedubNote('Could not queue the lines. Try again.');
+    } finally { setRedubbing(false); void checkStale(); }
+  };
+  const [redubNote, setRedubNote] = useState('');
+
+  useEffect(() => {
+    if (!open) return;
+    fetchPronunciations()
+      .then(setPronunciations)
+      .catch(() => setPronunciations([]));
+    setRedubNote('');
+    void checkStale();
+  }, [open]);
+
+  const persistPronunciations = async (next: Pronunciation[]) => {
+    setPronunciations(next);
+    setSavingPronunciations(true);
+    try {
+      await savePronunciations(next.filter((p) => p.word.trim() && p.say_as.trim()));
+    } catch {
+      /* keep the edits on screen; the next save will retry */
+    } finally {
+      setSavingPronunciations(false);
+      void checkStale();
+    }
+  };
   const [voiceFilter, setVoiceFilter] = useState<
     'all' | 'voxcpm' | 'edge' | 'male' | 'female' | 'child_boy' | 'child_girl' | 'grandpa' | 'grandma' | 'custom'
   >('all');
@@ -259,8 +293,6 @@ export default function SettingsModal({ open, onClose }: Props) {
       setSettings(s);
       setSelectedModel(s.gemini_model);
       setTtsEngine(s.tts_engine || 'edge-tts');
-      setVoxcpmPath(s.voxcpm_model_path || 'openbmb/VoxCPM2');
-      setVoxcpmSteps(s.voxcpm_inference_steps ?? 10);
     } catch {
       setError('Failed to load settings');
     }
@@ -295,32 +327,16 @@ export default function SettingsModal({ open, onClose }: Props) {
     }
   }, [open]);
 
-  const handleSave = async () => {
+  // Each choice is saved as it is made — there is no Save button to forget.
+  const saveNow = async (updates: { gemini_model?: string; tts_engine?: string; voxcpm_inference_steps?: number; separation_pace?: 'fast' | 'balanced' | 'cool' }) => {
     setSaving(true);
     setError('');
-    setSaved(false);
     try {
-      const updates: { gemini_model?: string; tts_engine?: string; voxcpm_model_path?: string; voxcpm_inference_steps?: number } = {};
-      if (selectedModel && selectedModel !== settings?.gemini_model) {
-        updates.gemini_model = selectedModel;
-      }
-      if (ttsEngine !== settings?.tts_engine) {
-        updates.tts_engine = ttsEngine;
-      }
-      if (ttsEngine === 'voxcpm' && voxcpmPath !== settings?.voxcpm_model_path) {
-        updates.voxcpm_model_path = voxcpmPath;
-      }
-      if (ttsEngine === 'voxcpm' && voxcpmSteps !== (settings?.voxcpm_inference_steps ?? 10)) {
-        updates.voxcpm_inference_steps = voxcpmSteps;
-      }
-      if (Object.keys(updates).length > 0) {
-        const updated = await updateSettings(updates);
-        setSettings(updated);
-      }
+      setSettings(await updateSettings(updates));
       setSaved(true);
       setTimeout(() => setSaved(false), 2200);
     } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Failed to save settings');
+      setError(e?.response?.data?.detail || 'That setting could not be saved');
     }
     setSaving(false);
   };
@@ -583,28 +599,18 @@ export default function SettingsModal({ open, onClose }: Props) {
 
   if (!open) return null;
 
-  const activeCount = settings?.api_keys.filter((k) => k.is_active).length ?? 0;
+  const activeCount = settings?.api_keys.filter((k) => k.is_active && k.usable !== false).length ?? 0;
+  const unusableCount = settings?.api_keys.filter((k) => k.usable === false).length ?? 0;
   const customVoiceCount = voiceProfiles.filter((p) => !p.is_built_in).length;
 
-  const tabs: { id: Tab; label: string; icon: React.ReactNode; badge?: string; badgeColor?: string }[] = [
-    { id: 'general', label: 'General & AI', icon: <Sparkles className="w-4 h-4 text-blue-400" /> },
-    {
-      id: 'voices',
-      label: 'Voice Profiles',
-      icon: <Volume2 className="w-4 h-4 text-purple-400" />,
-      badge: customVoiceCount > 0 ? `${customVoiceCount}` : undefined,
-      badgeColor: 'bg-purple-500/20 text-purple-300 border-purple-500/30',
-    },
-    { id: 'theme', label: 'Appearance', icon: <Palette className="w-4 h-4 text-pink-400" /> },
-    {
-      id: 'apikeys',
-      label: 'API Keys',
-      icon: <Key className="w-4 h-4 text-amber-400" />,
-      badge: activeCount > 0 ? `${activeCount}` : undefined,
-      badgeColor: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
-    },
-    { id: 'shortcuts', label: 'Shortcuts', icon: <Keyboard className="w-4 h-4 text-teal-400" /> },
-    { id: 'about', label: 'About', icon: <Info className="w-4 h-4 text-indigo-400" /> },
+  const tabs: { id: Tab; label: string; hint: string; icon: React.ReactNode; badge?: string; warn?: boolean }[] = [
+    { id: 'general', label: 'General', hint: 'AI model, voice engine, music isolation', icon: <Sliders className="w-4 h-4" /> },
+    { id: 'voices', label: 'Voices', hint: 'Built-in voices and your own', icon: <Volume2 className="w-4 h-4" />, badge: `${voiceProfiles.length}` },
+    { id: 'pronunciation', label: 'Pronunciation', hint: 'How names and words are said', icon: <Mic className="w-4 h-4" />, badge: pronunciations.length > 0 ? `${pronunciations.length}` : undefined },
+    { id: 'apikeys', label: 'API keys', hint: 'Gemini keys for captions and translation', icon: <Key className="w-4 h-4" />, badge: activeCount > 0 ? `${activeCount}` : 'none', warn: activeCount === 0 },
+    { id: 'theme', label: 'Appearance', hint: 'Colours', icon: <Palette className="w-4 h-4" /> },
+    { id: 'shortcuts', label: 'Shortcuts', hint: 'Keyboard shortcuts', icon: <Keyboard className="w-4 h-4" /> },
+    { id: 'about', label: 'About', hint: 'Version and what it is built on', icon: <Info className="w-4 h-4" /> },
   ];
 
   const themeFields: { key: keyof ThemeColors; label: string; desc: string }[] = [
@@ -640,29 +646,24 @@ export default function SettingsModal({ open, onClose }: Props) {
       onClick={onClose}
     >
       <div
-        className="bg-[#12141a] border border-[#232734] rounded-3xl w-full max-w-4xl shadow-2xl shadow-black/90 ring-1 ring-white/10 flex flex-col overflow-hidden text-[#e2e4e9]"
-        style={{ height: 'min(690px, 94vh)' }}
+        className="bg-[var(--s2)] border border-[var(--s5)] rounded-3xl w-full max-w-5xl shadow-2xl shadow-black/90 flex flex-col overflow-hidden text-[#e2e4e9]"
+        style={{ height: 'min(820px, 92vh)' }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-[#1e222d] bg-[#151821] shrink-0">
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-[var(--s4)] shrink-0">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-2xl bg-gradient-to-br from-blue-600 via-indigo-600 to-purple-600 flex items-center justify-center text-white shadow-lg shadow-indigo-950/60 border border-white/15">
+            <div className="w-9 h-9 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow-lg">
               <Sliders className="w-4 h-4" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <h2 className="text-sm font-bold text-white tracking-wide">Studio Settings & Preferences</h2>
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/15 text-blue-300 border border-blue-500/30 font-semibold font-mono">
-                  v2.4
-                </span>
-              </div>
-              <p className="text-[11px] text-zinc-400">Configure AI models, custom neural voices, API credentials, and timeline options</p>
+              <h2 className="text-sm font-bold text-white">Settings</h2>
+              <p className="text-[11px] text-zinc-400">These apply to every project</p>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="p-2 hover:bg-[#222634] rounded-xl text-zinc-400 hover:text-white transition-colors"
+            className="p-2 hover:bg-[var(--s5)] rounded-xl text-zinc-400 hover:text-white transition-colors"
             title="Close"
           >
             <X className="w-4 h-4" />
@@ -672,7 +673,7 @@ export default function SettingsModal({ open, onClose }: Props) {
         {/* Tabs + Content */}
         <div className="flex flex-1 overflow-hidden">
           {/* Sidebar Tabs */}
-          <div className="w-52 shrink-0 border-r border-[#1e222d] bg-[#14161f] p-3 space-y-1.5">
+          <div role="tablist" aria-label="Settings sections" className="w-48 shrink-0 border-r border-[var(--s4)] p-3 space-y-1">
             {tabs.map((tab) => {
               const isActive = activeTab === tab.id;
               return (
@@ -683,22 +684,21 @@ export default function SettingsModal({ open, onClose }: Props) {
                     setError('');
                     setIsEditingProfile(false);
                   }}
-                  className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-2xl text-xs font-semibold transition-all text-left relative ${
-                    isActive
-                      ? 'bg-gradient-to-r from-blue-600/25 via-indigo-600/15 to-transparent text-white border border-blue-500/50 shadow-md shadow-blue-950/40'
-                      : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#1b1e2a] border border-transparent'
+                  role="tab"
+                  aria-selected={isActive}
+                  title={tab.hint}
+                  className={`w-full flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-xs text-left transition-colors ${
+                    isActive ? 'bg-blue-600 text-white font-semibold' : 'text-zinc-400 hover:text-zinc-100 hover:bg-[var(--s4)]'
                   }`}
                 >
-                  <div className="flex items-center gap-2.5">
+                  <span className="flex items-center gap-2.5 min-w-0">
                     <span className="shrink-0">{tab.icon}</span>
-                    <span className="font-medium">{tab.label}</span>
-                  </div>
+                    <span className="truncate">{tab.label}</span>
+                  </span>
                   {tab.badge && (
-                    <span
-                      className={`text-[10px] px-1.5 py-0.5 rounded-full border font-mono font-bold ${
-                        tab.badgeColor || 'bg-blue-500/20 text-blue-300 border-blue-500/30'
-                      }`}
-                    >
+                    <span className={`text-[10px] px-1.5 rounded-full font-mono ${
+                      tab.warn ? 'bg-amber-500/20 text-amber-300' : isActive ? 'bg-white/20 text-white' : 'bg-white/10 text-zinc-300'
+                    }`}>
                       {tab.badge}
                     </span>
                   )}
@@ -708,7 +708,7 @@ export default function SettingsModal({ open, onClose }: Props) {
           </div>
 
           {/* Content Area */}
-          <div className="flex-1 flex flex-col overflow-hidden bg-[#121318]">
+          <div className="flex-1 flex flex-col overflow-hidden bg-[var(--s2)]">
             <div className="flex-1 overflow-y-auto p-6 space-y-6">
               {loading ? (
                 <div className="flex flex-col items-center justify-center py-16 text-zinc-400 gap-3">
@@ -724,12 +724,9 @@ export default function SettingsModal({ open, onClose }: Props) {
                       <div className="space-y-2.5">
                         <div className="flex items-center justify-between">
                           <div>
-                            <h3 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
-                              <Sparkles className="w-3.5 h-3.5 text-blue-400" />
-                              Transcription & AI Model
-                            </h3>
-                            <p className="text-[11px] text-zinc-400">
-                              Selected Gemini engine for multi-character diarization & speech localization
+                            <h3 className="text-xs font-bold text-white uppercase tracking-wider">AI model</h3>
+                            <p className="text-[11px] text-zinc-400 mt-0.5">
+                              The Gemini model that writes captions, translates and finds speakers. If it is busy or out of quota, the others are tried.
                             </p>
                           </div>
                         </div>
@@ -740,10 +737,8 @@ export default function SettingsModal({ open, onClose }: Props) {
                             return (
                               <label
                                 key={model.id}
-                                className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-all ${
-                                  isSel
-                                    ? 'bg-[#181e2b] border-blue-500/60 shadow-md shadow-blue-950/30 ring-1 ring-blue-500/30'
-                                    : 'bg-[#171922] border-[#262a35] hover:border-[#3a4050]'
+                                className={`flex items-center gap-3 px-3 py-2 rounded-xl border cursor-pointer transition-colors ${
+                                  isSel ? 'bg-blue-600/10 border-blue-500/60' : 'bg-[var(--s3)] border-[var(--s5)] hover:border-[var(--s8)]'
                                 }`}
                               >
                                 <input
@@ -751,27 +746,18 @@ export default function SettingsModal({ open, onClose }: Props) {
                                   name="model"
                                   value={model.id}
                                   checked={isSel}
-                                  onChange={() => setSelectedModel(model.id)}
+                                  onChange={() => { setSelectedModel(model.id); void saveNow({ gemini_model: model.id }); }}
                                   className="sr-only"
                                 />
                                 <div
-                                  className={`w-4 h-4 mt-0.5 rounded-full border-2 flex items-center justify-center shrink-0 transition-colors ${
+                                  className={`w-4 h-4 rounded-full border-2 flex items-center justify-center shrink-0 transition-colors ${
                                     isSel ? 'border-blue-400 bg-blue-500' : 'border-zinc-600'
                                   }`}
                                 >
                                   {isSel && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
                                 </div>
-                                <div className="flex-1 min-w-0">
-                                  <div className="flex items-center gap-2">
-                                    <span className="text-xs font-bold text-white">{model.name}</span>
-                                    {model.id.includes('2.0') && (
-                                      <span className="text-[9px] px-1.5 py-0.2 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 font-bold uppercase">
-                                        Next-Gen
-                                      </span>
-                                    )}
-                                  </div>
-                                  <p className="text-[11px] text-zinc-400 mt-0.5 leading-relaxed">{model.description}</p>
-                                </div>
+                                <span className="text-xs font-semibold text-white shrink-0">{model.name}</span>
+                                <span className="text-[11px] text-zinc-400 truncate">{model.description}</span>
                               </label>
                             );
                           })}
@@ -779,14 +765,11 @@ export default function SettingsModal({ open, onClose }: Props) {
                       </div>
 
                       {/* TTS Engine */}
-                      <div className="space-y-2.5 pt-2 border-t border-[#20242e]">
+                      <div className="space-y-2.5 pt-2 border-t border-[var(--s4)]">
                         <div>
-                          <h3 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
-                            <Volume2 className="w-3.5 h-3.5 text-purple-400" />
-                            Default Speech Synthesis Engine
-                          </h3>
-                          <p className="text-[11px] text-zinc-400">
-                            Neural voice engine powering character dubbing and recap narration
+                          <h3 className="text-xs font-bold text-white uppercase tracking-wider">Voice engine</h3>
+                          <p className="text-[11px] text-zinc-400 mt-0.5">
+                            What makes the voices when a line has no voice of its own chosen. Your cloned voices always use VoxCPM.
                           </p>
                         </div>
 
@@ -795,8 +778,8 @@ export default function SettingsModal({ open, onClose }: Props) {
                           <label
                             className={`flex flex-col justify-between p-3.5 rounded-xl border cursor-pointer transition-all ${
                               ttsEngine === 'edge-tts'
-                                ? 'bg-[#181e2b] border-blue-500/60 shadow-md shadow-blue-950/30 ring-1 ring-blue-500/30'
-                                : 'bg-[#171922] border-[#262a35] hover:border-[#3a4050]'
+                                ? 'bg-[var(--s3)] border-blue-500/60 shadow-md shadow-blue-950/30 ring-1 ring-blue-500/30'
+                                : 'bg-[var(--s3)] border-[var(--s5)] hover:border-[var(--s8)]'
                             }`}
                           >
                             <div>
@@ -805,14 +788,14 @@ export default function SettingsModal({ open, onClose }: Props) {
                                   <div className="w-6 h-6 rounded-lg bg-blue-600/20 text-blue-400 flex items-center justify-center font-bold text-xs">
                                     <Zap className="w-3.5 h-3.5" />
                                   </div>
-                                  <span className="text-xs font-bold text-white">Edge Neural TTS</span>
+                                  <span className="text-xs font-bold text-white">Edge voices</span>
                                 </div>
                                 <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-bold">
-                                  Ultra-Fast
+                                  Fast
                                 </span>
                               </div>
                               <p className="text-[11px] text-zinc-400 leading-relaxed">
-                                Microsoft Edge neural voices. Zero GPU overhead, studio DSP filters, and instant response.
+                                Microsoft’s Khmer voices, made online. A line takes about a second. Free.
                               </p>
                             </div>
                             <input
@@ -820,7 +803,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                               name="tts_engine"
                               value="edge-tts"
                               checked={ttsEngine === 'edge-tts'}
-                              onChange={() => setTtsEngine('edge-tts')}
+                              onChange={() => { setTtsEngine('edge-tts'); void saveNow({ tts_engine: 'edge-tts' }); }}
                               className="sr-only"
                             />
                           </label>
@@ -829,24 +812,24 @@ export default function SettingsModal({ open, onClose }: Props) {
                           <label
                             className={`flex flex-col justify-between p-3.5 rounded-xl border cursor-pointer transition-all ${
                               ttsEngine === 'voxcpm'
-                                ? 'bg-[#1f192b] border-purple-500/60 shadow-md shadow-purple-950/30 ring-1 ring-purple-500/30'
-                                : 'bg-[#171922] border-[#262a35] hover:border-[#3a4050]'
+                                ? 'bg-blue-600/10 border-blue-500/70 shadow-md ring-1 ring-blue-500/30'
+                                : 'bg-[var(--s3)] border-[var(--s5)] hover:border-[var(--s8)]'
                             }`}
                           >
                             <div>
                               <div className="flex items-center justify-between mb-2">
                                 <div className="flex items-center gap-2">
-                                  <div className="w-6 h-6 rounded-lg bg-purple-600/20 text-purple-400 flex items-center justify-center font-bold text-xs">
+                                  <div className="w-6 h-6 rounded-lg bg-white/10 text-zinc-400 flex items-center justify-center font-bold text-xs">
                                     <Sparkles className="w-3.5 h-3.5" />
                                   </div>
-                                  <span className="text-xs font-bold text-white">VoxCPM2 AI</span>
+                                  <span className="text-xs font-bold text-white">VoxCPM</span>
                                 </div>
-                                <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-purple-500/20 text-purple-400 border border-purple-500/30 font-bold">
-                                  Cinematic
+                                <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-white/10 text-zinc-400 border border-white/10 font-bold">
+                                  On this Mac
                                 </span>
                               </div>
                               <p className="text-[11px] text-zinc-400 leading-relaxed">
-                                2B parameter local generative voice model with natural emotional acting.
+                                Runs on this computer, so it is slower, and can copy a voice from a sample.
                               </p>
                             </div>
                             <input
@@ -854,10 +837,77 @@ export default function SettingsModal({ open, onClose }: Props) {
                               name="tts_engine"
                               value="voxcpm"
                               checked={ttsEngine === 'voxcpm'}
-                              onChange={() => setTtsEngine('voxcpm')}
+                              onChange={() => { setTtsEngine('voxcpm'); void saveNow({ tts_engine: 'voxcpm' }); }}
                               className="sr-only"
                             />
                           </label>
+                        </div>
+                      </div>
+
+                      {/* How hard cloned voices work the Mac */}
+                      <div className="space-y-2.5">
+                        <div>
+                          <h3 className="text-xs font-bold text-white uppercase tracking-wider">Cloned voice effort</h3>
+                          <p className="text-[11px] text-zinc-400 mt-0.5">
+                            Cloned voices (VoxCPM) are made on this Mac, which works it hard. A lighter setting finishes
+                            sooner and runs cooler; the voice is a little less polished. The built-in voices are not affected.
+                          </p>
+                        </div>
+                        <div className="grid grid-cols-3 gap-2">
+                          {([
+                            [10, 'Light', 'Fastest · one retake at most'],
+                            [15, 'Balanced', 'About 1.2× the time'],
+                            [30, 'Best', 'About 1.6× the time · most polished'],
+                          ] as const).map(([steps, label, hint]) => {
+                            const current = settings?.voxcpm_inference_steps || 30;
+                            // a value set by hand lights the nearest choice
+                            const active = steps === ([10, 15, 30] as const).reduce((a, b) => (Math.abs(b - current) < Math.abs(a - current) ? b : a));
+                            return (
+                              <button
+                                key={steps}
+                                onClick={() => void saveNow({ voxcpm_inference_steps: steps })}
+                                className={`rounded-xl border p-2.5 text-left transition-colors ${
+                                  active ? 'border-blue-500 bg-blue-600/15' : 'border-[var(--s5)] bg-[var(--s3)] hover:border-[var(--s7)]'
+                                }`}
+                              >
+                                <span className="block text-xs font-semibold text-white">{label}</span>
+                                <span className="block text-[10px] text-zinc-400 mt-0.5">{hint}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <p className="text-[10px] text-zinc-500">The voice model's memory (about 7 GB) is released by itself after ten minutes without use.</p>
+                      </div>
+
+                      {/* Vocal / BGM isolation pace */}
+                      <div className="space-y-2.5">
+                        <div>
+                          <h3 className="text-xs font-bold text-white uppercase tracking-wider">Music isolation speed</h3>
+                          <p className="text-[11px] text-zinc-400 mt-0.5">
+                            Isolating the music works the Mac hard and warms it on long videos. The slower settings
+                            rest between bursts — the result sounds the same.
+                          </p>
+                        </div>
+                        <div className="grid grid-cols-3 gap-2">
+                          {([
+                            ['fast', 'Fast', 'Quickest · runs hottest'],
+                            ['balanced', 'Balanced', 'About 1.4× the time · cooler'],
+                            ['cool', 'Cool & quiet', 'About 2× the time · coolest'],
+                          ] as const).map(([id, label, hint]) => {
+                            const active = (settings?.separation_pace || 'balanced') === id;
+                            return (
+                              <button
+                                key={id}
+                                onClick={() => void saveNow({ separation_pace: id })}
+                                className={`rounded-xl border p-2.5 text-left transition-colors ${
+                                  active ? 'border-blue-500 bg-blue-600/15' : 'border-[var(--s5)] bg-[var(--s3)] hover:border-[var(--s7)]'
+                                }`}
+                              >
+                                <span className="block text-xs font-semibold text-white">{label}</span>
+                                <span className="block text-[10px] text-zinc-400 mt-0.5">{hint}</span>
+                              </button>
+                            );
+                          })}
                         </div>
                       </div>
                     </div>
@@ -869,46 +919,42 @@ export default function SettingsModal({ open, onClose }: Props) {
                       {!isEditingProfile ? (
                         <>
                           {/* Top Header with Add Button */}
-                          <div className="flex items-center justify-between pb-2 border-b border-[#20242e]">
+                          <div className="flex items-center justify-between pb-2 border-b border-[var(--s4)]">
                             <div>
-                              <h3 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
-                                <Volume2 className="w-4 h-4 text-purple-400" />
-                                Voice Profiles & Sample Voices
-                              </h3>
+                              <h3 className="text-xs font-bold text-white uppercase tracking-wider">Voices</h3>
                               <p className="text-[11px] text-zinc-400 mt-0.5">
-                                Audition built-in sample voices and create customized neural presets for studio dubbing.
+                                Listen to the built-in voices, and make your own for the characters you dub.
                               </p>
                             </div>
                             <button
                               onClick={handleOpenCreateProfile}
-                              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-xs shadow-lg shadow-purple-950/40 transition-all active:scale-95 border border-purple-400/30"
+                              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs shrink-0 active:scale-95"
                             >
                               <Plus className="w-3.5 h-3.5" />
-                              <span>Add Custom Voice Profile</span>
+                              <span className="whitespace-nowrap">New voice</span>
                             </button>
                           </div>
 
                           {/* Filter Tabs */}
-                          <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+                          <div className="flex flex-wrap items-center gap-1.5">
                             {[
-                              { id: 'all', label: `All Roles (${voiceProfiles.length})` },
-                              { id: 'voxcpm', label: '🎙️ VoxCPM2 AI' },
-                              { id: 'edge', label: '⚡ Edge-TTS' },
-                              { id: 'male', label: '👨 Male' },
-                              { id: 'female', label: '👩 Female' },
-                              { id: 'child_boy', label: '👦 Child Boy' },
-                              { id: 'child_girl', label: '👧 Child Girl' },
-                              { id: 'grandpa', label: '👴 Grandpa' },
-                              { id: 'grandma', label: '👵 Grandma' },
-                              { id: 'custom', label: `Custom (${customVoiceCount})` },
+                              { id: 'all', label: `All (${voiceProfiles.length})` },
+                              { id: 'custom', label: `Mine (${customVoiceCount})` },
+                              { id: 'edge', label: 'Edge' },
+                              { id: 'voxcpm', label: 'Cloned' },
+                              { id: 'male', label: 'Male' },
+                              { id: 'female', label: 'Female' },
+                              { id: 'child_boy', label: 'Boy' },
+                              { id: 'child_girl', label: 'Girl' },
+                              { id: 'grandpa', label: 'Grandpa' },
+                              { id: 'grandma', label: 'Grandma' },
                             ].map((f) => (
                               <button
                                 key={f.id}
                                 onClick={() => setVoiceFilter(f.id as any)}
-                                className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors ${
-                                  voiceFilter === f.id
-                                    ? 'bg-[#262b3a] text-white border border-[#3b435a]'
-                                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#1a1d26]'
+                                aria-pressed={voiceFilter === f.id}
+                                className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold whitespace-nowrap transition-colors ${
+                                  voiceFilter === f.id ? 'bg-blue-600 text-white' : 'bg-[var(--s3)] text-zinc-400 hover:text-zinc-100'
                                 }`}
                               >
                                 {f.label}
@@ -926,10 +972,10 @@ export default function SettingsModal({ open, onClose }: Props) {
                                   key={p.id}
                                   className={`p-3.5 rounded-2xl border transition-all flex flex-col justify-between ${
                                     isPlaying
-                                      ? 'bg-[#1c162b] border-purple-500/70 shadow-lg shadow-purple-950/30 ring-1 ring-purple-500/30'
+                                      ? 'bg-blue-600/10 border-blue-500/70 shadow-lg ring-1 ring-blue-500/30'
                                       : isLoading
-                                      ? 'bg-[#1a1624] border-purple-500/40'
-                                      : 'bg-[#161821] border-[#252936] hover:border-[#353b4e]'
+                                      ? 'bg-[var(--s3)] border-white/10'
+                                      : 'bg-[var(--s3)] border-[var(--s5)] hover:border-[var(--s8)]'
                                   }`}
                                 >
                                   <div>
@@ -940,14 +986,14 @@ export default function SettingsModal({ open, onClose }: Props) {
                                             p.gender === 'male'
                                               ? 'bg-blue-600/20 text-blue-400 border-blue-500/30'
                                               : p.gender === 'child_boy' || p.gender === 'boy'
-                                              ? 'bg-cyan-600/20 text-cyan-400 border-cyan-500/30'
+                                              ? 'bg-blue-600/20 text-blue-400 border-blue-500/30'
                                               : p.gender === 'child_girl' || p.gender === 'girl' || p.gender === 'child'
                                               ? 'bg-amber-600/20 text-amber-400 border-amber-500/30'
                                               : p.gender === 'grandpa' || p.gender === 'elderly_male'
                                               ? 'bg-emerald-600/20 text-emerald-400 border-emerald-500/30'
                                               : p.gender === 'grandma' || p.gender === 'elderly_female' || p.gender === 'elderly'
-                                              ? 'bg-purple-600/20 text-purple-400 border-purple-500/30'
-                                              : 'bg-pink-600/20 text-pink-400 border-pink-500/30'
+                                              ? 'bg-white/10 text-zinc-400 border-white/10'
+                                              : 'bg-white/10 text-zinc-400 border-white/10'
                                           }`}
                                         >
                                           {p.gender === 'male'
@@ -966,7 +1012,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                                           <div className="flex items-center gap-1.5 flex-wrap">
                                             <h4 className="text-xs font-bold text-white truncate">{p.name}</h4>
                                             {!p.is_built_in && (
-                                              <span className="text-[9px] px-1.5 py-0.2 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 font-bold">
+                                              <span className="text-[9px] px-1.5 py-0.2 rounded bg-white/10 text-zinc-200 border border-white/10 font-bold">
                                                 Custom
                                               </span>
                                             )}
@@ -981,16 +1027,16 @@ export default function SettingsModal({ open, onClose }: Props) {
                                         disabled={isLoading}
                                         className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl font-bold text-[11px] transition-all shadow-sm shrink-0 ${
                                           isPlaying
-                                            ? 'bg-purple-600 text-white animate-pulse shadow-purple-950/40'
+                                            ? 'bg-white/10 text-white animate-pulse'
                                             : isLoading
-                                            ? 'bg-purple-950/60 text-purple-300 border border-purple-500/40'
-                                            : 'bg-[#222634] hover:bg-[#2b3042] text-zinc-200 border border-[#333a4f]'
+                                            ? 'bg-white/5 text-zinc-200 border border-white/10'
+                                            : 'bg-[var(--s5)] hover:bg-[var(--s6)] text-zinc-200 border border-[var(--s7)]'
                                         }`}
                                         title={isPlaying ? 'Stop Voice Sample' : isLoading ? 'Generating preview...' : 'Play Sample Voice'}
                                       >
                                         {isLoading ? (
                                           <>
-                                            <Loader2 className="w-3 h-3 animate-spin text-purple-400" />
+                                            <Loader2 className="w-3 h-3 animate-spin text-zinc-400" />
                                             <span>Loading...</span>
                                           </>
                                         ) : isPlaying ? (
@@ -1014,16 +1060,16 @@ export default function SettingsModal({ open, onClose }: Props) {
                                   </div>
 
                                   {/* Footer tags and Actions */}
-                                  <div className="pt-2 border-t border-[#20242e] flex items-center justify-between text-[10px]">
+                                  <div className="pt-2 border-t border-[var(--s4)] flex items-center justify-between text-[10px]">
                                     <div className="flex items-center gap-1.5 flex-wrap">
                                       <span className={`px-1.5 py-0.5 rounded border font-mono font-bold ${
                                         p.engine === 'voxcpm' || p.voice_name?.includes('voxcpm')
-                                          ? 'bg-purple-500/20 text-purple-300 border-purple-500/30'
+                                          ? 'bg-white/10 text-zinc-200 border-white/10'
                                           : 'bg-blue-500/20 text-blue-300 border-blue-500/30'
                                       }`}>
                                         {p.engine === 'voxcpm' || p.voice_name?.includes('voxcpm') ? '🎙️ VoxCPM2' : '⚡ Edge-TTS'}
                                       </span>
-                                      <span className="px-1.5 py-0.5 rounded bg-[#1e212c] text-zinc-300 border border-[#2a2f3f] font-mono uppercase">
+                                      <span className="px-1.5 py-0.5 rounded bg-[var(--s4)] text-zinc-300 border border-[var(--s6)] font-mono uppercase">
                                         {p.language}
                                       </span>
                                       {p.pitch !== '+0Hz' && (
@@ -1032,7 +1078,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                                         </span>
                                       )}
                                       {p.rate !== '+0%' && (
-                                        <span className="px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 font-mono">
+                                        <span className="px-1.5 py-0.5 rounded bg-white/10 text-zinc-200 border border-white/10 font-mono">
                                           {p.rate}
                                         </span>
                                       )}
@@ -1042,7 +1088,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                                       <div className="flex items-center gap-1">
                                         <button
                                           onClick={() => handleOpenEditProfile(p)}
-                                          className="p-1 text-zinc-400 hover:text-blue-400 hover:bg-[#202430] rounded-lg transition-colors"
+                                          className="p-1 text-zinc-400 hover:text-blue-400 hover:bg-[var(--s4)] rounded-lg transition-colors"
                                           title="Edit Custom Profile"
                                         >
                                           <Edit2 className="w-3.5 h-3.5" />
@@ -1065,9 +1111,9 @@ export default function SettingsModal({ open, onClose }: Props) {
                       ) : (
                         /* Profile Create / Edit Form */
                         <div className="space-y-4 animate-in fade-in">
-                          <div className="flex items-center justify-between pb-2 border-b border-[#20242e]">
+                          <div className="flex items-center justify-between pb-2 border-b border-[var(--s4)]">
                             <div className="flex items-center gap-2">
-                              <div className="w-7 h-7 rounded-xl bg-purple-600/20 text-purple-400 flex items-center justify-center font-bold text-xs">
+                              <div className="w-7 h-7 rounded-xl bg-white/10 text-zinc-400 flex items-center justify-center font-bold text-xs">
                                 <Volume2 className="w-4 h-4" />
                               </div>
                               <span className="text-xs font-bold text-white uppercase tracking-wider">
@@ -1092,7 +1138,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                                 className={`p-3 rounded-2xl border flex items-center gap-2.5 text-left transition-all ${
                                   profileForm.engine === 'edge-tts'
                                     ? 'bg-blue-600/20 border-blue-500 text-white ring-1 ring-blue-500/40 shadow-sm'
-                                    : 'bg-[#171922] border-[#2a2f3d] text-zinc-400 hover:text-white'
+                                    : 'bg-[var(--s3)] border-[var(--s6)] text-zinc-400 hover:text-white'
                                 }`}
                               >
                                 <div className="w-8 h-8 rounded-xl bg-blue-600/20 text-blue-400 flex items-center justify-center font-bold text-xs shrink-0">
@@ -1115,11 +1161,11 @@ export default function SettingsModal({ open, onClose }: Props) {
                                 }}
                                 className={`p-3 rounded-2xl border flex items-center gap-2.5 text-left transition-all ${
                                   profileForm.engine === 'voxcpm'
-                                    ? 'bg-purple-600/20 border-purple-500 text-white ring-1 ring-purple-500/40 shadow-sm'
-                                    : 'bg-[#171922] border-[#2a2f3d] text-zinc-400 hover:text-white'
+                                    ? 'bg-blue-600/20 border-blue-500 text-white ring-1 ring-blue-500/40 shadow-sm'
+                                    : 'bg-[var(--s3)] border-[var(--s6)] text-zinc-400 hover:text-white'
                                 }`}
                               >
-                                <div className="w-8 h-8 rounded-xl bg-purple-600/20 text-purple-400 flex items-center justify-center font-bold text-xs shrink-0">
+                                <div className="w-8 h-8 rounded-xl bg-white/10 text-zinc-400 flex items-center justify-center font-bold text-xs shrink-0">
                                   <Sparkles className="w-4 h-4" />
                                 </div>
                                 <div>
@@ -1139,7 +1185,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                                 value={profileForm.name}
                                 onChange={(e) => setProfileForm({ ...profileForm, name: e.target.value })}
                                 placeholder="e.g. Heroic Narrator, Soft Storyteller"
-                                className="w-full px-3 py-2 bg-[#171922] border border-[#2a2f3d] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500"
+                                className="w-full px-3 py-2 bg-[var(--s3)] border border-[var(--s6)] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-blue-500"
                               />
                             </div>
 
@@ -1149,7 +1195,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                               <select
                                 value={profileForm.gender}
                                 onChange={(e) => setProfileForm({ ...profileForm, gender: e.target.value as any })}
-                                className="w-full px-3 py-2 bg-[#171922] border border-[#2a2f3d] rounded-xl text-xs text-white focus:outline-none focus:border-purple-500"
+                                className="w-full px-3 py-2 bg-[var(--s3)] border border-[var(--s6)] rounded-xl text-xs text-white focus:outline-none focus:border-blue-500"
                               >
                                 <option value="male">👨 Male / Man (បុរស)</option>
                                 <option value="female">👩 Female / Woman (ស្ត្រី)</option>
@@ -1176,7 +1222,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                                     engine: selected?.engine || profileForm.engine,
                                   });
                                 }}
-                                className="w-full px-3 py-2 bg-[#171922] border border-[#2a2f3d] rounded-xl text-xs text-white focus:outline-none focus:border-purple-500"
+                                className="w-full px-3 py-2 bg-[var(--s3)] border border-[var(--s6)] rounded-xl text-xs text-white focus:outline-none focus:border-blue-500"
                               >
                                 {(profileForm.engine === 'voxcpm' ? VOXCPM_NEURAL_VOICES : EDGE_NEURAL_VOICES).map((v) => (
                                   <option key={v.id} value={v.id}>
@@ -1192,7 +1238,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                               <select
                                 value={profileForm.emotion}
                                 onChange={(e) => setProfileForm({ ...profileForm, emotion: e.target.value })}
-                                className="w-full px-3 py-2 bg-[#171922] border border-[#2a2f3d] rounded-xl text-xs text-white focus:outline-none focus:border-purple-500"
+                                className="w-full px-3 py-2 bg-[var(--s3)] border border-[var(--s6)] rounded-xl text-xs text-white focus:outline-none focus:border-blue-500"
                               >
                                 <option value="neutral">Neutral / Standard (ធម្មតា)</option>
                                 <option value="cheerful">Cheerful / Bright (រីករាយ)</option>
@@ -1233,7 +1279,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                             <div className="space-y-1">
                               <div className="flex items-center justify-between">
                                 <label className="text-[11px] font-bold text-zinc-300">Speed / Cadence Adjustment</label>
-                                <span className="text-[10px] font-mono font-bold text-purple-400">
+                                <span className="text-[10px] font-mono font-bold text-zinc-400">
                                   {profileForm.rate >= 0 ? `+${profileForm.rate}%` : `${profileForm.rate}%`}
                                 </span>
                               </div>
@@ -1244,7 +1290,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                                 step={2}
                                 value={profileForm.rate}
                                 onChange={(e) => setProfileForm({ ...profileForm, rate: Number(e.target.value) })}
-                                className="w-full accent-purple-500"
+                                className="w-full accent-blue-500"
                               />
                               <div className="flex justify-between text-[9px] text-zinc-500">
                                 <span>Slower (-20%)</span>
@@ -1262,15 +1308,15 @@ export default function SettingsModal({ open, onClose }: Props) {
                               value={profileForm.description}
                               onChange={(e) => setProfileForm({ ...profileForm, description: e.target.value })}
                               placeholder="e.g. Warm documentary narration voice for historical clips"
-                              className="w-full px-3 py-2 bg-[#171922] border border-[#2a2f3d] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500"
+                              className="w-full px-3 py-2 bg-[var(--s3)] border border-[var(--s6)] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-blue-500"
                             />
                           </div>
 
                           {/* Test Voice Audition Box */}
-                          <div className="p-4 rounded-2xl bg-[#171a24] border border-[#2a3042] space-y-3">
+                          <div className="p-4 rounded-2xl bg-[var(--s3)] border border-[var(--s6)] space-y-3">
                             <div className="flex items-center justify-between">
                               <span className="text-xs font-bold text-white flex items-center gap-1.5">
-                                <Wand2 className="w-3.5 h-3.5 text-pink-400" />
+                                <Wand2 className="w-3.5 h-3.5 text-zinc-400" />
                                 Test & Audition Voice Profile
                               </span>
                               {profileForm.sample_audio_url && (
@@ -1287,12 +1333,12 @@ export default function SettingsModal({ open, onClose }: Props) {
                                 value={profileForm.test_text}
                                 onChange={(e) => setProfileForm({ ...profileForm, test_text: e.target.value })}
                                 placeholder="Type a test phrase to listen..."
-                                className="flex-1 px-3 py-2 bg-[#111319] border border-[#2f3548] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500"
+                                className="flex-1 px-3 py-2 bg-[var(--s2)] border border-[var(--s7)] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-blue-500"
                               />
                               <button
                                 onClick={handleTestFormAudio}
                                 disabled={testingSample}
-                                className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white font-bold text-xs shadow-md shadow-purple-950/30 transition-all shrink-0"
+                                className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-bold text-xs shadow-md transition-all shrink-0"
                               >
                                 {testingSample ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5 fill-current" />}
                                 <span>Test Audio</span>
@@ -1307,7 +1353,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                                   href="http://localhost:7860"
                                   target="_blank"
                                   rel="noopener noreferrer"
-                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600/30 transition-colors text-[10px] font-semibold"
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white/10 text-zinc-200 border border-white/10 hover:bg-white/10 transition-colors text-[10px] font-semibold"
                                   title="Open VoxCPM2 Voice Cloning Web UI"
                                 >
                                   <span>🎙️ VoxCPM Web UI</span>
@@ -1325,25 +1371,25 @@ export default function SettingsModal({ open, onClose }: Props) {
                               <button
                                 onClick={() => fileInputRef.current?.click()}
                                 disabled={uploadingSample}
-                                className="flex items-center gap-1.5 px-3 py-1 rounded-xl bg-[#222634] hover:bg-[#2b3042] text-zinc-200 hover:text-white border border-[#343b50] transition-colors text-[11px] font-semibold shadow-sm"
+                                className="flex items-center gap-1.5 px-3 py-1 rounded-xl bg-[var(--s5)] hover:bg-[var(--s6)] text-zinc-200 hover:text-white border border-[var(--s8)] transition-colors text-[11px] font-semibold shadow-sm"
                               >
-                                {uploadingSample ? <Loader2 className="w-3 h-3 animate-spin" /> : <UploadCloud className="w-3 h-3 text-purple-400" />}
+                                {uploadingSample ? <Loader2 className="w-3 h-3 animate-spin" /> : <UploadCloud className="w-3 h-3 text-zinc-400" />}
                                 <span>Upload Audio File</span>
                               </button>
                             </div>
                           </div>
 
                           {/* Action Buttons */}
-                          <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#20242e]">
+                          <div className="flex items-center justify-end gap-2 pt-2 border-t border-[var(--s4)]">
                             <button
                               onClick={() => setIsEditingProfile(false)}
-                              className="px-4 py-2 text-xs font-semibold text-zinc-300 hover:text-white hover:bg-[#222633] rounded-xl transition-colors"
+                              className="px-4 py-2 text-xs font-semibold text-zinc-300 hover:text-white hover:bg-[var(--s5)] rounded-xl transition-colors"
                             >
                               Cancel
                             </button>
                             <button
                               onClick={handleSaveProfileForm}
-                              className="flex items-center gap-1.5 px-5 py-2 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-xs shadow-lg shadow-purple-950/40 transition-all active:scale-95"
+                              className="flex items-center gap-1.5 px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs shadow-lg transition-all active:scale-95"
                             >
                               <Check className="w-3.5 h-3.5" />
                               <span>{editingProfileId ? 'Update Profile' : 'Save Voice Profile'}</span>
@@ -1355,6 +1401,97 @@ export default function SettingsModal({ open, onClose }: Props) {
                   )}
 
                   {/* Theme Tab */}
+                  {activeTab === 'pronunciation' && (
+                    <div className="space-y-4">
+                      <div>
+                        <h3 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
+                          <Mic className="w-3.5 h-3.5 text-zinc-400" />
+                          Pronunciation
+                        </h3>
+                        <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">
+                          Teach the voice how to say names and terms it gets wrong. Write how it should sound —
+                          usually in Khmer letters. Only the spoken audio changes; your caption text stays exactly as written.
+                          Press the speaker to hear a word as the dub will say it.
+                        </p>
+                      </div>
+
+                      <div className="space-y-2">
+                        <div className="grid grid-cols-[1fr_1fr_auto_auto] gap-2 px-1">
+                          <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Written as</span>
+                          <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Say it as</span>
+                          <span className="w-7" />
+                          <span className="w-7" />
+                        </div>
+                        {pronunciations.map((entry, idx) => (
+                          <div key={idx} className="grid grid-cols-[1fr_1fr_auto_auto] gap-2">
+                            <input
+                              value={entry.word}
+                              onChange={(e) => {
+                                const next = [...pronunciations];
+                                next[idx] = { ...entry, word: e.target.value };
+                                setPronunciations(next);
+                              }}
+                              onBlur={() => persistPronunciations(pronunciations)}
+                              placeholder="Tang Bohu"
+                              className="bg-[var(--s3)] border border-[var(--s6)] rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500"
+                            />
+                            <input
+                              value={entry.say_as}
+                              onChange={(e) => {
+                                const next = [...pronunciations];
+                                next[idx] = { ...entry, say_as: e.target.value };
+                                setPronunciations(next);
+                              }}
+                              onBlur={() => persistPronunciations(pronunciations)}
+                              placeholder="តាំង ប៉ូហ៊ូ"
+                              className="bg-[var(--s3)] border border-[var(--s6)] rounded-lg px-2.5 py-1.5 text-xs text-white font-khmer focus:outline-none focus:border-blue-500"
+                            />
+                            <button
+                              onClick={() => void listen(idx, entry.word)}
+                              disabled={!entry.word.trim() || !entry.say_as.trim() || listening !== null}
+                              className="w-7 h-7 rounded-lg text-zinc-400 hover:text-white hover:bg-white/10 flex items-center justify-center transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-default"
+                              title="Hear it as the dub will say it"
+                              aria-label={`Hear ${entry.word}`}
+                            >
+                              {listening === idx ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Volume2 className="w-3.5 h-3.5" />}
+                            </button>
+                            <button
+                              onClick={() => persistPronunciations(pronunciations.filter((_, i) => i !== idx))}
+                              className="w-7 h-7 rounded-lg text-zinc-500 hover:text-red-400 hover:bg-red-900/30 flex items-center justify-center transition-colors cursor-pointer"
+                              title="Remove"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setPronunciations([...pronunciations, { word: '', say_as: '' }])}
+                          className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-zinc-200 transition-colors cursor-pointer"
+                        >
+                          + Add word
+                        </button>
+                        {savingPronunciations && <span className="text-[11px] text-zinc-500">Saving…</span>}
+                        {pronunciations.length === 0 && (
+                          <span className="text-[11px] text-zinc-500">No words yet — add one to fix a mispronunciation.</span>
+                        )}
+                      </div>
+
+                      {!!stale?.lines && (
+                        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
+                          <span>{stale.lines} dubbed line{stale.lines === 1 ? '' : 's'} in {stale.projects} video{stale.projects === 1 ? '' : 's'} still say{stale.lines === 1 ? 's' : ''} a word the old way.</span>
+                          <button onClick={() => void redub()} disabled={redubbing}
+                            className="px-2.5 py-1 rounded-md bg-amber-500/20 hover:bg-amber-500/30 font-semibold text-amber-50 cursor-pointer disabled:opacity-40">
+                            {redubbing ? 'Queueing…' : 'Dub those lines again'}
+                          </button>
+                        </div>
+                      )}
+                      {redubNote && <p role="status" className="text-[11px] text-zinc-300">{redubNote}</p>}
+                    </div>
+                  )}
+
                   {activeTab === 'theme' && (
                     <div className="space-y-6">
                       <div>
@@ -1362,7 +1499,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                         <ThemeModeToggle />
                       </div>
 
-                      <div className="space-y-3 pt-2 border-t border-[#20242e]">
+                      <div className="space-y-3 pt-2 border-t border-[var(--s4)]">
                         <div className="flex items-center justify-between">
                           <div>
                             <h3 className="text-xs font-bold text-white uppercase tracking-wider">Custom UI Palette</h3>
@@ -1370,7 +1507,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                           </div>
                           <button
                             onClick={handleResetTheme}
-                            className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-zinc-300 hover:text-white bg-[#1a1d26] hover:bg-[#232733] border border-[#2b303d] rounded-xl transition-all font-medium"
+                            className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-zinc-300 hover:text-white bg-[var(--s3)] hover:bg-[var(--s5)] border border-[var(--s6)] rounded-xl transition-all font-medium"
                           >
                             <RotateCcw className="w-3.5 h-3.5" />
                             Reset Defaults
@@ -1379,7 +1516,7 @@ export default function SettingsModal({ open, onClose }: Props) {
 
                         <div className="grid grid-cols-2 gap-3">
                           {themeFields.map(({ key, label, desc }) => (
-                            <div key={key} className="p-2.5 rounded-xl bg-[#161820] border border-[#252936] flex items-center justify-between gap-3">
+                            <div key={key} className="p-2.5 rounded-xl bg-[var(--s3)] border border-[var(--s5)] flex items-center justify-between gap-3">
                               <div className="min-w-0">
                                 <span className="text-xs font-bold text-white block truncate">{label}</span>
                                 <span className="text-[10px] text-zinc-500 block truncate">{desc}</span>
@@ -1389,7 +1526,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                                   type="color"
                                   value={theme[key]}
                                   onChange={(e) => handleThemeColor(key, e.target.value)}
-                                  className="w-7 h-7 rounded-lg border border-[#343b4d] cursor-pointer bg-transparent p-0"
+                                  className="w-7 h-7 rounded-lg border border-[var(--s7)] cursor-pointer bg-transparent p-0"
                                 />
                                 <span className="text-[10px] font-mono text-zinc-400 uppercase w-14">
                                   {theme[key]}
@@ -1412,8 +1549,13 @@ export default function SettingsModal({ open, onClose }: Props) {
                             Gemini API Keys
                           </h3>
                           <p className="text-[11px] text-zinc-400">
-                            Add multiple API keys to enable seamless automatic rotation during batch transcription
+                            Captions, translation and titles use these. With several keys, the next one takes over when one runs out of its daily quota.
                           </p>
+                          {unusableCount > 0 && (
+                            <p className="text-[11px] text-amber-300/90 mt-1">
+                              {unusableCount} saved {unusableCount === 1 ? 'entry is' : 'entries are'} empty and {unusableCount === 1 ? 'is' : 'are'} never used.
+                            </p>
+                          )}
                         </div>
                         {activeCount > 0 && (
                           <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono font-bold">
@@ -1422,85 +1564,24 @@ export default function SettingsModal({ open, onClose }: Props) {
                         )}
                       </div>
 
-                      {/* Keys List */}
-                      {settings?.api_keys && settings.api_keys.length > 0 ? (
-                        <div className="space-y-2">
-                          {settings.api_keys.map((k) => (
-                            <div
-                              key={k.id}
-                              className={`flex items-center justify-between p-3 rounded-xl border transition-all ${
-                                k.is_active
-                                  ? 'bg-[#171922] border-[#292e3c]'
-                                  : 'bg-[#14161d] border-[#22252e] opacity-60'
-                              }`}
-                            >
-                              <div className="flex items-center gap-3 min-w-0">
-                                <div
-                                  className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs font-bold ${
-                                    k.is_active ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-zinc-800 text-zinc-500'
-                                  }`}
-                                >
-                                  <Key className="w-3.5 h-3.5" />
-                                </div>
-                                <div className="min-w-0">
-                                  <div className="flex items-center gap-2">
-                                    <span className="text-xs font-mono font-semibold text-white">{k.preview}</span>
-                                    {k.label && (
-                                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-[#242835] text-zinc-300 border border-[#343a4c]">
-                                        {k.label}
-                                      </span>
-                                    )}
-                                  </div>
-                                </div>
-                              </div>
-
-                              <div className="flex items-center gap-1.5">
-                                <button
-                                  onClick={() => handleToggleKey(k)}
-                                  className="p-1.5 hover:bg-[#252936] rounded-lg transition-colors text-zinc-400 hover:text-white"
-                                  title={k.is_active ? 'Disable Key' : 'Enable Key'}
-                                >
-                                  {k.is_active ? (
-                                    <ToggleRight className="w-5 h-5 text-emerald-400" />
-                                  ) : (
-                                    <ToggleLeft className="w-5 h-5 text-zinc-500" />
-                                  )}
-                                </button>
-                                <button
-                                  onClick={() => handleDeleteKey(k)}
-                                  className="p-1.5 hover:bg-red-500/20 rounded-lg transition-colors text-zinc-500 hover:text-red-400"
-                                  title="Delete Key"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs">
-                          No active Gemini API keys found. Add your key below to transcribe videos and dub voices.
-                        </div>
-                      )}
-
                       {/* Add New Key */}
-                      <div className="p-4 rounded-xl bg-[#161820] border border-[#272b37] space-y-3">
-                        <span className="text-[11px] font-bold text-white uppercase tracking-wider block">Add New API Key</span>
+                      <div className="p-4 rounded-xl bg-[var(--s3)] border border-[var(--s5)] space-y-3">
+                        <span className="text-[11px] font-bold text-white uppercase tracking-wider block">Add a key</span>
                         <div className="flex gap-2">
                           <input
                             type="text"
                             value={newLabel}
                             onChange={(e) => setNewLabel(e.target.value)}
                             placeholder="Label (e.g. Work, Personal)"
-                            className="w-44 px-3 py-2 bg-[#111318] border border-[#2a2f3d] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-blue-500"
+                            className="w-44 px-3 py-2 bg-[var(--s2)] border border-[var(--s6)] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-blue-500"
                           />
                           <div className="flex-1 relative">
                             <input
                               type={showNewKey ? 'text' : 'password'}
                               value={newKey}
                               onChange={(e) => setNewKey(e.target.value)}
-                              placeholder="AIzaSy..."
-                              className="w-full px-3 py-2 pr-9 bg-[#111318] border border-[#2a2f3d] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-blue-500 font-mono"
+                              placeholder="AIzaSy… or AQ.…"
+                              className="w-full px-3 py-2 pr-9 bg-[var(--s2)] border border-[var(--s6)] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-blue-500 font-mono"
                               onKeyDown={(e) => {
                                 if (e.key === 'Enter') handleAddKey();
                               }}
@@ -1529,12 +1610,82 @@ export default function SettingsModal({ open, onClose }: Props) {
                             rel="noopener noreferrer"
                             className="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300 transition-colors font-medium"
                           >
-                            Get free Gemini API Key from Google AI Studio
+                            Get a free key from Google AI Studio
                             <ExternalLink className="w-3 h-3" />
                           </a>
-                          <span>Multiple keys automatically load-balanced</span>
+                          <span>Keys are kept on this computer</span>
                         </div>
                       </div>
+
+                      {/* Keys List */}
+                      {settings?.api_keys && settings.api_keys.length > 0 ? (
+                        <div className="space-y-1.5">
+                          {settings.api_keys.map((k) => (
+                            <div
+                              key={k.id}
+                              className={`flex items-center justify-between px-3 py-1.5 rounded-xl border transition-all ${
+                                k.is_active
+                                  ? 'bg-[var(--s3)] border-[var(--s6)]'
+                                  : 'bg-[var(--s2)] border-[var(--s4)] opacity-60'
+                              }`}
+                            >
+                              <div className="flex items-center gap-3 min-w-0">
+                                <div
+                                  className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs font-bold ${
+                                    k.is_active ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-zinc-800 text-zinc-500'
+                                  }`}
+                                >
+                                  <Key className="w-3.5 h-3.5" />
+                                </div>
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-xs font-mono font-semibold text-white">{k.preview}</span>
+                                    {k.usable === false && (
+                                      <span
+                                        className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30"
+                                        title="This entry is blank, so it is never used."
+                                      >
+                                        empty key
+                                      </span>
+                                    )}
+                                    {k.label && (
+                                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-[var(--s5)] text-zinc-300 border border-[var(--s7)]">
+                                        {k.label}
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  onClick={() => handleToggleKey(k)}
+                                  className="p-1.5 hover:bg-[var(--s5)] rounded-lg transition-colors text-zinc-400 hover:text-white"
+                                  title={k.is_active ? 'Disable Key' : 'Enable Key'}
+                                >
+                                  {k.is_active ? (
+                                    <ToggleRight className="w-5 h-5 text-emerald-400" />
+                                  ) : (
+                                    <ToggleLeft className="w-5 h-5 text-zinc-500" />
+                                  )}
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteKey(k)}
+                                  className="p-1.5 hover:bg-red-500/20 rounded-lg transition-colors text-zinc-500 hover:text-red-400"
+                                  title="Delete Key"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs">
+                          No working Gemini key yet. Add one above — captions, translation and titles need it.
+                        </div>
+                      )}
+
                     </div>
                   )}
 
@@ -1561,10 +1712,10 @@ export default function SettingsModal({ open, onClose }: Props) {
                         ].map((s) => (
                           <div
                             key={s.keys}
-                            className="flex items-center justify-between p-2.5 rounded-xl bg-[#161820] border border-[#252936]"
+                            className="flex items-center justify-between p-2.5 rounded-xl bg-[var(--s3)] border border-[var(--s5)]"
                           >
                             <span className="text-xs text-zinc-300 font-medium">{s.action}</span>
-                            <kbd className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-lg bg-[#101217] border border-[#2d3241] text-zinc-300 shadow-inner">
+                            <kbd className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-lg bg-[var(--s2)] border border-[var(--s6)] text-zinc-300 shadow-inner">
                               {s.keys}
                             </kbd>
                           </div>
@@ -1576,30 +1727,32 @@ export default function SettingsModal({ open, onClose }: Props) {
                   {/* About Tab */}
                   {activeTab === 'about' && (
                     <div className="space-y-6">
-                      <div className="text-center p-6 rounded-2xl bg-gradient-to-b from-[#181c28] to-[#13151b] border border-[#272d3d] shadow-lg">
-                        <div className="w-14 h-14 mx-auto mb-3 rounded-2xl bg-gradient-to-br from-blue-500 via-indigo-600 to-purple-600 flex items-center justify-center text-white shadow-lg shadow-indigo-950/50">
+                      <div className="text-center p-6 rounded-2xl bg-gradient-to-b from-[var(--s3)] to-[var(--s2)] border border-[var(--s6)] shadow-lg">
+                        <div className="w-14 h-14 mx-auto mb-3 rounded-2xl bg-gradient-to-br from-blue-500 flex items-center justify-center text-white shadow-lg">
                           <Layers className="w-7 h-7" />
                         </div>
-                        <h3 className="text-base font-bold text-white">Meatika AI Dubber Pro</h3>
-                        <p className="text-xs text-blue-400 font-semibold mt-0.5">Khmer Video Translation & Vocal Studio</p>
+                        <h3 className="text-base font-bold text-white">Dubbing Studio</h3>
+                        <p className="text-xs text-blue-400 font-semibold mt-0.5">Khmer AI video dubbing & captions</p>
                         <p className="text-[10px] text-zinc-500 mt-1 font-mono">v2.4.0 (Build 2026.08)</p>
                       </div>
 
+                      <AppUpdate />
+
                       <div className="grid grid-cols-2 gap-2.5 text-xs">
-                        <div className="p-3 rounded-xl bg-[#161820] border border-[#252936] flex items-center justify-between">
-                          <span className="text-zinc-400">Audio Separation</span>
-                          <span className="text-white font-semibold">Demucs Stem Isolation</span>
+                        <div className="p-3 rounded-xl bg-[var(--s3)] border border-[var(--s5)] flex items-center justify-between">
+                          <span className="text-zinc-400">Music isolation</span>
+                          <span className="text-white font-semibold">Demucs</span>
                         </div>
-                        <div className="p-3 rounded-xl bg-[#161820] border border-[#252936] flex items-center justify-between">
-                          <span className="text-zinc-400">Speech Engine</span>
-                          <span className="text-white font-semibold">Edge Neural + VoxCPM2</span>
+                        <div className="p-3 rounded-xl bg-[var(--s3)] border border-[var(--s5)] flex items-center justify-between">
+                          <span className="text-zinc-400">Voices</span>
+                          <span className="text-white font-semibold">Edge + VoxCPM</span>
                         </div>
-                        <div className="p-3 rounded-xl bg-[#161820] border border-[#252936] flex items-center justify-between">
-                          <span className="text-zinc-400">AI Localization</span>
-                          <span className="text-white font-semibold">Google Gemini 2.0</span>
+                        <div className="p-3 rounded-xl bg-[var(--s3)] border border-[var(--s5)] flex items-center justify-between">
+                          <span className="text-zinc-400">Captions & translation</span>
+                          <span className="text-white font-semibold">{settings?.available_models.find((m) => m.id === settings.gemini_model)?.name || 'Google Gemini'}</span>
                         </div>
-                        <div className="p-3 rounded-xl bg-[#161820] border border-[#252936] flex items-center justify-between">
-                          <span className="text-zinc-400">Core Pipeline</span>
+                        <div className="p-3 rounded-xl bg-[var(--s3)] border border-[var(--s5)] flex items-center justify-between">
+                          <span className="text-zinc-400">Built on</span>
                           <span className="text-white font-semibold">FFmpeg + FastAPI + React</span>
                         </div>
                       </div>
@@ -1618,36 +1771,22 @@ export default function SettingsModal({ open, onClose }: Props) {
             </div>
 
             {/* Modal Footer */}
-            <div className="flex items-center justify-between px-6 py-3.5 border-t border-[#20242e] bg-[#161820] shrink-0">
-              <span className="text-[11px] text-zinc-500">
-                {activeTab === 'general'
-                  ? 'Changes take effect across active project'
-                  : activeTab === 'voices'
-                  ? 'Custom voice profiles persist across all projects'
-                  : ''}
-              </span>
-              <div className="flex items-center gap-2.5">
-                <button
-                  onClick={onClose}
-                  className="px-4 py-2 text-xs font-semibold text-zinc-300 hover:text-white hover:bg-[#222633] rounded-xl transition-colors"
-                >
-                  Close
-                </button>
-                {activeTab === 'general' && (
-                  <button
-                    onClick={handleSave}
-                    disabled={saving || loading}
-                    className="flex items-center gap-2 px-5 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 disabled:opacity-40 text-white rounded-xl text-xs font-bold shadow-lg shadow-blue-900/30 active:scale-95 transition-all"
-                  >
-                    {saving ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    ) : saved ? (
-                      <Check className="w-3.5 h-3.5 text-emerald-300" />
-                    ) : null}
-                    <span>{saved ? 'Saved Successfully!' : 'Save Preferences'}</span>
-                  </button>
+            <div className="flex items-center justify-between px-5 py-3 border-t border-[var(--s4)] shrink-0">
+              <span role="status" className="flex items-center gap-1.5 text-[11px] text-zinc-500">
+                {saving ? (
+                  <><Loader2 className="w-3 h-3 animate-spin" /> Saving…</>
+                ) : saved ? (
+                  <><Check className="w-3 h-3 text-emerald-400" /> <span className="text-emerald-300">Saved</span></>
+                ) : (
+                  'Changes are saved as you make them'
                 )}
-              </div>
+              </span>
+              <button
+                onClick={onClose}
+                className="px-4 py-2 text-xs font-semibold text-zinc-200 bg-white/5 hover:bg-white/10 rounded-xl transition-colors"
+              >
+                Done
+              </button>
             </div>
           </div>
         </div>

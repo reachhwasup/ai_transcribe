@@ -14,14 +14,15 @@ from sqlalchemy.orm import selectinload
 
 from backend.config import settings
 from backend.database.db import get_db, async_session
-from backend.database.models import Project, Segment, VideoClip
+from backend.database.models import AppSetting, Project, Segment, VideoClip
 from backend.api.schemas import (
     ProjectCreate, ProjectUpdate, ProjectResponse, ProjectListResponse,
 )
 from backend.services.audio_service import get_video_duration
-from backend.services.video_service import generate_preview
+from backend.services.video_service import generate_preview, clear_derived_audio
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+
 
 ALLOWED_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".flv"}
 
@@ -52,16 +53,54 @@ async def list_projects(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Project).order_by(Project.updated_at.desc())
     )
-    projects = result.scalars().all()
+    projects = list(result.scalars().all())
+
+    # Newest first, except that the parts of one split stay together and in part order —
+    # otherwise a 12-part video scatters itself across the grid as each part is worked on.
+    # A whole split sits where its most recently touched member would have sat.
+    # The projects made from one folder stay together the same way, in the folder's order.
+    def group_of(p):
+        return p.source_project_id or (f"batch:{p.batch_id}" if p.batch_id else p.id)
+
+    newest_in_group: dict[str, object] = {}
+    for p in projects:
+        root = group_of(p)
+        if root not in newest_in_group:
+            newest_in_group[root] = p.updated_at
+
+    def sort_key(p):
+        # part_index is 0 for the original, so it leads its own parts
+        return (newest_in_group[group_of(p)], -(p.part_index or p.batch_index or 0))
+
+    projects.sort(key=sort_key, reverse=True)
+
+    # one query for every saved "could not transcribe these stretches" note
+    from backend.database.models import AppSetting
+
+    warn_rows = await db.execute(
+        select(AppSetting).where(AppSetting.key.like("transcribe_warning:%"))
+    )
+    warnings = {r.key.split(":", 1)[1]: r.value for r in warn_rows.scalars().all()}
 
     response = []
     for p in projects:
-        count_result = await db.execute(
-            select(func.count()).where(Segment.project_id == p.id)
+        # one row per project: how many captions, and how many already have a voice
+        counts = await db.execute(
+            select(
+                func.count(),
+                func.count(Segment.audio_url).filter(func.trim(func.coalesce(Segment.audio_url, "")) != ""),
+                func.count().filter(
+                    func.trim(func.coalesce(Segment.speaker, "")) == "",
+                    func.trim(func.coalesce(Segment.text, "")) != "",
+                ),
+            ).where(Segment.project_id == p.id)
         )
-        seg_count = count_result.scalar() or 0
+        seg_count, dubbed, unnamed = counts.one()
         data = ProjectListResponse.model_validate(p)
-        data.segment_count = seg_count
+        data.segment_count = seg_count or 0
+        data.dubbed_count = dubbed or 0
+        data.unnamed_count = unnamed or 0
+        data.transcribe_warning = warnings.get(p.id, "")
         response.append(data)
 
     return response
@@ -74,6 +113,9 @@ async def create_project(data: ProjectCreate, db: AsyncSession = Depends(get_db)
         name=data.name,
         description=data.description,
         language=data.language,
+        batch_id=data.batch_id[:36],
+        batch_name=data.batch_name[:255],
+        batch_index=max(0, data.batch_index),
     )
     db.add(project)
     await db.commit()
@@ -218,12 +260,42 @@ async def delete_project(project_id: str, db: AsyncSession = Depends(get_db)):
     if not project:
         raise HTTPException(404, "Project not found")
 
-    # Clean up entire project upload directory (video, audio, TTS, separated audio, etc.)
+    # 1. Clean up entire project upload directory (source video, preview proxy, extracted audio, BGM/vocals, watermarks, exports, demucs stems)
     project_dir = os.path.join(settings.upload_dir, project_id)
     if os.path.isdir(project_dir):
         shutil.rmtree(project_dir, ignore_errors=True)
 
+    # Clean up any external paths referenced directly on the project model
+    for p_path in (project.video_path, project.audio_path, project.preview_path):
+        if p_path and os.path.exists(p_path):
+            try:
+                os.remove(p_path)
+            except OSError:
+                pass
+
+    # 2. Clean up all segment AI TTS voice files in uploads/tts/
+    seg_res = await db.execute(select(Segment).where(Segment.project_id == project_id))
+    tts_dir = os.path.join(settings.upload_dir, "tts")
+    for seg in seg_res.scalars().all():
+        if seg.audio_url:
+            fpath = seg.audio_url.lstrip("/")
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+        if os.path.isdir(tts_dir):
+            for fname in os.listdir(tts_dir):
+                if fname.startswith(seg.id):
+                    try:
+                        os.remove(os.path.join(tts_dir, fname))
+                    except OSError:
+                        pass
+
     await db.delete(project)
+    # per-project settings kept by key ("text_overlays:<id>", "assets:<id>", "editor_settings:<id>"…)
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(AppSetting).where(AppSetting.key.like(f"%:{project_id}")))
     await db.commit()
 
 
@@ -260,13 +332,13 @@ async def upload_video(
             os.remove(project.video_path)
         except OSError:
             pass
-    for stem_name in ("bgm.wav", "vocals.wav", "preview.mp4", "full_audio.wav"):
-        stem_p = os.path.join(project_dir, stem_name)
-        if os.path.exists(stem_p):
-            try:
-                os.remove(stem_p)
-            except OSError:
-                pass
+    clear_derived_audio(project_dir)
+    preview_p = os.path.join(project_dir, "preview.mp4")
+    if os.path.exists(preview_p):
+        try:
+            os.remove(preview_p)
+        except OSError:
+            pass
 
     # Get video duration
     duration = get_video_duration(file_path)
@@ -277,6 +349,7 @@ async def upload_video(
     project.status = "uploaded"
     project.preview_path = ""
     project.preview_status = "generating"
+    project.timeline_cleared = False
 
     # Remove old video clips and create initial one spanning the full video
     existing_clips = await db.execute(
@@ -328,11 +401,33 @@ async def remove_project_video(
     for clip in existing_clips.scalars().all():
         await db.delete(clip)
 
+    # Physically delete source video, preview video proxy, audio file, and audio stems from disk
+    project_dir = os.path.join(settings.upload_dir, project_id)
+    if os.path.isdir(project_dir):
+        for fname in os.listdir(project_dir):
+            if fname != "watermarks":
+                fpath = os.path.join(project_dir, fname)
+                try:
+                    if os.path.isfile(fpath):
+                        os.remove(fpath)
+                    elif os.path.isdir(fpath) and fname == "_demucs_tmp":
+                        shutil.rmtree(fpath, ignore_errors=True)
+                except OSError:
+                    pass
+
+    for p_path in (project.video_path, project.audio_path, project.preview_path):
+        if p_path and os.path.exists(p_path):
+            try:
+                os.remove(p_path)
+            except OSError:
+                pass
+
     project.video_path = ""
     project.video_filename = ""
     project.duration = 0.0
     project.preview_path = ""
     project.preview_status = "none"
+    project.audio_path = ""
 
     await db.commit()
     await db.refresh(project)
@@ -364,6 +459,12 @@ async def upload_watermark(
         raise HTTPException(400, f"Unsupported image file type. Allowed: {', '.join(allowed)}")
 
     watermark_dir = os.path.join(settings.upload_dir, project_id, "watermarks")
+    if os.path.isdir(watermark_dir):
+        for old_file in os.listdir(watermark_dir):
+            try:
+                os.remove(os.path.join(watermark_dir, old_file))
+            except OSError:
+                pass
     os.makedirs(watermark_dir, exist_ok=True)
 
     safe_filename = f"logo_{uuid.uuid4()}{ext}"
@@ -379,4 +480,26 @@ async def upload_watermark(
         "filename": file.filename,
         "path": file_path,
     }
+
+
+@router.get("/{project_id}/watermark")
+async def get_watermark(project_id: str):
+    """The project's current logo/watermark image, if one was uploaded."""
+    watermark_dir = os.path.join(settings.upload_dir, project_id, "watermarks")
+    if not os.path.isdir(watermark_dir):
+        return {"url": None}
+    files = [f for f in os.listdir(watermark_dir) if not f.startswith(".")]
+    if not files:
+        return {"url": None}
+    newest = max(files, key=lambda f: os.path.getmtime(os.path.join(watermark_dir, f)))
+    return {"url": f"/uploads/{project_id}/watermarks/{newest}"}
+
+
+@router.delete("/{project_id}/watermark", status_code=204)
+async def delete_watermark(project_id: str, db: AsyncSession = Depends(get_db)):
+    """Delete all watermark logo files for a project."""
+    watermark_dir = os.path.join(settings.upload_dir, project_id, "watermarks")
+    if os.path.isdir(watermark_dir):
+        shutil.rmtree(watermark_dir, ignore_errors=True)
+    return {"ok": True}
 

@@ -1,3 +1,4 @@
+import { useShallow } from 'zustand/react/shallow';
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { useProjectStore } from '../stores/projectStore';
 import {
@@ -7,7 +8,6 @@ import {
   updateSettings,
   fetchVoiceProfiles,
   type AppSettings,
-  type VoiceProfileItem,
 } from '../api/client';
 import {
   Play,
@@ -17,18 +17,11 @@ import {
   ChevronDown,
   Check,
   Plus,
-  RotateCcw,
   Sparkles,
-  Download,
   Copy,
   Mic,
-  Zap,
-  Sliders,
   Search,
   X,
-  Clock,
-  Layers,
-  Volume2,
 } from 'lucide-react';
 
 interface VoiceOption {
@@ -55,7 +48,7 @@ const EDGE_VOICES: VoiceOption[] = [
     avatar: '👨‍💼',
     greeting: '“សួស្តីបងប្អូនទាំងអស់គ្នា...”',
     lang: 'Khmer',
-    accent: 'from-blue-500 to-indigo-600',
+    accent: 'from-blue-500',
     tag: 'Warm & Confident · Male',
     profile: 'male',
     engine: 'edge-tts',
@@ -68,7 +61,7 @@ const EDGE_VOICES: VoiceOption[] = [
     avatar: '👩‍💼',
     greeting: '“សូមស្វាគមន៍មកកាន់...”',
     lang: 'Khmer',
-    accent: 'from-pink-500 to-rose-600',
+    accent: 'bg-white/10 to-rose-600',
     tag: 'Clear & Melodious · Female',
     profile: 'female',
     engine: 'edge-tts',
@@ -81,107 +74,21 @@ const EDGE_VOICES: VoiceOption[] = [
     avatar: '👶',
     greeting: '“សួស្តីលោកពុកអ្នកម្តាយ...”',
     lang: 'Khmer',
-    accent: 'from-purple-500 to-pink-500',
+    accent: 'bg-white/10',
     tag: 'Playful & Cute · Child',
     profile: 'child',
     engine: 'edge-tts',
     badge: 'Child Voice',
   },
-  {
-    id: 'en-US-AndrewMultilingualNeural',
-    name: 'Andrew (Multi)',
-    gender: 'Male',
-    avatar: '🎙️',
-    greeting: '“Quick and sharp narration...”',
-    lang: 'English / Multi',
-    accent: 'from-amber-500 to-orange-600',
-    tag: 'High Energy Host · Male',
-    profile: 'male',
-    engine: 'edge-tts',
-    badge: 'Multilingual',
-  },
-  {
-    id: 'en-US-AvaMultilingualNeural',
-    name: 'Ava (Multi)',
-    gender: 'Female',
-    avatar: '✨',
-    greeting: '“Smooth and melodious...”',
-    lang: 'English / Multi',
-    accent: 'from-teal-500 to-emerald-600',
-    tag: 'Cinematic & Expressive · Female',
-    profile: 'female',
-    engine: 'edge-tts',
-    badge: 'Multilingual',
-  },
-  {
-    id: 'en-US-BrianMultilingualNeural',
-    name: 'Brian (Multi)',
-    gender: 'Male',
-    avatar: '👔',
-    greeting: '“Deep and calm documentary tone...”',
-    lang: 'English / Multi',
-    accent: 'from-indigo-500 to-sky-600',
-    tag: 'Authoritative & Calm · Male',
-    profile: 'male',
-    engine: 'edge-tts',
-    badge: 'Documentary',
-  },
 ];
 
-const VOXCPM_VOICES: VoiceOption[] = [
-  {
-    id: 'voxcpm-male',
-    name: 'VoxCPM2 - Piseth (បុរស)',
-    gender: 'Male',
-    avatar: '🎬',
-    greeting: '“ខ្ញុំរីករាយណាស់ដែលបានជួបអ្នកនៅថ្ងៃនេះ...”',
-    lang: 'Khmer 2B Model',
-    accent: 'from-purple-600 to-indigo-600',
-    tag: 'Cinematic Acting · Male 2B',
-    profile: 'male',
-    engine: 'voxcpm',
-    badge: '2B Generative',
-  },
-  {
-    id: 'voxcpm-female',
-    name: 'VoxCPM2 - Sreymom (នារី)',
-    gender: 'Female',
-    avatar: '👑',
-    greeting: '“ខ្ញុំរីករាយណាស់ដែលបានជួបអ្នកនៅថ្ងៃនេះ...”',
-    lang: 'Khmer 2B Model',
-    accent: 'from-pink-600 to-rose-600',
-    tag: 'Emotional Acting · Female 2B',
-    profile: 'female',
-    engine: 'voxcpm',
-    badge: '2B Generative',
-  },
-  {
-    id: 'voxcpm-young',
-    name: 'VoxCPM2 - Young Hero (យុវជន)',
-    gender: 'Male',
-    avatar: '⚔️',
-    greeting: '“ខ្ញុំរីករាយណាស់ដែលបានជួបអ្នកនៅថ្ងៃនេះ...”',
-    lang: 'Khmer 2B Model',
-    accent: 'from-cyan-500 to-blue-600',
-    tag: 'Hero & Action Drama 2B',
-    profile: 'male',
-    engine: 'voxcpm',
-    badge: '2B Generative',
-  },
-  {
-    id: 'voxcpm-elder',
-    name: 'VoxCPM2 - Master Elder (លោកតា)',
-    gender: 'Male',
-    avatar: '🧙‍♂️',
-    greeting: '“ខ្ញុំរីករាយណាស់ដែលបានជួបអ្នកនៅថ្ងៃនេះ...”',
-    lang: 'Khmer 2B Model',
-    accent: 'from-amber-500 to-yellow-600',
-    tag: 'Solemn Elder & Legend 2B',
-    profile: 'male',
-    engine: 'voxcpm',
-    badge: '2B Generative',
-  },
-];
+const VOXCPM_VOICES: VoiceOption[] = EDGE_VOICES.slice(0, 2).map((voice) => ({
+  ...voice,
+  id: voice.profile === 'male' ? 'voxcpm-piseth' : 'voxcpm-sreymom',
+  name: `VoxCPM ${voice.name}`,
+  engine: 'voxcpm',
+  badge: 'VoxCPM',
+}));
 
 const EMOTIONS = [
   { id: 'neutral', name: 'Neutral', emoji: '😐', desc: 'Natural & Balanced' },
@@ -231,8 +138,8 @@ interface PendingSpeechMessage {
   startTime: number;
 }
 
-export default function MeatikaTTSPanel() {
-  const { currentProject, currentTime, loadProject, deleteSegment } = useProjectStore();
+export default function MeatikaTTSPanel({ onNavigate }: { onNavigate?: (tool: 'captions' | 'dubbing' | 'recap' | 'hooks') => void }) {
+  const { currentProject, loadProject, deleteSegment } = useProjectStore(useShallow(state => ({ currentProject: state.currentProject, loadProject: state.loadProject, deleteSegment: state.deleteSegment })));
   const currentProjectId = currentProject?.id;
 
   // Active Engine: 'edge-tts' | 'voxcpm'
@@ -246,7 +153,6 @@ export default function MeatikaTTSPanel() {
   const [speed, setSpeed] = useState(1.0);
   const [isGenerating, setIsGenerating] = useState(false);
   const [pendingMsg, setPendingMsg] = useState<PendingSpeechMessage | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
   const [showVoiceDropdown, setShowVoiceDropdown] = useState(false);
   const [voiceSearchQuery, setVoiceSearchQuery] = useState('');
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
@@ -295,7 +201,7 @@ export default function MeatikaTTSPanel() {
             avatar: isFemale ? '👩' : '👨',
             greeting: '“សួស្តី! នេះជាសំឡេងគំរូ...”',
             lang: p.language === 'km' ? 'Khmer' : (p.language || 'Khmer'),
-            accent: isFemale ? 'from-pink-500 to-rose-600' : 'from-indigo-500 to-purple-600',
+            accent: isFemale ? 'bg-white/10 to-rose-600' : 'bg-white/10',
             tag: p.description || (p.sample_audio_url ? 'Zero-Shot Cloned Voice' : 'Custom Voice Profile'),
             profile: isFemale ? 'female' : 'male',
             engine: (p.engine === 'voxcpm' ? 'voxcpm' : 'edge-tts') as 'edge-tts' | 'voxcpm',
@@ -315,7 +221,7 @@ export default function MeatikaTTSPanel() {
     loadCustomProfiles();
     fetchSettings()
       .then((s: AppSettings) => {
-        if (!localStorage.getItem(`tts_voice_${currentProjectId}`)) {
+        if (!localStorage.getItem(`tts-voice-${currentProjectId}`)) {
           if (s.tts_engine === 'voxcpm') {
             setTtsEngine('voxcpm');
             setSelectedVoice(VOXCPM_VOICES[0]);
@@ -532,7 +438,7 @@ export default function MeatikaTTSPanel() {
   };
 
   const handleGenerate = async () => {
-    if (!currentProject?.id || !promptText.trim()) return;
+    if (isGenerating || !currentProject?.id || !promptText.trim()) return;
     setIsGenerating(true);
 
     const rawText = promptText.trim();
@@ -633,7 +539,7 @@ export default function MeatikaTTSPanel() {
           reference_audio: msg.sampleAudioUrl,
           sample_audio_url: msg.sampleAudioUrl,
           speed,
-          start_time: currentTime || 0,
+          start_time: useProjectStore.getState().currentTime || 0,
           speaker: msg.voiceName,
           audio_url: msg.audioUrl || '',
           duration: msg.duration,
@@ -682,26 +588,21 @@ export default function MeatikaTTSPanel() {
   }, [activeVoices, voiceSearchQuery]);
 
   return (
-    <div className="h-full flex flex-col bg-[#121316] text-[#e1e3e6] overflow-hidden select-none font-sans [contain:strict]">
+    <div className="h-full flex flex-col bg-[var(--s2)] text-[#e1e3e6] overflow-hidden select-none font-sans [contain:strict]">
       {/* Top Header Toolbar */}
-      <div className="px-3.5 py-2.5 flex items-center justify-between shrink-0 border-b border-[#1c1e24] bg-[#121316] backdrop-blur-md">
+      <div className="px-3.5 py-2.5 flex flex-wrap gap-2 items-center justify-between shrink-0 border-b border-[var(--s3)] bg-[var(--s2)] backdrop-blur-md">
         <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-purple-600 via-pink-600 to-indigo-600 flex items-center justify-center text-white shadow-md shadow-pink-950/40 shrink-0">
+          <div className="w-8 h-8 rounded-xl bg-white/10 flex items-center justify-center text-white shadow-md shrink-0">
             <Mic className="w-4 h-4" />
           </div>
           <div>
             <div className="flex items-center gap-1.5">
-              <h2 className="text-xs font-bold text-white tracking-wide">TTS Voiceover</h2>
-              <span className="text-[9px] px-2 py-0.5 rounded-full bg-pink-500/15 text-pink-300 border border-pink-500/30 font-bold font-mono">
-                {selectedVoice.isCustom
-                  ? '🌟 Custom'
-                  : ttsEngine === 'voxcpm'
-                  ? '🎬 VoxCPM2'
-                  : '⚡ Edge Neural'}
+              <h2 className="text-xs font-semibold text-white">AI Voice Studio</h2>
+              <span className="text-[9px] px-1.5 py-0.5 rounded bg-white/10 text-zinc-300 border border-white/10">
+                {selectedVoice.isCustom ? 'Custom voice' : ttsEngine === 'voxcpm' ? 'VoxCPM' : 'Edge'}
               </span>
             </div>
             <p className="text-[10px] text-zinc-400 font-medium truncate max-w-[180px] flex items-center gap-1 mt-0.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
               <span>{selectedVoice.name.split(' ')[0]}</span>
               <span className="text-zinc-600">·</span>
               <span className="text-zinc-400">{selectedEmotion.emoji} {selectedEmotion.name}</span>
@@ -713,7 +614,7 @@ export default function MeatikaTTSPanel() {
 
         <div className="flex items-center gap-1.5">
           {/* Engine Selector Control */}
-          <div className="flex items-center bg-[#171920] p-0.5 rounded-xl border border-[#242834]">
+          <div className="flex items-center bg-[var(--s3)] p-0.5 rounded-xl border border-[var(--s5)]">
             <button
               onClick={() => handleSwitchEngine('edge-tts')}
               className={`px-2.5 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-all cursor-pointer ${
@@ -723,95 +624,58 @@ export default function MeatikaTTSPanel() {
               }`}
               title="Fast Microsoft Edge Neural Khmer voices"
             >
-              <Zap className="w-3 h-3 text-yellow-300" />
-              <span>Edge</span>
+              <span>Edge · fast</span>
             </button>
             <button
               onClick={() => handleSwitchEngine('voxcpm')}
               className={`px-2.5 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-all cursor-pointer ${
                 ttsEngine === 'voxcpm'
-                  ? 'bg-gradient-to-r from-purple-600 to-pink-600 text-white shadow-md shadow-pink-950/50'
+                  ? 'bg-white/10 text-white shadow-md'
                   : 'text-zinc-400 hover:text-zinc-200'
               }`}
               title="2B Parameter Generative Acting AI Voice"
             >
-              <Sparkles className="w-3 h-3 text-pink-300" />
-              <span>VoxCPM2</span>
+              <span>VoxCPM · cloned</span>
             </button>
           </div>
 
           {messages.length > 0 && (
             <button
               onClick={() => setMessages([])}
-              className="p-1.5 rounded-xl text-zinc-400 hover:text-red-400 hover:bg-[#181a1f] transition-colors border border-transparent hover:border-red-500/20 cursor-pointer"
+              className="p-1.5 rounded-xl text-zinc-400 hover:text-red-400 hover:bg-[var(--s3)] transition-colors border border-transparent hover:border-red-500/20 cursor-pointer"
               title="Clear Session Takes"
             >
               <Trash2 className="w-3.5 h-3.5" />
             </button>
           )}
 
-          <button
-            onClick={() => setShowSettings(!showSettings)}
-            className={`p-1.5 rounded-xl transition-all cursor-pointer ${
-              showSettings
-                ? 'text-pink-300 bg-pink-500/20 border border-pink-500/40 shadow-sm'
-                : 'text-zinc-400 hover:text-white hover:bg-[#181a1f] border border-transparent'
-            }`}
-            title="Speech Speed Tempo"
-          >
-            <Sliders className="w-3.5 h-3.5" />
-          </button>
         </div>
       </div>
 
-      {/* Speed Slider Settings Drawer */}
-      {showSettings && (
-        <div className="px-4 py-2 bg-[#171922] border-b border-[#222634] flex items-center justify-between gap-3 text-xs animate-in slide-in-from-top-2 duration-150 shrink-0">
-          <div className="flex items-center gap-3 flex-1">
-            <span className="text-[11px] font-bold text-zinc-300 uppercase tracking-wider flex items-center gap-1.5 shrink-0">
-              <Zap className="w-3.5 h-3.5 text-yellow-400" /> Tempo Speed:
-            </span>
-            <input
-              type="range"
-              min="0.75"
-              max="1.5"
-              step="0.05"
-              value={speed}
-              onChange={(e) => setSpeed(parseFloat(e.target.value))}
-              className="w-full h-1.5 bg-[#252834] rounded-lg appearance-none cursor-pointer accent-pink-500"
-            />
-            <span className="font-mono text-xs font-bold text-pink-300 min-w-[38px] text-right">
-              {speed.toFixed(2)}×
-            </span>
-          </div>
-          <button
-            onClick={() => setSpeed(1.0)}
-            className="text-[10px] text-zinc-400 hover:text-white flex items-center gap-1 bg-[#202330] px-2.5 py-1 rounded-lg border border-[#2e3344] hover:border-zinc-500 transition-colors shrink-0 font-medium cursor-pointer"
-          >
-            <RotateCcw className="w-2.5 h-2.5" /> 1.0×
-          </button>
+      {onNavigate && <div className="px-3 py-3 border-b border-white/5 shrink-0">
+        <p className="text-[10px] text-zinc-400 mb-2">Create a voiceover below, or open an AI workflow</p>
+        <div className="grid grid-cols-2 gap-1.5">
+          {([{ id: 'captions', label: 'Auto captions', detail: 'Transcribe & translate' }, { id: 'dubbing', label: 'Dub dialogue', detail: 'Assign character voices' }, { id: 'recap', label: 'Movie recap', detail: 'Create a narrated story' }, { id: 'hooks', label: 'Intro hooks', detail: 'Write an opening line' }] as const).map(tool => <button key={tool.id} onClick={() => onNavigate(tool.id)} className="text-left rounded-lg border border-white/10 bg-white/[0.03] hover:bg-blue-500/10 hover:border-blue-500/40 px-2.5 py-2 transition-colors"><span className="block text-[11px] font-semibold text-zinc-200">{tool.label}</span><span className="block text-[10px] text-zinc-500 mt-0.5">{tool.detail}</span></button>)}
         </div>
-      )}
-
+      </div>}
       {/* Main Feed: Generation History */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden scroll-smooth scrollbar-thin scrollbar-thumb-zinc-700/50 hover:scrollbar-thumb-zinc-600/70 scrollbar-track-transparent p-3 sm:p-4 space-y-3 [contain:content]">
         {messages.length === 0 && !pendingMsg && (
           <div className="h-full flex flex-col items-center justify-center text-center p-6 text-zinc-500 space-y-3.5 animate-in fade-in duration-150">
-            <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-[#1b1e2c] to-[#141622] border border-[#282d40] flex items-center justify-center text-pink-400 shadow-xl shadow-black/40">
-              <Sparkles className="w-7 h-7 text-pink-400 animate-pulse" />
+            <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-[var(--s4)] to-[var(--s3)] border border-[var(--s6)] flex items-center justify-center text-zinc-400 shadow-xl shadow-black/40">
+              <Sparkles className="w-7 h-7 text-zinc-400 animate-pulse" />
             </div>
             <div>
-              <h3 className="text-xs font-bold text-white tracking-wide">
-                {selectedVoice.isCustom
-                  ? `🌟 ${selectedVoice.name} (Custom Profile)`
-                  : ttsEngine === 'voxcpm'
-                  ? '🎬 VoxCPM2 Generative Voice Studio'
-                  : '⚡ Studio Neural Voice Synthesis'}
-              </h3>
-              <p className="text-[11px] text-zinc-400 max-w-xs leading-relaxed mt-1">
-                Type or paste text below to generate realistic studio voiceovers. Audition lines and inject them directly to your timeline.
-              </p>
+              <h3 className="text-xs font-semibold text-white">Make a voiceover line</h3>
+              <ol className="text-[11px] text-zinc-400 max-w-xs leading-relaxed mt-1 space-y-0.5 text-left list-decimal list-inside">
+                <li>Pick a voice and emotion below</li>
+                <li>Type or paste your text</li>
+                <li>Press Generate, then listen</li>
+                <li>Add the take to the timeline at the playhead</li>
+              </ol>
             </div>
+
+            <p className="text-[10px] text-zinc-500">Or start from an example:</p>
 
             {/* Quick Prompts Suggestions */}
             <div className="grid grid-cols-2 gap-2 w-full max-w-sm pt-2">
@@ -819,9 +683,9 @@ export default function MeatikaTTSPanel() {
                 <button
                   key={idx}
                   onClick={() => setPromptText(s.text)}
-                  className="p-2.5 text-left rounded-2xl bg-[#161824] hover:bg-[#202434] border border-[#262b3d] hover:border-pink-500/40 text-[11px] text-zinc-300 hover:text-white transition-all group cursor-pointer shadow-sm"
+                  className="p-2.5 text-left rounded-2xl bg-[var(--s3)] hover:bg-[var(--s4)] border border-[var(--s5)] hover:border-white/10 text-[11px] text-zinc-300 hover:text-white transition-all group cursor-pointer shadow-sm"
                 >
-                  <span className="font-bold block text-[10px] text-pink-400 mb-0.5 group-hover:text-pink-300">
+                  <span className="font-bold block text-[10px] text-zinc-400 mb-0.5 group-hover:text-zinc-200">
                     {s.label}
                   </span>
                   <span className="line-clamp-1 font-khmer text-zinc-400 text-[10px]">{s.text}</span>
@@ -838,7 +702,7 @@ export default function MeatikaTTSPanel() {
           return (
             <div
               key={msg.id}
-              className="p-3.5 rounded-2xl bg-[#161824] border border-[#262b3c] hover:border-[#3a415a] transition-all shadow-md group relative space-y-2.5"
+              className="p-3.5 rounded-2xl bg-[var(--s3)] border border-[var(--s5)] hover:border-[var(--s9)] transition-all shadow-md group relative space-y-2.5"
             >
               {/* Header Info */}
               <div className="flex items-center justify-between">
@@ -848,7 +712,7 @@ export default function MeatikaTTSPanel() {
                     <div className="flex items-center gap-1.5">
                       <span className="text-xs font-bold text-white">{msg.voiceName}</span>
                       {msg.emotion && (
-                        <span className="text-[9px] px-2 py-0.5 rounded-full bg-pink-500/15 text-pink-300 font-semibold border border-pink-500/30">
+                        <span className="text-[9px] px-2 py-0.5 rounded-full bg-white/10 text-zinc-200 font-semibold border border-white/10">
                           {msg.emotionEmoji} {msg.emotion}
                         </span>
                       )}
@@ -860,7 +724,7 @@ export default function MeatikaTTSPanel() {
                   <span className="text-[10px] text-zinc-500 font-mono">{msg.timestamp}</span>
                   <button
                     onClick={() => handleDeleteMsg(msg.id)}
-                    className="p-1 text-zinc-500 hover:text-red-400 rounded-lg hover:bg-[#242730] transition-colors ml-1 cursor-pointer"
+                    className="p-1 text-zinc-500 hover:text-red-400 rounded-lg hover:bg-[var(--s4)] transition-colors ml-1 cursor-pointer"
                     title="Remove take"
                   >
                     <Trash2 className="w-3 h-3" />
@@ -874,24 +738,24 @@ export default function MeatikaTTSPanel() {
               </p>
 
               {/* Action Bar / Waveform Progress */}
-              <div className="flex items-center justify-between pt-2 border-t border-[#232738] gap-2.5">
+              <div className="flex items-center justify-between pt-2 border-t border-[var(--s5)] gap-2.5">
                 <div className="flex items-center gap-2 flex-1">
                   {/* Play / Pause Button */}
                   <button
                     onClick={() => handleTogglePlay(msg)}
                     className={`w-7 h-7 rounded-xl flex items-center justify-center text-xs font-bold transition-all shadow-sm cursor-pointer ${
                       isPlaying
-                        ? 'bg-pink-600 text-white shadow-pink-950/60 ring-2 ring-pink-400 scale-105'
-                        : 'bg-[#222634] hover:bg-pink-600 text-zinc-200 hover:text-white border border-[#2e3346]'
+                        ? 'bg-white/10 text-white ring-2 ring-white/20 scale-105'
+                        : 'bg-[var(--s5)] hover:bg-white/10 text-zinc-200 hover:text-white border border-[var(--s7)]'
                     }`}
                   >
                     {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 translate-x-0.5" />}
                   </button>
 
                   {/* Audio Progress Bar */}
-                  <div className="flex-1 bg-[#101218] h-1.5 rounded-full overflow-hidden relative border border-[#242838]">
+                  <div className="flex-1 bg-[var(--s2)] h-1.5 rounded-full overflow-hidden relative border border-[var(--s5)]">
                     <div
-                      className="bg-gradient-to-r from-pink-500 to-purple-500 h-full rounded-full transition-all duration-100"
+                      className="bg-white/10 h-full rounded-full transition-all duration-100"
                       style={{ width: `${isPlaying ? playbackProgress * 100 : 0}%` }}
                     />
                   </div>
@@ -904,7 +768,7 @@ export default function MeatikaTTSPanel() {
                 <div className="flex items-center gap-1.5 shrink-0">
                   <button
                     onClick={() => handleCopyText(msg)}
-                    className="p-1.5 text-zinc-400 hover:text-white rounded-lg hover:bg-[#222634] transition-colors cursor-pointer"
+                    className="p-1.5 text-zinc-400 hover:text-white rounded-lg hover:bg-[var(--s5)] transition-colors cursor-pointer"
                     title="Copy Text"
                   >
                     {copiedMsgId === msg.id ? (
@@ -919,7 +783,7 @@ export default function MeatikaTTSPanel() {
                     className={`px-2.5 py-1 rounded-xl text-[10px] font-bold flex items-center gap-1 transition-all cursor-pointer ${
                       msg.inTimeline
                         ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30'
-                        : 'bg-[#222636] hover:bg-purple-600 text-zinc-200 hover:text-white border border-[#2f3448]'
+                        : 'bg-[var(--s5)] hover:bg-white/10 text-zinc-200 hover:text-white border border-[var(--s7)]'
                     }`}
                     title={msg.inTimeline ? 'Added to project timeline' : 'Add subtitle segment to timeline'}
                   >
@@ -943,16 +807,16 @@ export default function MeatikaTTSPanel() {
 
         {/* Pending Generation Skeleton */}
         {pendingMsg && (
-          <div className="p-3.5 rounded-2xl bg-[#181b28] border border-pink-500/40 animate-pulse space-y-2.5 shadow-lg">
+          <div className="p-3.5 rounded-2xl bg-[var(--s3)] border border-white/10 animate-pulse space-y-2.5 shadow-lg">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <span className="text-lg">{pendingMsg.voice.avatar}</span>
                 <span className="text-xs font-bold text-white">{pendingMsg.voice.name}</span>
-                <span className="text-[9px] px-2 py-0.5 rounded-full bg-pink-500/20 text-pink-300 font-semibold border border-pink-500/30">
+                <span className="text-[9px] px-2 py-0.5 rounded-full bg-white/10 text-zinc-200 font-semibold border border-white/10">
                   {pendingMsg.emotion.emoji} {pendingMsg.emotion.name}
                 </span>
               </div>
-              <span className="text-[10px] text-pink-400 font-mono flex items-center gap-1 font-bold">
+              <span className="text-[10px] text-zinc-400 font-mono flex items-center gap-1 font-bold">
                 <Loader2 className="w-3 h-3 animate-spin" /> Synthesizing Voice...
               </span>
             </div>
@@ -961,9 +825,9 @@ export default function MeatikaTTSPanel() {
               "{pendingMsg.text}"
             </p>
 
-            <div className="w-full bg-[#101218] h-1.5 rounded-full overflow-hidden border border-pink-500/20">
+            <div className="w-full bg-[var(--s2)] h-1.5 rounded-full overflow-hidden border border-white/10">
               <div
-                className="bg-gradient-to-r from-pink-500 via-purple-500 to-indigo-500 h-full rounded-full transition-all duration-300"
+                className="bg-white/10 h-full rounded-full transition-all duration-300"
                 style={{ width: `${pendingMsg.progress}%` }}
               />
             </div>
@@ -974,9 +838,9 @@ export default function MeatikaTTSPanel() {
       </div>
 
       {/* Input / Control Bottom Studio Deck */}
-      <div className="p-3.5 border-t border-[#1c1e24] bg-[#121316] shrink-0 space-y-2.5">
-        {/* Voice Selector Bar & Emotion Tray */}
-        <div className="flex items-center gap-2">
+      <div className="p-3.5 border-t border-[var(--s3)] bg-[var(--s2)] shrink-0 space-y-2.5">
+        {/* Voice, emotion and speed */}
+        <div className="flex items-center gap-2 flex-wrap">
           {/* Main Voice Selector Trigger */}
           <div className="relative flex-1" ref={voiceDropdownRef}>
             <button
@@ -984,7 +848,7 @@ export default function MeatikaTTSPanel() {
                 setShowVoiceDropdown(!showVoiceDropdown);
                 loadCustomProfiles();
               }}
-              className="w-full flex items-center justify-between p-2 rounded-2xl bg-[#161824] border border-[#262b3c] hover:border-purple-500/40 text-xs transition-all shadow-sm group cursor-pointer"
+              className="w-full flex items-center justify-between p-2 rounded-2xl bg-[var(--s3)] border border-[var(--s5)] hover:border-white/10 text-xs transition-all shadow-sm group cursor-pointer"
             >
               <div className="flex items-center gap-2.5 truncate">
                 <span className="text-lg">{selectedVoice.avatar}</span>
@@ -994,7 +858,7 @@ export default function MeatikaTTSPanel() {
                       {selectedVoice.name}
                     </span>
                     {selectedVoice.isCustom && (
-                      <span className="text-[8px] px-1.5 py-0.2 rounded bg-purple-500/20 text-purple-300 font-bold border border-purple-500/30">
+                      <span className="text-[9px] px-1.5 py-0.2 rounded bg-white/10 text-zinc-200 font-bold border border-white/10">
                         Custom
                       </span>
                     )}
@@ -1007,10 +871,10 @@ export default function MeatikaTTSPanel() {
 
             {/* Dropdown Menu */}
             {showVoiceDropdown && (
-              <div className="absolute bottom-full left-0 mb-2 w-84 bg-[#161824]/98 border border-[#2b3042] rounded-3xl shadow-2xl p-2.5 z-50 max-h-88 overflow-hidden flex flex-col space-y-2 backdrop-blur-xl animate-in zoom-in-95 duration-150">
-                <div className="px-2 py-1 text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center justify-between border-b border-[#232738] pb-1.5">
+              <div className="absolute bottom-full left-0 mb-2 w-84 bg-[rgb(var(--s3-rgb)/0.98)] border border-[var(--s6)] rounded-3xl shadow-2xl p-2.5 z-50 max-h-88 overflow-hidden flex flex-col space-y-2 backdrop-blur-xl animate-in zoom-in-95 duration-150">
+                <div className="px-2 py-1 text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center justify-between border-b border-[var(--s5)] pb-1.5">
                   <span>Voice Profiles</span>
-                  <span className="font-mono text-pink-400 font-bold">{filteredVoices.length} voices</span>
+                  <span className="font-mono text-zinc-400 font-bold">{filteredVoices.length} voices</span>
                 </div>
 
                 {/* Category Filter Pills */}
@@ -1019,8 +883,8 @@ export default function MeatikaTTSPanel() {
                     onClick={() => setVoiceCategory('all')}
                     className={`px-2.5 py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
                       voiceCategory === 'all'
-                        ? 'bg-pink-600 text-white shadow-sm'
-                        : 'bg-[#10121a] text-zinc-400 hover:text-white'
+                        ? 'bg-white/10 text-white shadow-sm'
+                        : 'bg-[var(--s2)] text-zinc-400 hover:text-white'
                     }`}
                   >
                     All
@@ -1030,8 +894,8 @@ export default function MeatikaTTSPanel() {
                       onClick={() => setVoiceCategory('custom')}
                       className={`px-2.5 py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
                         voiceCategory === 'custom'
-                          ? 'bg-purple-600 text-white'
-                          : 'bg-[#10121a] text-purple-300 hover:text-white border border-purple-500/30'
+                          ? 'bg-white/10 text-white'
+                          : 'bg-[var(--s2)] text-zinc-200 hover:text-white border border-white/10'
                       }`}
                     >
                       🌟 Custom ({customVoices.length})
@@ -1041,8 +905,8 @@ export default function MeatikaTTSPanel() {
                     onClick={() => setVoiceCategory('voxcpm')}
                     className={`px-2.5 py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
                       voiceCategory === 'voxcpm'
-                        ? 'bg-indigo-600 text-white'
-                        : 'bg-[#10121a] text-zinc-400 hover:text-white'
+                        ? 'bg-white/10 text-white'
+                        : 'bg-[var(--s2)] text-zinc-400 hover:text-white'
                     }`}
                   >
                     🎬 VoxCPM2
@@ -1052,7 +916,7 @@ export default function MeatikaTTSPanel() {
                     className={`px-2.5 py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
                       voiceCategory === 'edge'
                         ? 'bg-blue-600 text-white'
-                        : 'bg-[#10121a] text-zinc-400 hover:text-white'
+                        : 'bg-[var(--s2)] text-zinc-400 hover:text-white'
                     }`}
                   >
                     ⚡ Edge-TTS
@@ -1067,7 +931,7 @@ export default function MeatikaTTSPanel() {
                     placeholder="Search voice name or language..."
                     value={voiceSearchQuery}
                     onChange={(e) => setVoiceSearchQuery(e.target.value)}
-                    className="w-full pl-8 pr-7 py-1.5 bg-[#10121a] border border-[#242838] focus:border-pink-500 rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none"
+                    className="w-full pl-8 pr-7 py-1.5 bg-[var(--s2)] border border-[var(--s5)] focus:border-white/10 rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none"
                     autoFocus
                   />
                   {voiceSearchQuery && (
@@ -1091,8 +955,8 @@ export default function MeatikaTTSPanel() {
                       }}
                       className={`w-full p-2 rounded-2xl text-left flex items-center justify-between transition-all group cursor-pointer ${
                         selectedVoice.id === v.id && selectedVoice.name === v.name
-                          ? 'bg-pink-600/20 border border-pink-500/50 text-white shadow-sm'
-                          : 'hover:bg-[#202434] text-zinc-300 border border-transparent'
+                          ? 'bg-white/10 border border-white/10 text-white shadow-sm'
+                          : 'hover:bg-[var(--s4)] text-zinc-300 border border-transparent'
                       }`}
                     >
                       <div className="flex items-center gap-2.5 truncate">
@@ -1100,8 +964,8 @@ export default function MeatikaTTSPanel() {
                         <div className="truncate">
                           <div className="flex items-center gap-1.5">
                             <span className="font-bold text-xs text-white truncate">{v.name}</span>
-                            <span className={`text-[8px] px-1.5 py-0.2 rounded font-mono ${
-                              v.isCustom ? 'bg-purple-500/25 text-purple-300 border border-purple-500/40' : 'bg-zinc-800 text-zinc-400'
+                            <span className={`text-[9px] px-1.5 py-0.2 rounded font-mono ${
+                              v.isCustom ? 'bg-white/10 text-zinc-200 border border-white/10' : 'bg-zinc-800 text-zinc-400'
                             }`}>
                               {v.badge}
                             </span>
@@ -1115,8 +979,8 @@ export default function MeatikaTTSPanel() {
                           onClick={(e) => handleAuditionVoice(v, e)}
                           className={`p-1.5 rounded-xl text-xs transition-colors cursor-pointer ${
                             auditionVoiceId === v.id
-                              ? 'bg-pink-600 text-white ring-2 ring-pink-400'
-                              : 'bg-[#222636] hover:bg-pink-600 text-zinc-300 hover:text-white'
+                              ? 'bg-white/10 text-white ring-2 ring-white/20'
+                              : 'bg-[var(--s5)] hover:bg-white/10 text-zinc-300 hover:text-white'
                           }`}
                           title="Audition Sample"
                         >
@@ -1127,7 +991,7 @@ export default function MeatikaTTSPanel() {
                           )}
                         </button>
                         {selectedVoice.id === v.id && selectedVoice.name === v.name && (
-                          <Check className="w-3.5 h-3.5 text-pink-400 ml-0.5" />
+                          <Check className="w-3.5 h-3.5 text-zinc-400 ml-0.5" />
                         )}
                       </div>
                     </button>
@@ -1145,11 +1009,27 @@ export default function MeatikaTTSPanel() {
                 const emo = EMOTIONS.find((em) => em.id === e.target.value);
                 if (emo) setSelectedEmotion(emo);
               }}
-              className="bg-[#161824] border border-[#262b3c] hover:border-purple-500/40 text-white text-xs font-bold rounded-2xl px-3 py-2.5 focus:outline-none focus:border-pink-500 cursor-pointer shadow-sm"
+              className="bg-[var(--s3)] border border-[var(--s5)] hover:border-white/10 text-white text-xs font-bold rounded-2xl px-3 py-2.5 focus:outline-none focus:border-white/10 cursor-pointer shadow-sm"
             >
               {EMOTIONS.map((e) => (
                 <option key={e.id} value={e.id}>
                   {e.emoji} {e.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Speed */}
+          <div className="shrink-0">
+            <select
+              value={speed}
+              onChange={(e) => setSpeed(parseFloat(e.target.value))}
+              className="bg-[var(--s3)] border border-[var(--s5)] hover:border-white/10 text-white text-xs rounded-2xl px-2.5 py-2.5 focus:outline-none focus:border-blue-500/60 cursor-pointer"
+              title="Speaking speed"
+            >
+              {[0.85, 1.0, 1.15, 1.25, 1.4].map((v) => (
+                <option key={v} value={v}>
+                  {v === 1 ? 'Normal speed' : `${v}× speed`}
                 </option>
               ))}
             </select>
@@ -1159,6 +1039,7 @@ export default function MeatikaTTSPanel() {
         {/* Text Input Box Deck */}
         <div className="relative">
           <textarea
+            aria-label="Voiceover script"
             value={promptText}
             onChange={(e) => setPromptText(e.target.value)}
             onKeyDown={(e) => {
@@ -1167,24 +1048,26 @@ export default function MeatikaTTSPanel() {
                 handleGenerate();
               }
             }}
-            placeholder="Type or paste narration script in Khmer or English..."
-            rows={2}
-            className="w-full bg-[#161824] border border-[#262b3c] rounded-2xl p-3 pr-28 text-xs text-white placeholder-zinc-500 font-khmer focus:outline-none focus:border-pink-500/80 transition-colors resize-none leading-relaxed shadow-inner"
+            placeholder="Type or paste your narration in Khmer or English…"
+            rows={3}
+            className="w-full bg-[var(--s3)] border border-[var(--s5)] rounded-2xl p-3 pb-8 text-xs text-white placeholder-zinc-500 font-khmer focus:outline-none focus:border-blue-500/60 transition-colors resize-none leading-relaxed"
           />
+          <div className="absolute left-3 bottom-2.5 text-[10px] text-zinc-500 pointer-events-none">
+            {promptText.trim()
+              ? `${promptText.trim().length} chars · about ${Math.max(1, Math.round(promptText.trim().length / 15))}s`
+              : 'Ctrl/⌘ + Enter to generate'}
+          </div>
 
           {/* Generate Button inside Input Box */}
-          <div className="absolute right-2.5 bottom-3 flex items-center gap-1.5">
+          <div className="absolute right-2.5 bottom-2 flex items-center gap-1.5">
             <button
               onClick={handleGenerate}
               disabled={isGenerating || !promptText.trim()}
-              className="px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-pink-600 via-purple-600 to-indigo-600 hover:from-pink-500 hover:to-indigo-500 text-white text-xs font-bold shadow-lg shadow-pink-950/50 flex items-center gap-1.5 transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed uppercase tracking-wider font-mono cursor-pointer"
+              className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium flex items-center gap-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+              title="Generate this line (Ctrl/⌘ + Enter)"
             >
-              {isGenerating ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <Sparkles className="w-3.5 h-3.5" />
-              )}
-              <span>Say</span>
+              {isGenerating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Mic className="w-3.5 h-3.5" />}
+              <span>{isGenerating ? 'Generating…' : 'Generate'}</span>
             </button>
           </div>
         </div>
