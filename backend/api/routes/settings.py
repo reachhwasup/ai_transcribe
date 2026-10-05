@@ -1,8 +1,9 @@
 from __future__ import annotations
+import os
 from typing import Optional, List
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from pydantic import BaseModel
-from sqlalchemy import select, delete as sa_delete
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings as app_config
@@ -11,11 +12,13 @@ from backend.database.models import ApiKey, AppSetting
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
+
 AVAILABLE_MODELS = [
-    {"id": "gemini-3.5-flash", "name": "Gemini 3.5 Flash", "description": "High accuracy, fast transcription (Recommended)"},
-    {"id": "gemini-3.5-flash-lite", "name": "Gemini 3.5 Flash Lite", "description": "Ultra-fast responses & high quota"},
-    {"id": "gemini-3.6-flash", "name": "Gemini 3.6 Flash", "description": "Advanced multi-modal speech recognition"},
-    {"id": "gemini-flash-latest", "name": "Gemini Flash Latest", "description": "Latest stable Flash release"},
+    {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash", "description": "Newest and fastest — best transcription quality (Recommended)"},
+    {"id": "gemini-3.7-flash", "name": "Gemini 3.7 Flash", "description": "Previous generation, slower"},
+    {"id": "gemini-3.6-flash", "name": "Gemini 3.6 Flash", "description": "Multimodal speech recognition"},
+    {"id": "gemini-3.5-flash", "name": "Gemini 3.5 Flash", "description": "High accuracy, fast transcription"},
+    {"id": "gemini-3.5-flash-lite", "name": "Gemini 3.5 Flash Lite", "description": "Ultra-fast, lower quality — more script mix-ups"},
 ]
 
 
@@ -27,6 +30,9 @@ class ApiKeyOut(BaseModel):
     preview: str
     is_active: bool
     created_at: str
+    # False only for a blank key. Gemini accepts several key formats, so the shape of a key
+    # says nothing about whether it works — only a real request does.
+    usable: bool = True
 
 
 class ApiKeyAdd(BaseModel):
@@ -44,6 +50,7 @@ class SettingsResponse(BaseModel):
     tts_engine: str
     voxcpm_model_path: str
     voxcpm_inference_steps: int
+    separation_pace: str = "balanced"
     available_models: List[dict]
     api_keys: List[ApiKeyOut]
 
@@ -54,6 +61,7 @@ class SettingsUpdate(BaseModel):
     tts_engine: Optional[str] = None
     voxcpm_model_path: Optional[str] = None
     voxcpm_inference_steps: Optional[int] = None
+    separation_pace: Optional[str] = None
 
 
 # --- Helpers ---
@@ -73,6 +81,7 @@ def _key_out(k: ApiKey) -> ApiKeyOut:
         preview=_mask_key(k.key),
         is_active=k.is_active,
         created_at=k.created_at.isoformat() if k.created_at else "",
+        usable=bool((k.key or "").strip()),
     )
 
 
@@ -113,6 +122,8 @@ async def _sync_config(db: AsyncSession) -> None:
     app_config.tts_engine = tts_engine
     app_config.voxcpm_model_path = voxcpm_model_path
     app_config.voxcpm_inference_steps = steps
+    pace = await _get_setting(db, "separation_pace", app_config.separation_pace)
+    app_config.separation_pace = pace if pace in ("fast", "balanced", "cool") else "balanced"
 
     # Load the first active key into the config for backward compat
     result = await db.execute(
@@ -139,6 +150,7 @@ async def get_settings(db: AsyncSession = Depends(get_db)):
         tts_engine=app_config.tts_engine,
         voxcpm_model_path=app_config.voxcpm_model_path,
         voxcpm_inference_steps=app_config.voxcpm_inference_steps,
+        separation_pace=app_config.separation_pace,
         available_models=AVAILABLE_MODELS,
         api_keys=await _all_keys(db),
     )
@@ -168,6 +180,11 @@ async def update_settings(data: SettingsUpdate, db: AsyncSession = Depends(get_d
     if data.voxcpm_inference_steps is not None:
         await _set_setting(db, "voxcpm_inference_steps", str(max(1, data.voxcpm_inference_steps)))
 
+    if data.separation_pace is not None:
+        if data.separation_pace not in ("fast", "balanced", "cool"):
+            raise HTTPException(400, "Invalid pace. Choose 'fast', 'balanced' or 'cool'.")
+        await _set_setting(db, "separation_pace", data.separation_pace)
+
     await db.commit()
     await _sync_config(db)
 
@@ -177,6 +194,7 @@ async def update_settings(data: SettingsUpdate, db: AsyncSession = Depends(get_d
         tts_engine=app_config.tts_engine,
         voxcpm_model_path=app_config.voxcpm_model_path,
         voxcpm_inference_steps=app_config.voxcpm_inference_steps,
+        separation_pace=app_config.separation_pace,
         available_models=AVAILABLE_MODELS,
         api_keys=await _all_keys(db),
     )
@@ -234,6 +252,8 @@ async def delete_api_key(key_id: str, db: AsyncSession = Depends(get_db)):
 # ==========================================
 
 class VoiceProfileItem(BaseModel):
+    eq: Optional[dict] = None
+    group_id: str = ""
     id: str
     name: str
     gender: str = "female"  # "female" | "male" | "child" | "elderly"
@@ -250,6 +270,7 @@ class VoiceProfileItem(BaseModel):
 
 
 class VoiceProfileCreate(BaseModel):
+    group_id: str = ""
     name: str
     gender: str = "female"
     voice_name: str = "km-KH-SreymomNeural"
@@ -263,6 +284,7 @@ class VoiceProfileCreate(BaseModel):
 
 
 class VoiceProfileUpdate(BaseModel):
+    group_id: Optional[str] = None
     name: Optional[str] = None
     gender: Optional[str] = None
     voice_name: Optional[str] = None
@@ -400,62 +422,6 @@ DEFAULT_SAMPLE_VOICE_PROFILES = [
         "sample_audio_url": "",
         "is_built_in": True,
     },
-    {
-        "id": "builtin_voxcpm_piseth",
-        "name": "VoxCPM2 Heroic Male (ពិសិដ្ឋ)",
-        "gender": "male",
-        "voice_name": "voxcpm-piseth",
-        "engine": "voxcpm",
-        "language": "km",
-        "pitch": "+0Hz",
-        "rate": "+0%",
-        "emotion": "neutral",
-        "description": "2B Autoregressive generative neural model for male leads, narrators, and heroes.",
-        "sample_audio_url": "",
-        "is_built_in": True,
-    },
-    {
-        "id": "builtin_voxcpm_sreymom",
-        "name": "VoxCPM2 Gentle Female (ស្រីមុំ)",
-        "gender": "female",
-        "voice_name": "voxcpm-sreymom",
-        "engine": "voxcpm",
-        "language": "km",
-        "pitch": "+0Hz",
-        "rate": "+0%",
-        "emotion": "neutral",
-        "description": "Expressive 2B generative female voice for natural cinematic acting and conversational dialogue.",
-        "sample_audio_url": "",
-        "is_built_in": True,
-    },
-    {
-        "id": "builtin_voxcpm_lokta",
-        "name": "VoxCPM2 Elder Master (លោកតា គ្រូធំ)",
-        "gender": "grandpa",
-        "voice_name": "voxcpm-lokta",
-        "engine": "voxcpm",
-        "language": "km",
-        "pitch": "-3Hz",
-        "rate": "-5%",
-        "emotion": "calm",
-        "description": "Deep, authoritative 2B neural elder tone for grandfathers, masters, and sages.",
-        "sample_audio_url": "",
-        "is_built_in": True,
-    },
-    {
-        "id": "builtin_voxcpm_lokyeay",
-        "name": "VoxCPM2 Wise Matriarch (លោកយាយ ចាស់ទុំ)",
-        "gender": "grandma",
-        "voice_name": "voxcpm-lokyeay",
-        "engine": "voxcpm",
-        "language": "km",
-        "pitch": "-2Hz",
-        "rate": "-4%",
-        "emotion": "calm",
-        "description": "Warm, emotional 2B neural elder female voice for story narration and matriarchs.",
-        "sample_audio_url": "",
-        "is_built_in": True,
-    },
 ]
 
 
@@ -477,6 +443,56 @@ async def _save_custom_voice_profiles(db: AsyncSession, profiles: List[dict]) ->
     await db.commit()
 
 
+class PronunciationEntry(BaseModel):
+    word: str
+    say_as: str
+    # when this word's spoken form was last set; a dub made before it still says it the old way
+    changed_at: float = 0.0
+
+
+@router.get("/pronunciations", response_model=List[PronunciationEntry])
+async def list_pronunciations(db: AsyncSession = Depends(get_db)):
+    """Words the voice engine should pronounce a specific way (captions are unaffected)."""
+    import json
+
+    raw = await _get_setting(db, "pronunciations", "[]")
+    try:
+        entries = json.loads(raw)
+    except ValueError:
+        entries = []
+    return [PronunciationEntry(**e) for e in entries if e.get("word") and e.get("say_as")]
+
+
+@router.put("/pronunciations", response_model=List[PronunciationEntry])
+async def save_pronunciations(
+    entries: List[PronunciationEntry],
+    db: AsyncSession = Depends(get_db),
+):
+    import json
+
+    from backend.services.tts_service import set_pronunciations
+
+    import time
+
+    try:
+        before = {e.get("word"): e for e in json.loads(await _get_setting(db, "pronunciations", "[]"))}
+    except ValueError:
+        before = {}
+    cleaned = []
+    for e in entries:
+        word, say = e.word.strip(), e.say_as.strip()
+        if not word or not say:
+            continue
+        old = before.get(word)
+        same = bool(old) and old.get("say_as") == say
+        # an entry that was already there before stale dubs were tracked has no time: unknown
+        cleaned.append({"word": word, "say_as": say, "changed_at": float(old.get("changed_at") or 0.0) if same else time.time()})
+    await _set_setting(db, "pronunciations", json.dumps(cleaned, ensure_ascii=False))
+    await db.commit()
+    set_pronunciations(cleaned)  # take effect without a restart
+    return [PronunciationEntry(**e) for e in cleaned]
+
+
 @router.get("/voice-profiles", response_model=List[VoiceProfileItem])
 async def list_voice_profiles(db: AsyncSession = Depends(get_db)):
     """Return all voice profiles: default built-in samples + user custom profiles."""
@@ -494,7 +510,9 @@ async def create_voice_profile(data: VoiceProfileCreate, db: AsyncSession = Depe
     if not data.name.strip():
         raise HTTPException(400, "Voice profile name cannot be empty")
 
+    await _validate_voice_group(db, data.group_id)
     new_profile = {
+        "group_id": data.group_id,
         "id": f"custom_{uuid.uuid4().hex[:10]}",
         "name": data.name.strip(),
         "gender": data.gender or "female",
@@ -530,6 +548,9 @@ async def update_voice_profile(profile_id: str, data: VoiceProfileUpdate, db: As
     if not target:
         raise HTTPException(404, "Custom voice profile not found or is a built-in profile")
 
+    if data.group_id is not None:
+        await _validate_voice_group(db, data.group_id)
+        target["group_id"] = data.group_id
     if data.name is not None:
         target["name"] = data.name.strip()
     if data.gender is not None:
@@ -549,6 +570,14 @@ async def update_voice_profile(profile_id: str, data: VoiceProfileUpdate, db: As
     if data.description is not None:
         target["description"] = data.description
     if data.sample_audio_url is not None:
+        old_sample = target.get("sample_audio_url")
+        if old_sample and old_sample != data.sample_audio_url:
+            s_path = old_sample.lstrip("/")
+            if os.path.exists(s_path):
+                try:
+                    os.remove(s_path)
+                except OSError:
+                    pass
         target["sample_audio_url"] = data.sample_audio_url
 
     await _save_custom_voice_profiles(db, custom)
@@ -557,13 +586,21 @@ async def update_voice_profile(profile_id: str, data: VoiceProfileUpdate, db: As
 
 @router.delete("/voice-profiles/{profile_id}")
 async def delete_voice_profile(profile_id: str, db: AsyncSession = Depends(get_db)):
-    """Delete a custom voice profile."""
+    """Delete a custom voice profile and its sample audio file."""
     custom = await _get_custom_voice_profiles(db)
-    filtered = [p for p in custom if p["id"] != profile_id]
-
-    if len(filtered) == len(custom):
+    target = next((p for p in custom if p["id"] == profile_id), None)
+    if not target:
         raise HTTPException(404, "Custom voice profile not found or cannot delete built-in profile")
 
+    if target.get("sample_audio_url"):
+        s_path = target["sample_audio_url"].lstrip("/")
+        if os.path.exists(s_path):
+            try:
+                os.remove(s_path)
+            except OSError:
+                pass
+
+    filtered = [p for p in custom if p["id"] != profile_id]
     await _save_custom_voice_profiles(db, filtered)
     return {"ok": True}
 
@@ -654,3 +691,133 @@ async def upload_voice_profile_sample_audio(
 
     audio_url = f"/uploads/tts/samples/{unique_filename}"
     return {"ok": True, "audio_url": audio_url, "filename": file.filename}
+
+
+class VoiceGroupCreate(BaseModel):
+    name: str
+
+
+async def _get_voice_groups(db: AsyncSession) -> List[dict]:
+    import json
+    return json.loads(await _get_setting(db, "voice_groups", "[]"))
+
+
+async def _validate_voice_group(db: AsyncSession, group_id: str) -> None:
+    if group_id and not any(g["id"] == group_id for g in await _get_voice_groups(db)):
+        raise HTTPException(400, "Voice group not found")
+
+
+@router.get("/voice-groups")
+async def list_voice_groups(db: AsyncSession = Depends(get_db)):
+    return await _get_voice_groups(db)
+
+
+@router.post("/voice-groups")
+async def create_voice_group(data: VoiceGroupCreate, db: AsyncSession = Depends(get_db)):
+    import json
+    import uuid
+    name = data.name.strip()
+    if not name or len(name) > 80:
+        raise HTTPException(400, "Enter a group name of 1–80 characters")
+    groups = await _get_voice_groups(db)
+    if any(g["name"].casefold() == name.casefold() for g in groups):
+        raise HTTPException(409, "A voice group with that name already exists")
+    group = {"id": f"group_{uuid.uuid4().hex[:12]}", "name": name}
+    groups.append(group)
+    await _set_setting(db, "voice_groups", json.dumps(groups))
+    await db.commit()
+    return group
+
+
+async def _stale_dubs(db: AsyncSession) -> list[tuple]:
+    """Dubbed lines that say a dictionary word the old way: the line has the word, and its voice
+    file was made before the word's spoken form was last set. [(segment, word)]."""
+    import json
+    import os
+
+    from backend.database.models import Segment
+    from backend.services.tts_service import says_word
+
+    try:
+        entries = json.loads(await _get_setting(db, "pronunciations", "[]"))
+    except ValueError:
+        entries = []
+    entries = [e for e in entries if e.get("word") and float(e.get("changed_at") or 0) > 0]
+    if not entries:
+        return []
+    segments = (await db.execute(select(Segment).where(Segment.audio_url != "", Segment.audio_url.is_not(None)))).scalars().all()
+    found = []
+    for seg in segments:
+        hits = [e for e in entries if says_word(seg.text or "", e["word"])]
+        if not hits:
+            continue
+        try:
+            made = os.path.getmtime((seg.audio_url or "").lstrip("/"))
+        except OSError:
+            continue
+        newest = max(hits, key=lambda e: float(e["changed_at"]))
+        if made < float(newest["changed_at"]):
+            found.append((seg, newest["word"]))
+    return found
+
+
+@router.get("/pronunciations/stale")
+async def stale_pronunciations(db: AsyncSession = Depends(get_db)):
+    """How many dubbed lines still say each word the way it was said before."""
+    words: dict[str, int] = {}
+    projects = set()
+    for seg, word in await _stale_dubs(db):
+        words[word] = words.get(word, 0) + 1
+        projects.add(seg.project_id)
+    return {"lines": sum(words.values()), "projects": len(projects), "words": words}
+
+
+@router.post("/pronunciations/redub")
+async def redub_stale_pronunciations(db: AsyncSession = Depends(get_db)):
+    """Clear those dubs and queue their projects for dubbing, which voices only what is missing."""
+    from backend.api.routes import pipeline
+    from backend.api.routes.voice_generation import _active_voice_streams
+
+    stale = await _stale_dubs(db)
+    busy = {seg.project_id for seg, _ in stale if seg.project_id in _active_voice_streams}
+    cleared: dict[str, int] = {}
+    for seg, _ in stale:
+        if seg.project_id in busy:
+            continue
+        seg.audio_url, seg.audio_speed = "", 1.0      # the file stays, for undo
+        cleared[seg.project_id] = cleared.get(seg.project_id, 0) + 1
+    await db.commit()
+    queued = 0
+    for project_id in cleared:
+        try:
+            await pipeline.add_to_pipeline(project_id, pipeline.PipelineOptions(captions=False, dub=True), db)
+            queued += 1
+        except HTTPException:
+            pass
+    return {"lines": sum(cleared.values()), "projects": len(cleared), "queued": queued, "busy": len(busy)}
+
+
+class ListenRequest(BaseModel):
+    text: str
+    voice_profile: str = "female"
+
+
+@router.post("/pronunciations/listen")
+async def listen_to_pronunciation(body: ListenRequest):
+    """The text spoken as a dub would say it, dictionary applied — to check an entry by ear."""
+    import os
+
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+
+    from backend.services.tts_service import generate_segment_audio
+
+    text = body.text.strip()[:200]
+    if not text:
+        raise HTTPException(400, "Nothing to say")
+    try:
+        path = await generate_segment_audio(text=text, voice_profile=body.voice_profile, language="km", apply_fx=False)
+    except Exception as exc:
+        raise HTTPException(502, f"The voice could not be made: {exc}") from exc
+    media = "audio/wav" if path.lower().endswith(".wav") else "audio/mpeg"
+    return FileResponse(path, media_type=media, background=BackgroundTask(lambda: os.path.exists(path) and os.remove(path)))

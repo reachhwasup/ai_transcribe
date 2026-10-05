@@ -44,7 +44,17 @@ async def init_db():
             "ALTER TABLE projects ADD COLUMN preview_status VARCHAR(20) DEFAULT 'none'",
             "ALTER TABLE video_clips ADD COLUMN transition_type VARCHAR(50) DEFAULT 'none'",
             "ALTER TABLE video_clips ADD COLUMN transition_duration FLOAT DEFAULT 0.5",
+            "ALTER TABLE projects ADD COLUMN source_project_id VARCHAR(36) DEFAULT ''",
+            "ALTER TABLE projects ADD COLUMN part_index INTEGER DEFAULT 0",
+            "ALTER TABLE projects ADD COLUMN part_count INTEGER DEFAULT 0",
+            "ALTER TABLE projects ADD COLUMN part_offset FLOAT DEFAULT 0.0",
+            "ALTER TABLE segments ADD COLUMN voice_fx VARCHAR(20) DEFAULT 'normal'",
+            "ALTER TABLE projects ADD COLUMN timeline_cleared BOOLEAN DEFAULT 0",
+            "ALTER TABLE projects ADD COLUMN batch_id VARCHAR(36) DEFAULT ''",
+            "ALTER TABLE projects ADD COLUMN batch_name VARCHAR(255) DEFAULT ''",
+            "ALTER TABLE projects ADD COLUMN batch_index INTEGER DEFAULT 0",
             "CREATE INDEX IF NOT EXISTS ix_segments_project_time ON segments (project_id, start_time)",
+            "CREATE INDEX IF NOT EXISTS ix_segments_project_speaker ON segments (project_id, speaker)",
             "CREATE INDEX IF NOT EXISTS ix_video_clips_project_index ON video_clips (project_id, index)",
         ]
         for stmt in migration_statements:

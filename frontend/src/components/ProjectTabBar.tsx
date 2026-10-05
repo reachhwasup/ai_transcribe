@@ -1,38 +1,32 @@
+import { useShallow } from 'zustand/react/shallow';
 import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useProjectStore } from '../stores/projectStore';
+import { readTabs, writeTabs, TABS_CHANGED_EVENT, type TabItem } from '../utils/openTabs';
+import { latestJob, STEP_SHORT, usePipelineStore, usePipelineWatch } from '../utils/pipelineWatch';
 import {
   Film,
   Plus,
   X,
-  Sparkles,
   Search,
-  Check,
   ChevronLeft,
   ChevronRight,
-  Clock,
   Video,
+  Loader2,
+  Clock,
+  AlertTriangle,
 } from 'lucide-react';
-
-interface TabItem {
-  id: string;
-  name: string;
-}
 
 export default function ProjectTabBar() {
   const navigate = useNavigate();
   const { id: currentProjectId } = useParams<{ id: string }>();
-  const { projects, currentProject, loadProjects, createProject } = useProjectStore();
+  const { projects, currentProject, loadProjects, createProject } = useProjectStore(useShallow(state => ({ projects: state.projects, currentProject: state.currentProject, loadProjects: state.loadProjects, createProject: state.createProject })));
 
-  const [tabs, setTabs] = useState<TabItem[]>(() => {
-    try {
-      const saved = localStorage.getItem('meatika_open_tabs');
-      return saved ? JSON.parse(saved) : [];
-    } catch {
-      return [];
-    }
-  });
+  const [tabs, setTabs] = useState<TabItem[]>(readTabs);
+  // each open project's job on the server, so a tab shows it is being worked on
+  usePipelineWatch();
+  const jobs = usePipelineStore((s) => s.jobs);
 
   const [showDropdown, setShowDropdown] = useState(false);
   const [showNewModal, setShowNewModal] = useState(false);
@@ -79,12 +73,32 @@ export default function ProjectTabBar() {
       } else {
         updated = [...prev, { id: currentProject.id, name: currentProject.name || 'Untitled Video' }];
       }
-      try {
-        localStorage.setItem('meatika_open_tabs', JSON.stringify(updated));
-      } catch {}
+      writeTabs(updated, false);
       return updated;
     });
   }, [currentProject?.id, currentProject?.name]);
+
+  // Forget tabs whose project is gone — deleted in another window, or left over from
+  // before deletion cleaned up after itself. An empty list means "not loaded yet" rather
+  // than "everything was deleted", so it never wipes the bar mid-fetch.
+  useEffect(() => {
+    if (!projects.length) return;
+    const alive = new Set(projects.map((p) => p.id));
+    setTabs((prev) => {
+      const kept = prev.filter((t) => alive.has(t.id));
+      if (kept.length === prev.length) return prev;
+      writeTabs(kept, false);
+      if (currentProjectId && !alive.has(currentProjectId)) navigate('/');
+      return kept;
+    });
+  }, [projects, currentProjectId, navigate]);
+
+  // Someone outside the tab bar opened tabs (splitting a long video into parts, say)
+  useEffect(() => {
+    const sync = () => setTabs(readTabs());
+    window.addEventListener(TABS_CHANGED_EVENT, sync);
+    return () => window.removeEventListener(TABS_CHANGED_EVENT, sync);
+  }, []);
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -108,9 +122,7 @@ export default function ProjectTabBar() {
     e.stopPropagation();
     const remaining = tabs.filter((t) => t.id !== tabId);
     setTabs(remaining);
-    try {
-      localStorage.setItem('meatika_open_tabs', JSON.stringify(remaining));
-    } catch {}
+    writeTabs(remaining, false);
 
     // If closing active tab, navigate to adjacent tab or dashboard
     if (tabId === currentProjectId) {
@@ -131,11 +143,11 @@ export default function ProjectTabBar() {
       const project = await createProject(newProjectName.trim(), '', newProjectLang);
       const newTabs = [...tabs.filter((t) => t.id !== project.id), { id: project.id, name: project.name }];
       setTabs(newTabs);
-      localStorage.setItem('meatika_open_tabs', JSON.stringify(newTabs));
+      writeTabs(newTabs, false);
       setShowNewModal(false);
       setShowDropdown(false);
       setNewProjectName('');
-      navigate(`/project/${project.id}`);
+      navigate(`/project/${project.id}`, { state: { initialCenterTab: 'assets' } });
     } catch (err) {
       console.error('Failed to create tab project:', err);
     } finally {
@@ -148,7 +160,7 @@ export default function ProjectTabBar() {
       ? tabs
       : [...tabs, { id: proj.id, name: proj.name || 'Untitled Video' }];
     setTabs(newTabs);
-    localStorage.setItem('meatika_open_tabs', JSON.stringify(newTabs));
+    writeTabs(newTabs, false);
     setShowDropdown(false);
     navigate(`/project/${proj.id}`);
   };
@@ -173,7 +185,7 @@ export default function ProjectTabBar() {
         {canScrollLeft && (
           <button
             onClick={() => scrollTabs('left')}
-            className="absolute left-0 z-20 h-7 w-5 flex items-center justify-center bg-gradient-to-r from-[#121316] via-[#121316]/90 to-transparent text-zinc-400 hover:text-white"
+            className="absolute left-0 z-20 h-7 w-5 flex items-center justify-center bg-gradient-to-r from-[var(--s2)] via-[rgb(var(--s2-rgb)/0.9)] to-transparent text-zinc-400 hover:text-white"
           >
             <ChevronLeft className="w-3.5 h-3.5" />
           </button>
@@ -193,20 +205,32 @@ export default function ProjectTabBar() {
                 onClick={() => handleSelectTab(tab.id)}
                 className={`group relative flex items-center gap-2 px-3 py-1.5 h-[34px] rounded-xl cursor-pointer transition-all duration-150 shrink-0 max-w-[200px] select-none ${
                   isActive
-                    ? 'bg-gradient-to-b from-[#232735] to-[#1a1c27] text-white shadow-md shadow-black/40 ring-1 ring-white/10 font-semibold'
-                    : 'bg-[#15171d]/60 hover:bg-[#1c1e28] text-zinc-400 hover:text-zinc-200 border border-transparent'
+                    ? 'bg-gradient-to-b from-[var(--s5)] to-[var(--s3)] text-white shadow-md shadow-black/40 ring-1 ring-white/10 font-semibold'
+                    : 'bg-[rgb(var(--s2-rgb)/0.6)] hover:bg-[var(--s3)] text-zinc-400 hover:text-zinc-200 border border-transparent'
                 }`}
-                title={tab.name}
+                title={(() => {
+                  const job = latestJob(jobs, tab.id);
+                  return job?.status === 'running' ? `${tab.name} — ${STEP_SHORT[job.step] || 'working'} ${job.percent}% on the server`
+                    : job?.status === 'queued' ? `${tab.name} — waiting in the server's queue`
+                    : job?.status === 'review' ? `${tab.name} — waiting for you to check before export`
+                    : tab.name;
+                })()}
               >
-                {/* Visual Icon */}
+                {/* Visual Icon — or what the server is doing to this project */}
                 <div
                   className={`w-4 h-4 rounded-md flex items-center justify-center shrink-0 transition-colors ${
                     isActive
-                      ? 'bg-purple-500/20 text-purple-300'
+                      ? 'bg-white/10 text-zinc-200'
                       : 'text-zinc-500 group-hover:text-zinc-400'
                   }`}
                 >
-                  <Film className="w-3 h-3" />
+                  {(() => {
+                    const job = latestJob(jobs, tab.id);
+                    if (job?.status === 'running') return <Loader2 className="w-3 h-3 animate-spin text-blue-400" />;
+                    if (job?.status === 'queued') return <Clock className="w-3 h-3 text-zinc-400" />;
+                    if (job?.status === 'review') return <AlertTriangle className="w-3 h-3 text-amber-300" />;
+                    return <Film className="w-3 h-3" />;
+                  })()}
                 </div>
 
                 {/* Tab Title */}
@@ -224,9 +248,19 @@ export default function ProjectTabBar() {
                   <X className="w-3 h-3" />
                 </button>
 
+                {/* How far the server's current step has got */}
+                {(() => {
+                  const job = latestJob(jobs, tab.id);
+                  return job?.status === 'running' && job.percent > 0 ? (
+                    <div className="absolute bottom-0 left-3 right-3 h-[2px] rounded-full bg-white/5 overflow-hidden">
+                      <div className="h-full bg-blue-500 transition-[width]" style={{ width: `${job.percent}%` }} />
+                    </div>
+                  ) : null;
+                })()}
+
                 {/* Active Indicator Underline Glow */}
                 {isActive && (
-                  <div className="absolute bottom-0 left-3 right-3 h-[2px] bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 rounded-full shadow-[0_0_8px_rgba(168,85,247,0.6)]" />
+                  <div className="absolute bottom-0 left-3 right-3 h-[2px] bg-white/10 rounded-full" />
                 )}
               </div>
             );
@@ -237,7 +271,7 @@ export default function ProjectTabBar() {
         {canScrollRight && (
           <button
             onClick={() => scrollTabs('right')}
-            className="absolute right-8 z-20 h-7 w-5 flex items-center justify-center bg-gradient-to-l from-[#121316] via-[#121316]/90 to-transparent text-zinc-400 hover:text-white"
+            className="absolute right-8 z-20 h-7 w-5 flex items-center justify-center bg-gradient-to-l from-[var(--s2)] via-[rgb(var(--s2-rgb)/0.9)] to-transparent text-zinc-400 hover:text-white"
           >
             <ChevronRight className="w-3.5 h-3.5" />
           </button>
@@ -250,8 +284,8 @@ export default function ProjectTabBar() {
             onClick={() => setShowDropdown(!showDropdown)}
             className={`w-[30px] h-[30px] rounded-xl flex items-center justify-center transition-all cursor-pointer ${
               showDropdown
-                ? 'bg-purple-600 text-white shadow-lg shadow-purple-950/60 ring-1 ring-purple-400/40'
-                : 'bg-[#171920] hover:bg-[#222632] border border-[#262a36] text-zinc-400 hover:text-white hover:border-zinc-600 shadow-sm'
+                ? 'bg-white/10 text-white shadow-lg ring-1 ring-white/20'
+                : 'bg-[var(--s3)] hover:bg-[var(--s4)] border border-[var(--s5)] text-zinc-400 hover:text-white hover:border-zinc-600 shadow-sm'
             }`}
             title="Open or Create Video Tab"
           >
@@ -260,7 +294,7 @@ export default function ProjectTabBar() {
 
           {/* Tab Management Dropdown Menu */}
           {showDropdown && (
-            <div className="absolute left-0 top-full mt-2 w-80 bg-[#151722]/98 border border-[#2b3042] rounded-2xl shadow-2xl p-2.5 z-50 backdrop-blur-xl space-y-2 animate-in zoom-in-95 duration-150">
+            <div className="absolute left-0 top-full mt-2 w-80 bg-[rgb(var(--s3-rgb)/0.98)] border border-[var(--s6)] rounded-2xl shadow-2xl p-2.5 z-50 backdrop-blur-xl space-y-2 animate-in zoom-in-95 duration-150">
               {/* New Video Action */}
               <button
                 type="button"
@@ -268,9 +302,9 @@ export default function ProjectTabBar() {
                   setShowDropdown(false);
                   setShowNewModal(true);
                 }}
-                className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl bg-gradient-to-r from-purple-600/20 via-pink-600/20 to-purple-600/10 hover:from-purple-600/30 hover:to-pink-600/30 border border-purple-500/30 text-purple-200 hover:text-white text-xs font-bold transition-all text-left group cursor-pointer shadow-sm"
+                className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl bg-white/10 hover:bg-white/10 border border-white/10 text-zinc-100 hover:text-white text-xs font-bold transition-all text-left group cursor-pointer shadow-sm"
               >
-                <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-white shadow-md shadow-purple-950/40 group-hover:scale-105 transition-transform">
+                <div className="w-7 h-7 rounded-lg bg-white/10 flex items-center justify-center text-white shadow-md group-hover:scale-105 transition-transform">
                   <Plus className="w-4 h-4" />
                 </div>
                 <div>
@@ -280,7 +314,7 @@ export default function ProjectTabBar() {
               </button>
 
               {/* Open Existing Projects List */}
-              <div className="space-y-1.5 pt-1.5 border-t border-[#232738]">
+              <div className="space-y-1.5 pt-1.5 border-t border-[var(--s5)]">
                 <div className="flex items-center justify-between px-2 text-[10px] uppercase font-bold text-zinc-400 tracking-wider">
                   <span>Open Video in Tab</span>
                   <span className="font-mono text-zinc-500">{projects.length} Total</span>
@@ -295,7 +329,7 @@ export default function ProjectTabBar() {
                       value={searchFilter}
                       onChange={(e) => setSearchFilter(e.target.value)}
                       placeholder="Filter by name..."
-                      className="w-full bg-[#10121a] border border-[#272c3d] rounded-xl pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500 font-sans"
+                      className="w-full bg-[var(--s2)] border border-[var(--s6)] rounded-xl pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-white/10 font-sans"
                     />
                   </div>
                 )}
@@ -314,14 +348,14 @@ export default function ProjectTabBar() {
                           onClick={() => handleOpenExisting(p)}
                           className={`w-full flex items-center justify-between gap-2.5 px-3 py-2 rounded-xl text-xs transition-all text-left cursor-pointer ${
                             isCurrent
-                              ? 'bg-purple-950/50 border border-purple-500/30 text-purple-200 font-semibold'
-                              : 'hover:bg-[#1d202c] text-zinc-300 hover:text-white border border-transparent'
+                              ? 'bg-white/5 border border-white/10 text-zinc-100 font-semibold'
+                              : 'hover:bg-[var(--s4)] text-zinc-300 hover:text-white border border-transparent'
                           }`}
                         >
                           <div className="flex items-center gap-2.5 truncate">
                             <div
                               className={`w-6 h-6 rounded-lg flex items-center justify-center shrink-0 ${
-                                isCurrent ? 'bg-purple-500/30 text-purple-300' : 'bg-[#12141c] text-zinc-500'
+                                isCurrent ? 'bg-white/10 text-zinc-200' : 'bg-[var(--s2)] text-zinc-500'
                               }`}
                             >
                               <Video className="w-3 h-3" />
@@ -348,10 +382,10 @@ export default function ProjectTabBar() {
       {showNewModal &&
         createPortal(
           <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-150">
-            <div className="bg-[#151722] border border-[#2b3042] rounded-3xl p-6 w-full max-w-sm shadow-2xl space-y-5 animate-in zoom-in-95 duration-150">
+            <div className="bg-[var(--s3)] border border-[var(--s6)] rounded-3xl p-6 w-full max-w-sm shadow-2xl space-y-5 animate-in zoom-in-95 duration-150">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500 text-white flex items-center justify-center font-bold shadow-md shadow-purple-950/50">
+                  <div className="w-8 h-8 rounded-xl bg-white/10 text-white flex items-center justify-center font-bold shadow-md">
                     <Plus className="w-4 h-4" />
                   </div>
                   <div>
@@ -378,7 +412,7 @@ export default function ProjectTabBar() {
                     onKeyDown={(e) => e.key === 'Enter' && handleCreateNew()}
                     placeholder="e.g. Episode 2 Recap"
                     autoFocus
-                    className="w-full px-3.5 py-2.5 bg-[#0f1118] border border-[#272c3d] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500 transition-colors shadow-inner"
+                    className="w-full px-3.5 py-2.5 bg-[var(--s2)] border border-[var(--s6)] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-white/10 transition-colors shadow-inner"
                   />
                 </div>
 
@@ -387,7 +421,7 @@ export default function ProjectTabBar() {
                   <select
                     value={newProjectLang}
                     onChange={(e) => setNewProjectLang(e.target.value)}
-                    className="w-full px-3.5 py-2.5 bg-[#0f1118] border border-[#272c3d] rounded-xl text-xs text-white focus:outline-none focus:border-purple-500 transition-colors cursor-pointer"
+                    className="w-full px-3.5 py-2.5 bg-[var(--s2)] border border-[var(--s6)] rounded-xl text-xs text-white focus:outline-none focus:border-white/10 transition-colors cursor-pointer"
                   >
                     <option value="km">🇰🇭 ខ្មែរ (Khmer)</option>
                     <option value="en">🇺🇸 English</option>
@@ -412,7 +446,7 @@ export default function ProjectTabBar() {
                   type="button"
                   onClick={handleCreateNew}
                   disabled={!newProjectName.trim() || isCreating}
-                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 disabled:opacity-50 text-white font-bold text-xs shadow-lg shadow-purple-950/50 transition-all active:scale-95 cursor-pointer"
+                  className="px-4 py-2 rounded-xl bg-white/10 hover:bg-white/10 disabled:opacity-50 text-white font-bold text-xs shadow-lg transition-all active:scale-95 cursor-pointer"
                 >
                   {isCreating ? 'Creating...' : 'Open in New Tab'}
                 </button>

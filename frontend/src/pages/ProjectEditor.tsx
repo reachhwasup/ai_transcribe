@@ -1,71 +1,83 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useShallow } from 'zustand/react/shallow';
+import { useEffect, useRef, useState, useCallback, lazy, Suspense, type ReactNode } from 'react';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
+import { useBatchStore } from '../utils/batchRunner';
 import { useProjectStore } from '../stores/projectStore';
-import { checkAudioSeparation, deleteAudioSeparation, uploadVideo } from '../api/client';
+import { buildClipLayout, timelineToSource } from '../utils/clipTimemap';
+import { JUMP_TO_LINE, takePendingLine } from '../utils/jumpToLine';
+import { deleteAudioSeparation, uploadVideo, fetchRenderQueue, VERSION_RESTORED_EVENT } from '../api/client';
+import { syncProjectSettings } from '../utils/projectSettings';
 import VideoPlayer from '../components/VideoPlayer';
 import SubtitleDataPanel from '../components/SubtitleDataPanel';
 import TimelineEditorPro from '../components/TimelineEditorPro';
-import StatusBar from '../components/StatusBar';
-import SettingsModal from '../components/SettingsModal';
-import ExportModal from '../components/ExportModal';
-import VideoToolsModal from '../components/VideoToolsModal';
-
 import MediaPool from '../components/MediaPool';
-import Sidebar from '../components/Sidebar';
-import MeatikaTTSPanel from '../components/MeatikaTTSPanel';
-import AIAssistantPanel from '../components/AIAssistantPanel';
-import CaptionPropertiesPanel from '../components/CaptionPropertiesPanel';
-import DubbingStudioHub from '../components/DubbingStudioHub';
 import ProjectTabBar from '../components/ProjectTabBar';
+import { SPLIT_SUGGEST_SECONDS } from '../utils/splitting';
+import BatchProgressPanel from '../components/BatchProgressPanel';
+import { useReloadWhileServerWorks } from '../utils/pipelineWatch';
 
 import {
   LayoutGrid,
-  Search,
   Upload,
-  FolderPlus,
-  List,
-  ArrowUpDown,
-  Trash2,
   GripVertical,
   GripHorizontal,
-  Film,
   PanelLeftClose,
   PanelLeftOpen,
+  Layers,
   Loader2,
-  Smile,
   Download,
-  Sparkles,
-  User,
+  Flame,
+  Film,
   Settings,
-  Image as ImageIcon,
+  History,
+  Copy,
+  LayoutTemplate,
 } from 'lucide-react';
-import { useThemeStore } from '../stores/themeStore';
 
-type MeatikaLeftTab = 'tts' | 'ai';
-type MeatikaCenterTab = 'assets' | 'library' | 'captions' | 'dubbing';
+// Heavy panels and modals are split into their own chunks and only fetched when first shown
+const SettingsModal = lazy(() => import('../components/SettingsModal'));
+const ExportModal = lazy(() => import('../components/ExportModal'));
+const VersionsModal = lazy(() => import('../components/VersionsModal'));
+const TemplatesModal = lazy(() => import('../components/TemplatesModal'));
+const ApplyToPartsModal = lazy(() => import('../components/ApplyToPartsModal'));
+const MeatikaTTSPanel = lazy(() => import('../components/MeatikaTTSPanel'));
+// Imported directly, not lazy(): behind lazy() + Suspense the Dubbing tab (and the Intro Hook
+// panel it hosts) could sit blank for a long time after switching to it. It still mounts only
+// the first time the tab opens (MountOnFirstUse), and draws its lines a page at a time.
+import DubbingStudioHub from '../components/DubbingStudioHub';
+const MovieRecapPanel = lazy(() => import('../components/MovieRecapPanel'));
+const NewProjectsModal = lazy(() => import('../components/NewProjectsModal'));
+
+// Mounts children the first time `active` becomes true, then keeps them mounted
+// so panel/modal state survives being hidden or closed.
+function MountOnFirstUse({ active, children }: { active: boolean; children: ReactNode }) {
+  const [used, setUsed] = useState(active);
+  useEffect(() => {
+    if (active) setUsed(true);
+  }, [active]);
+  if (!used && !active) return null;
+  return <Suspense fallback={null}>{children}</Suspense>;
+}
+
+type MeatikaCenterTab = 'assets' | 'captions' | 'dubbing';
 
 export default function ProjectEditor() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const {
     currentProject,
     isLoading,
     error,
     loadProject,
     clearError,
-    selectedSegmentIds,
-    activeSegmentId,
-    setActiveSegment,
-    updateSegment,
-    deleteSegment,
-    deleteMultipleSegments,
-    deleteAllSegments,
     audioSeparated,
     vocalsUrl,
     bgmUrl,
     setAudioSeparated,
-  } = useProjectStore();
-  const { mode, toggle: toggleTheme } = useThemeStore();
+    splitPromptProjectId,
+    setSplitPrompt,
+  } = useProjectStore(useShallow(state => ({ currentProject: state.currentProject, isLoading: state.isLoading, error: state.error, loadProject: state.loadProject, clearError: state.clearError, audioSeparated: state.audioSeparated, vocalsUrl: state.vocalsUrl, bgmUrl: state.bgmUrl, setAudioSeparated: state.setAudioSeparated, splitPromptProjectId: state.splitPromptProjectId, setSplitPrompt: state.setSplitPrompt })));
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const vocalsRef = useRef<HTMLAudioElement>(null);
@@ -75,19 +87,117 @@ export default function ProjectEditor() {
   // Modals state
   const [showSettings, setShowSettings] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
-  const [showVideoTools, setShowVideoTools] = useState(false);
+  const [showVersions, setShowVersions] = useState(false);
+  const [showTemplates, setShowTemplates] = useState(false);
+  const [showApplyParts, setShowApplyParts] = useState(false);
+  // Progress across every part of a split video, so the batch is visible after the
+  // split dialog is gone rather than only while it is open.
+  const [showBatchPanel, setShowBatchPanel] = useState(false);
+  // a folder or a long video just confirmed brings you here: show how its projects are getting on
+  const progressAsked = useBatchStore((s) => s.showProgress);
+  useEffect(() => { if (progressAsked) setShowBatchPanel(true); }, [progressAsked]);
+  // captions and voices made on the server show up here as they are made
+  useReloadWhileServerWorks(currentProject?.id);
+  // A badge on the drawer button, so a render running in the background is visible
+  // without opening anything.
+  const [activeRenderCount, setActiveRenderCount] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    let polling = false;
+    const poll = async () => {
+      if (polling || document.hidden) return;
+      polling = true;
+      try {
+        const jobs = await fetchRenderQueue();
+        if (alive) {
+          setActiveRenderCount(
+            jobs.filter((j) => j.status === 'queued' || j.status === 'rendering').length,
+          );
+        }
+      } catch {
+        /* the badge is a convenience; a failed poll just leaves the last count */
+      } finally {
+        polling = false;
+      }
+    };
+    poll();
+    const timer = setInterval(poll, 6000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, []);
+  const [showRecapPanel, setShowRecapPanel] = useState(false);
+  const [showHookPanel, setShowHookPanel] = useState(false);
+  const [hookPanelTarget, setHookPanelTarget] = useState<HTMLElement | null>(null);
+  const closeHookPanel = useCallback(() => setShowHookPanel(false), []);
+  // a line picked in the review list, perhaps in another episode: go to it once it is loaded
+  useEffect(() => {
+    const projectId = currentProject?.id;
+    if (!projectId) return;
+    const show = () => {
+      const target = takePendingLine(projectId);
+      const seg = target && currentProject.segments.find((s) => s.id === target.segmentId);
+      if (!target) return;
+      const state = useProjectStore.getState();
+      const time = seg ? seg.start_time : target.time;
+      setCenterTab('captions');
+      state.setActiveSegment(seg ? seg.id : null);
+      state.setCurrentTime(time);
+      if (videoRef.current) {
+        const layout = buildClipLayout(state.videoClips);
+        const mapped = layout.length ? timelineToSource(layout, time) : null;
+        videoRef.current.currentTime = mapped ? mapped.sourceTime : time;
+      }
+    };
+    show();
+    window.addEventListener(JUMP_TO_LINE, show);
+    return () => window.removeEventListener(JUMP_TO_LINE, show);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentProject?.id]);
+
+  // the hook's content stays in its drawer until the drawer has slid away
+  const [hookLingers, setHookLingers] = useState(false);
+  useEffect(() => {
+    if (showHookPanel) { setHookLingers(true); return; }
+    const timer = setTimeout(() => setHookLingers(false), 220);
+    return () => clearTimeout(timer);
+  }, [showHookPanel]);
+  useEffect(() => {
+    if (!showRecapPanel) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setShowRecapPanel(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showRecapPanel]);
+  useEffect(() => { setShowHookPanel(false); setShowRecapPanel(false); }, [id]);
 
   // Tabs
-  const [leftTab, setLeftTab] = useState<MeatikaLeftTab>('tts');
-  const [centerTab, setCenterTab] = useState<MeatikaCenterTab>('captions');
-  const [searchQuery, setSearchQuery] = useState('');
+  const [centerTab, setCenterTab] = useState<MeatikaCenterTab>(
+    () => location.state?.initialCenterTab === 'assets' ? 'assets' : 'captions'
+  );
+  useEffect(() => {
+    // The editor stays mounted when a new project is created from its tab bar.
+    if (location.state?.initialCenterTab === 'assets') setCenterTab('assets');
+  }, [id, location.key, location.state?.initialCenterTab]);
 
   // Panel sizing & responsiveness
   const [isLeftPanelOpen, setIsLeftPanelOpen] = useState<boolean>(
-    () => localStorage.getItem('editor-left-panel-open') !== 'false'
+    () => localStorage.getItem('editor-left-panel-open') === 'true'
   );
   const [leftPanelWidth, setLeftPanelWidth] = useState(() => Number(localStorage.getItem('editor-left-panel-width')) || 360);
   const [timelineHeight, setTimelineHeight] = useState(() => Number(localStorage.getItem('editor-timeline-height')) || 260);
+  // Once you drag the divider, your height wins; double-click it to go back to auto-fit
+  const [timelineHeightIsManual, setTimelineHeightIsManual] = useState(() => {
+    const flag = localStorage.getItem('editor-timeline-manual');
+    if (flag !== null) return flag === 'true';
+    // Height chosen before auto-fit existed: keep honouring it
+    return localStorage.getItem('editor-timeline-height') !== null;
+  });
+
+  const fitTimelineToTracks = useCallback((needed: number) => {
+    if (timelineHeightIsManual) return;
+    setTimelineHeight(Math.round(Math.max(150, Math.min(needed, window.innerHeight * 0.6))));
+  }, [timelineHeightIsManual]);
 
   useEffect(() => {
     localStorage.setItem('editor-left-panel-open', String(isLeftPanelOpen));
@@ -98,6 +208,9 @@ export default function ProjectEditor() {
   useEffect(() => {
     localStorage.setItem('editor-timeline-height', String(timelineHeight));
   }, [timelineHeight]);
+  useEffect(() => {
+    localStorage.setItem('editor-timeline-manual', String(timelineHeightIsManual));
+  }, [timelineHeightIsManual]);
 
   const draggingRef = useRef<'leftPanel' | 'timeline' | null>(null);
   const startPosRef = useRef(0);
@@ -106,6 +219,7 @@ export default function ProjectEditor() {
   const handleResizeStart = useCallback((e: React.MouseEvent, target: 'leftPanel' | 'timeline') => {
     e.preventDefault();
     draggingRef.current = target;
+    if (target === 'timeline') setTimelineHeightIsManual(true);
     startPosRef.current = target === 'leftPanel' ? e.clientX : e.clientY;
     startSizeRef.current = target === 'leftPanel' ? leftPanelWidth : timelineHeight;
 
@@ -133,8 +247,18 @@ export default function ProjectEditor() {
   useEffect(() => {
     if (vocalsRef.current) { vocalsRef.current.pause(); vocalsRef.current.src = ''; }
     if (bgmRef.current) { bgmRef.current.pause(); bgmRef.current.src = ''; }
-    if (id) loadProject(id);
+    if (id) loadProject(id).then(() => syncProjectSettings(id));
   }, [id]);
+
+  // a restored version brings its caption style, logo and blur boxes back from the server
+  useEffect(() => {
+    const onRestored = (e: Event) => {
+      const pid = (e as CustomEvent).detail?.projectId;
+      if (pid) syncProjectSettings(pid, true);
+    };
+    window.addEventListener(VERSION_RESTORED_EVENT, onRestored);
+    return () => window.removeEventListener(VERSION_RESTORED_EVENT, onRestored);
+  }, []);
 
   useEffect(() => {
     if (!id || currentProject?.preview_status !== 'generating') return;
@@ -229,8 +353,6 @@ export default function ProjectEditor() {
       if ((e.target as HTMLElement)?.isContentEditable) return;
       if (showSettings || showExportModal) return;
 
-      const video = videoRef.current;
-
       switch (e.key) {
         case 'Delete':
         case 'Backspace':
@@ -294,12 +416,16 @@ export default function ProjectEditor() {
     const file = e.target.files?.[0];
     if (!file || !currentProject?.id) return;
     if (fileInputRef.current) fileInputRef.current.value = '';
-    await uploadVideo(currentProject.id, file);
+    const uploaded = await uploadVideo(currentProject.id, file);
     await loadProject(currentProject.id);
+    // A long video is worth offering to split into part projects before any work starts
+    if ((uploaded?.duration || 0) >= SPLIT_SUGGEST_SECONDS && !uploaded?.part_index) {
+      setSplitPrompt(currentProject.id);
+    }
   };
 
   return (
-    <div className="h-screen flex flex-col overflow-hidden bg-[#0d0e11] text-[#e1e3e6] select-none font-sans">
+    <div className="h-screen flex flex-col overflow-hidden bg-[var(--s1)] text-[#e1e3e6] select-none font-sans">
       {/* Global Error Toast */}
       {error && (
         <div className="fixed top-4 right-4 z-50 bg-red-950/95 border border-red-800 text-red-200 px-4 py-3 rounded-xl shadow-2xl max-w-md animate-in slide-in-from-top-2">
@@ -311,36 +437,44 @@ export default function ProjectEditor() {
       )}
 
       {/* Top Header Bar — Multi-Tab Video Project Workspace (Always Fixed & Mounted) */}
-      <header className="h-12 border-b border-[#1c1e24] bg-[#121316] px-4 flex items-center justify-between shrink-0 z-30">
+      <header className="h-11 border-b border-[var(--s3)] bg-[var(--s2)] px-3 flex items-center justify-between shrink-0 z-30">
         {/* Left: Meatika Menu & Panel Toggle */}
         <div className="flex items-center gap-1.5 shrink-0">
           <button
             onClick={() => navigate('/')}
-            className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-[#1f2127] transition-colors flex items-center gap-2"
-            title="Back to Dashboard"
+            className="p-1.5 rounded-md text-zinc-400 hover:text-white hover:bg-white/10 transition-colors"
+            title="Back to projects"
           >
-            <div className="grid grid-cols-2 gap-0.5 w-4 h-4">
-              <div className="w-1.5 h-1.5 rounded-sm bg-zinc-300" />
-              <div className="w-1.5 h-1.5 rounded-sm bg-zinc-300" />
-              <div className="w-1.5 h-1.5 rounded-sm bg-zinc-300" />
-              <div className="w-1.5 h-1.5 rounded-sm bg-zinc-300" />
-            </div>
+            <LayoutGrid className="w-4 h-4" />
           </button>
 
+          {/* Parts progress and the export queue both live in the left drawer, so this is
+              useful on any project, not only a split one. */}
+          <button
+            onClick={() => setShowBatchPanel(true)}
+            className="relative flex items-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-medium text-blue-300 hover:text-white hover:bg-white/10 transition-colors"
+            title="Parts progress and export queue"
+          >
+            <Layers className="w-4 h-4" />
+            {(currentProject?.part_count || 0) > 0 && (
+              <span className="hidden sm:inline">
+                Part {currentProject?.part_index} / {currentProject?.part_count}
+              </span>
+            )}
+            {activeRenderCount > 0 && (
+              <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-blue-600 px-1 text-[9px] font-bold text-white">
+                {activeRenderCount}
+              </span>
+            )}
+          </button>
           <button
             onClick={() => setIsLeftPanelOpen(!isLeftPanelOpen)}
-            className={`p-1.5 rounded-lg transition-colors ${
-              isLeftPanelOpen
-                ? 'text-purple-400 bg-purple-950/40 border border-purple-500/30'
-                : 'text-zinc-400 hover:text-white hover:bg-[#1f2127]'
+            className={`p-1.5 rounded-md transition-colors ${
+              isLeftPanelOpen ? 'text-white bg-white/10' : 'text-zinc-400 hover:text-white hover:bg-white/10'
             }`}
-            title={isLeftPanelOpen ? 'Collapse Left Tool Panel' : 'Expand Left Tool Panel'}
+            title={isLeftPanelOpen ? 'Hide voiceover panel' : 'Show voiceover panel'}
           >
-            {isLeftPanelOpen ? (
-              <PanelLeftClose className="w-4 h-4" />
-            ) : (
-              <PanelLeftOpen className="w-4 h-4" />
-            )}
+            {isLeftPanelOpen ? <PanelLeftClose className="w-4 h-4" /> : <PanelLeftOpen className="w-4 h-4" />}
           </button>
         </div>
 
@@ -350,20 +484,61 @@ export default function ProjectEditor() {
         {/* Right Actions: Export Video & Settings */}
         <div className="flex items-center gap-2 shrink-0">
           <button
-            onClick={() => setShowExportModal(true)}
-            className="relative overflow-hidden group flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-pink-600 via-purple-600 to-indigo-600 hover:from-pink-500 hover:via-purple-500 hover:to-indigo-500 text-white font-bold text-xs shadow-lg shadow-purple-950/40 border border-white/15 active:scale-95 transition-all cursor-pointer"
-            title="Export Video, Audio, Subtitles & AI Viral Titles"
+            onClick={() => { setShowRecapPanel(false); setShowHookPanel(open => !open); }}
+            disabled={!currentProject || isLoading}
+            aria-expanded={showHookPanel}
+            aria-controls="intro-hook-panel"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium text-xs transition-colors disabled:opacity-40 ${showHookPanel ? 'bg-blue-600/25 text-blue-100' : 'bg-white/5 text-zinc-300 hover:bg-white/10'}`}
+            title="Open Intro Hook side panel"
           >
-            <span className="absolute inset-0 bg-gradient-to-r from-white/0 via-white/20 to-white/0 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-700 pointer-events-none" />
-            <Download className="w-3.5 h-3.5 text-white group-hover:translate-y-[-1px] transition-transform" />
-            <span className="hidden sm:inline tracking-wide">Export Video</span>
-            <Sparkles className="w-3 h-3 text-yellow-300 animate-pulse hidden md:inline" />
+            <Flame className="w-3.5 h-3.5" />
+            <span>Intro Hook</span>
           </button>
-
-          {/* Settings Button */}
+          <button onClick={() => { setShowHookPanel(false); setShowRecapPanel(open => !open); }}
+            disabled={!currentProject || isLoading} aria-expanded={showRecapPanel} aria-controls="movie-recap-panel"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium text-xs disabled:opacity-40 ${showRecapPanel ? 'bg-blue-600/25 text-blue-100' : 'bg-white/5 text-zinc-300 hover:bg-white/10'}`}>
+            <Film className="w-3.5 h-3.5" /><span>Movie Recap</span>
+          </button>
+          {(currentProject?.part_count || 0) > 1 && (
+            <button
+              onClick={() => setShowApplyParts(true)}
+              disabled={isLoading}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white font-medium text-xs transition-colors disabled:opacity-40"
+              title="Copy this part's caption style, logo, blur boxes and BGM setup to the other parts"
+            >
+              <Copy className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Copy to parts</span>
+            </button>
+          )}
+          <button
+            onClick={() => setShowTemplates(true)}
+            disabled={!currentProject || isLoading}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white font-medium text-xs transition-colors disabled:opacity-40"
+            title="Save this project's look as a template, or apply a saved one"
+          >
+            <LayoutTemplate className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Template</span>
+          </button>
+          <button
+            onClick={() => setShowVersions(true)}
+            disabled={!currentProject || isLoading}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white font-medium text-xs transition-colors disabled:opacity-40"
+            title="Save and restore versions of this edit"
+          >
+            <History className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Versions</span>
+          </button>
+          <button
+            onClick={() => setShowExportModal(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-blue-600 text-white hover:bg-blue-500 font-medium text-xs transition-colors cursor-pointer"
+            title="Export video, audio and subtitles"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Export</span>
+          </button>
           <button
             onClick={() => setShowSettings(true)}
-            className="w-8 h-8 rounded-lg bg-[#181a20] border border-[#262933] hover:border-[#3b4050] hover:bg-[#22252e] text-zinc-300 hover:text-white flex items-center justify-center shadow-sm transition-all active:scale-95"
+            className="p-1.5 rounded-md text-zinc-400 hover:text-white hover:bg-white/10 transition-colors"
             title="Settings"
           >
             <Settings className="w-4 h-4" />
@@ -373,20 +548,20 @@ export default function ProjectEditor() {
 
       {/* Main Workspace Body */}
       {isLoading && !currentProject ? (
-        <div className="flex-1 flex items-center justify-center bg-[#0d0e11]">
+        <div className="flex-1 flex items-center justify-center bg-[var(--s1)]">
           <div className="flex flex-col items-center gap-3">
-            <Loader2 className="w-8 h-8 text-teal-400 animate-spin" />
-            <p className="text-xs text-zinc-400 font-medium tracking-wide">Loading project...</p>
+            <Loader2 className="w-5 h-5 text-zinc-500 animate-spin" />
+            <p className="text-xs text-zinc-500">Loading project…</p>
           </div>
         </div>
       ) : !currentProject ? (
-        <div className="flex-1 flex items-center justify-center bg-[#0d0e11]">
+        <div className="flex-1 flex items-center justify-center bg-[var(--s1)]">
           <div className="text-center">
             <p className="text-zinc-400 mb-4">{error || 'Project not found or server reconnecting...'}</p>
             <div className="flex items-center justify-center gap-3">
               <button
                 onClick={() => id && loadProject(id)}
-                className="px-4 py-2 bg-teal-600 hover:bg-teal-500 text-white text-xs font-semibold rounded-lg shadow-lg transition-all"
+                className="px-3 py-1.5 bg-blue-600 text-white hover:bg-blue-500 text-xs font-medium rounded-md transition-colors"
               >
                 Retry Loading
               </button>
@@ -405,52 +580,29 @@ export default function ProjectEditor() {
           <div key={id} className="flex-1 flex overflow-hidden">
         {/* Left Tool Panel (TTS & AI, collapsible) */}
         <div
-          className={`shrink-0 border-r border-[#1c1e24] bg-[#121316] flex flex-col overflow-hidden transition-all duration-150 ${
+          className={`shrink-0 border-r border-[var(--s3)] bg-[var(--s2)] flex flex-col overflow-hidden transition-all duration-150 ${
             isLeftPanelOpen ? '' : 'hidden'
           }`}
           style={{ width: isLeftPanelOpen ? leftPanelWidth : 0 }}
         >
-          {/* Top Horizontal Tool Tabs (TTS | AI) */}
-          <div className="h-10 border-b border-[#1c1e24] bg-[#121316] flex items-center px-3 gap-1 shrink-0">
-            {([
-              { id: 'tts', label: 'TTS' },
-              { id: 'ai', label: 'AI' },
-            ] as const).map((tab) => {
-              const isActive = leftTab === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  onClick={() => setLeftTab(tab.id as MeatikaLeftTab)}
-                  className={`px-2.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition-all cursor-pointer ${
-                    isActive
-                      ? 'bg-[#22242b] text-white shadow-sm ring-1 ring-white/10'
-                      : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#17191e]'
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              );
-            })}
-          </div>
-
-          {/* Active Tool Content */}
-          <div className="flex-1 overflow-hidden relative">
-            <div className={`h-full w-full ${leftTab === 'tts' ? 'block' : 'hidden'}`}>
-              <MeatikaTTSPanel />
-            </div>
-            <div className={`h-full w-full ${leftTab === 'ai' ? 'block' : 'hidden'}`}>
-              <AIAssistantPanel />
-            </div>
+          <div className="flex-1 overflow-hidden">
+            <Suspense fallback={null}>
+              <MeatikaTTSPanel onNavigate={tool => {
+                if (tool === 'captions' || tool === 'dubbing') setCenterTab(tool);
+                setShowRecapPanel(tool === 'recap');
+                setShowHookPanel(tool === 'hooks');
+              }} />
+            </Suspense>
           </div>
         </div>
 
         {/* Left Panel Resize Handle */}
         {isLeftPanelOpen && (
           <div
-            className="w-1 shrink-0 bg-[#1c1e24] hover:bg-white/40 cursor-col-resize transition-colors relative group"
+            className="w-1 shrink-0 bg-[var(--s5)] hover:bg-[var(--accent-primary)] cursor-col-resize transition-colors relative group"
             onMouseDown={(e) => handleResizeStart(e, 'leftPanel')}
           >
-            <div className="absolute inset-y-0 -left-1 -right-1" />
+            <div className="absolute inset-y-0 -left-1.5 -right-1.5" />
             <div className="absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity">
               <GripVertical className="w-3 h-3 text-white" />
             </div>
@@ -458,138 +610,87 @@ export default function ProjectEditor() {
         )}
 
         {/* Center Production Hub (MY ASSETS, LIBRARY, CAPTIONS, DUBBING) */}
-        <div className="flex-1 flex flex-col border-r border-[#1c1e24] min-w-0 overflow-hidden bg-[#121316]">
+        <div className="flex-1 flex flex-col border-r border-[var(--s3)] min-w-0 overflow-hidden bg-[var(--s2)]">
           {/* Top Tabs */}
-          <div className="h-10 border-b border-[#1c1e24] bg-[#121316] flex items-center px-4 gap-2 shrink-0">
+          <div className="h-9 border-b border-[var(--s3)] flex items-stretch px-3 gap-3 shrink-0">
             {([
-              { id: 'assets', label: 'MY ASSETS' },
-              { id: 'library', label: 'LIBRARY' },
-              { id: 'captions', label: 'CAPTIONS' },
-              { id: 'dubbing', label: 'DUBBING & RECAP' },
+              { id: 'captions', label: 'Captions' },
+              { id: 'dubbing', label: 'Dubbing' },
+              { id: 'assets', label: 'Assets' },
             ] as const).map((tab) => {
               const isActive = centerTab === tab.id;
               return (
                 <button
                   key={tab.id}
                   onClick={() => setCenterTab(tab.id as MeatikaCenterTab)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-bold tracking-wider transition-all ${
-                    isActive
-                      ? 'bg-[#22242b] text-white shadow-sm ring-1 ring-white/10'
-                      : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#17191e]'
+                  className={`h-full px-2 text-xs border-b-2 transition-colors cursor-pointer ${
+                    isActive ? 'border-blue-500 text-white' : 'border-transparent text-zinc-500 hover:text-zinc-200'
                   }`}
                 >
                   {tab.label}
                 </button>
               );
             })}
-          </div>
-
-          {/* Subheader Toolbar (Search + Action Buttons) */}
-          <div className="px-4 py-2 border-b border-[#1c1e24] bg-[#121316] flex items-center justify-between gap-3 shrink-0">
-            {/* Search Input */}
-            <div className="relative flex-1 max-w-xs">
-              <Search className="w-3.5 h-3.5 text-zinc-500 absolute left-3 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search media..."
-                className="w-full bg-[#181a1f] border border-[#26282e] rounded-xl pl-9 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-[#3d424d]"
-              />
-            </div>
-
-            {/* Action Buttons: Upload, Folder, View, Sort, Delete */}
-            <div className="flex items-center gap-1 text-zinc-400">
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="video/*,audio/*,image/*"
-                className="hidden"
-                onChange={handleUploadFile}
-              />
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors"
-                title="Upload Media"
-              >
-                <Upload className="w-4 h-4" />
-              </button>
-
-              <button
-                onClick={() => {
-                  const folderName = prompt('Enter new folder name:');
-                  if (folderName) alert(`Folder "${folderName}" created.`);
-                }}
-                className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors"
-                title="New Folder"
-              >
-                <FolderPlus className="w-4 h-4" />
-              </button>
-
-              <button
-                className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors"
-                title="List / Grid View"
-              >
-                <List className="w-4 h-4" />
-              </button>
-
-              <button
-                className="p-1.5 rounded-lg hover:bg-[#1e2025] hover:text-white transition-colors"
-                title="Sort Order"
-              >
-                <ArrowUpDown className="w-4 h-4" />
-              </button>
-            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="video/*,audio/*,image/*"
+              className="hidden"
+              onChange={handleUploadFile}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="ml-auto self-center p-1.5 rounded-md text-zinc-400 hover:text-white hover:bg-white/10 transition-colors"
+              title="Upload media"
+            >
+              <Upload className="w-4 h-4" />
+            </button>
           </div>
 
           {/* Center Tab Body */}
-          <div className="flex-1 overflow-hidden flex flex-col bg-[#121316]">
-            {centerTab === 'assets' && (
+          <div className="flex-1 overflow-hidden flex flex-col bg-[var(--s2)]">
+            <div className={`flex-1 flex-col overflow-hidden ${centerTab === 'assets' ? 'flex' : 'hidden'}`}>
               <MediaPool
                 videoRef={videoRef}
                 vocalsUrl={vocalsUrl}
                 bgmUrl={bgmUrl}
                 audioSeparated={audioSeparated}
               />
-            )}
+            </div>
 
-            {centerTab === 'library' && (
-              <Sidebar
-                onOpenExport={() => setShowExportModal(true)}
-                audioSeparated={audioSeparated}
-                onAudioSeparated={handleAudioSeparated}
-              />
-            )}
+            <div className={`flex-1 flex-col overflow-hidden ${centerTab === 'captions' ? 'flex' : 'hidden'}`}>
+              <SubtitleDataPanel videoRef={videoRef} />
+            </div>
 
-            {centerTab === 'captions' && (
-              <div className="flex-1 flex flex-col overflow-hidden">
-                <SubtitleDataPanel videoRef={videoRef} />
-              </div>
-            )}
-
-            {centerTab === 'dubbing' && <DubbingStudioHub />}
+            <div className={`flex-1 flex-col overflow-hidden ${centerTab === 'dubbing' ? 'flex' : 'hidden'}`}>
+              <MountOnFirstUse active={centerTab === 'dubbing' || showHookPanel}>
+                <DubbingStudioHub hookPanelTarget={showHookPanel || hookLingers ? hookPanelTarget : null} onCloseHookPanel={closeHookPanel} />
+              </MountOnFirstUse>
+            </div>
           </div>
         </div>
 
         {/* Right Top: Video Canvas Viewport */}
-        <div className="w-[42%] min-w-[340px] max-w-[55%] shrink-0 flex flex-col overflow-hidden bg-black">
+        <div className="relative isolate w-[42%] min-w-[340px] max-w-[55%] shrink-0 flex flex-col overflow-hidden bg-black">
           <VideoPlayer videoRef={videoRef} />
         </div>
       </div>
 
       {/* Timeline Resize Handle */}
       <div
-        className="h-1 shrink-0 bg-[#1c1e24] hover:bg-white/40 cursor-row-resize transition-colors relative group"
+        className="h-1 shrink-0 bg-[var(--s5)] hover:bg-[var(--accent-primary)] cursor-row-resize transition-colors relative group"
         onMouseDown={(e) => handleResizeStart(e, 'timeline')}
+        onDoubleClick={() => setTimelineHeightIsManual(false)}
+        title="Drag to resize · double-click to fit the tracks"
       >
-        <div className="absolute inset-x-0 -top-1 -bottom-1" />
+        <div className="absolute inset-x-0 -top-1.5 -bottom-1.5" />
         <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity">
           <GripHorizontal className="w-3 h-3 text-white" />
         </div>
       </div>
 
       {/* Bottom Multi-Track Timeline — keyed by id so video tracks and clips re-initialize per project */}
-      <div key={`timeline-${id}`} className="border-t border-[#1c1e24] shrink-0" style={{ height: timelineHeight }}>
+      <div key={`timeline-${id}`} className="border-t border-[var(--s3)] shrink-0" style={{ height: timelineHeight }}>
         <TimelineEditorPro
           videoRef={videoRef}
           vocalsRef={vocalsRef}
@@ -597,22 +698,102 @@ export default function ProjectEditor() {
           audioSeparated={audioSeparated}
           onAudioSeparated={handleAudioSeparated}
           onRemoveAudioSeparation={handleRemoveAudioSeparation}
+          onContentHeight={fitTimelineToTracks}
         />
       </div>
 
-          {/* Status Bar */}
-          <StatusBar />
         </>
       )}
 
       {/* Modals */}
-      <SettingsModal open={showSettings} onClose={() => setShowSettings(false)} />
-      <ExportModal open={showExportModal} onClose={() => setShowExportModal(false)} />
-      <VideoToolsModal open={showVideoTools} onClose={() => setShowVideoTools(false)} videoRef={videoRef} />
+      <MountOnFirstUse active={showSettings}>
+        <SettingsModal open={showSettings} onClose={() => setShowSettings(false)} />
+      </MountOnFirstUse>
+      <MountOnFirstUse active={showExportModal}>
+        <ExportModal open={showExportModal} onClose={() => setShowExportModal(false)} />
+      </MountOnFirstUse>
+
+      {showApplyParts && currentProject?.id && (
+        <Suspense fallback={null}>
+          <ApplyToPartsModal
+            projectId={currentProject.id}
+            projectName={currentProject.name}
+            onClose={() => setShowApplyParts(false)}
+          />
+        </Suspense>
+      )}
+
+      {showTemplates && currentProject?.id && (
+        <Suspense fallback={null}>
+          <TemplatesModal projectId={currentProject.id} projectName={currentProject.name} onClose={() => setShowTemplates(false)} />
+        </Suspense>
+      )}
+      {showVersions && currentProject?.id && (
+        <Suspense fallback={null}>
+          <VersionsModal
+            projectId={currentProject.id}
+            onClose={() => setShowVersions(false)}
+            onRestored={() => loadProject(currentProject.id)}
+          />
+        </Suspense>
+      )}
+
+      {/* Offered once, right after a long video finishes uploading */}
+      {splitPromptProjectId && splitPromptProjectId === currentProject?.id && (
+        <Suspense fallback={null}>
+          <NewProjectsModal
+            source="video"
+            longVideo={{
+              id: currentProject.id,
+              name: currentProject.name,
+              duration: currentProject.duration || 0,
+              language: currentProject.language,
+            }}
+            onClose={() => setSplitPrompt(null)}
+          />
+        </Suspense>
+      )}
+
+      {/* Intro Hook and Movie Recap slide in from the right, over the editor, the way the
+          progress panel slides in from the left — the video stays in view beside them. */}
+      {(showHookPanel || showRecapPanel) && (
+        <div
+          className="fixed inset-0 z-40 bg-black/40"
+          aria-hidden="true"
+          onClick={() => { setShowHookPanel(false); setShowRecapPanel(false); }}
+        />
+      )}
+      <aside
+        id="movie-recap-panel"
+        aria-label="Movie Recap"
+        aria-hidden={!showRecapPanel}
+        inert={!showRecapPanel}
+        className={`fixed right-0 top-0 z-50 flex h-full w-[460px] max-w-[100vw] flex-col overflow-hidden border-l border-[var(--s4)] bg-[var(--s2)] shadow-2xl transition-transform duration-200 ${
+          showRecapPanel ? 'translate-x-0' : 'translate-x-full'
+        }`}
+      >
+        <MountOnFirstUse active={showRecapPanel}><MovieRecapPanel onClose={() => setShowRecapPanel(false)} /></MountOnFirstUse>
+      </aside>
+      <aside
+        id="intro-hook-panel"
+        aria-label="Intro Hook"
+        aria-hidden={!showHookPanel}
+        inert={!showHookPanel}
+        ref={setHookPanelTarget}
+        className={`fixed right-0 top-0 z-50 flex h-full w-[460px] max-w-[100vw] flex-col overflow-hidden border-l border-[var(--s4)] bg-[var(--s2)] shadow-2xl transition-transform duration-200 ${
+          showHookPanel ? 'translate-x-0' : 'translate-x-full'
+        }`}
+      />
+
+      <BatchProgressPanel
+        open={showBatchPanel}
+        currentProjectId={currentProject?.id}
+        onClose={() => setShowBatchPanel(false)}
+      />
 
       {/* Hidden Audio Elements for Separated Stems */}
-      <audio ref={vocalsRef} src={vocalsUrl || undefined} preload="auto" style={{ display: 'none' }} />
-      <audio ref={bgmRef} src={bgmUrl || undefined} preload="auto" style={{ display: 'none' }} />
+      <audio ref={vocalsRef} src={vocalsUrl || undefined} preload="metadata" style={{ display: 'none' }} />
+      <audio ref={bgmRef} src={bgmUrl || undefined} preload="metadata" style={{ display: 'none' }} />
     </div>
   );
 }

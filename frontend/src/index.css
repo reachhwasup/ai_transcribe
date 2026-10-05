@@ -9,6 +9,33 @@
 }
 
 :root, [data-theme="dark"] {
+  /* Surface ramp. Every panel, row, control and border in the editor sits on one of these ten
+     steps, evenly spaced in lightness and sharing one hue. Before this there were 302 slightly
+     different greys — panels beside each other were a point or two apart, which is what made
+     the editor look assembled rather than designed. */
+  --s0: #060708;   /* deepest wells: the timeline behind the tracks */
+  --s1: #0d0e11;   /* app background */
+  --s2: #131519;   /* panels */
+  --s3: #1a1c22;   /* rows, cards, raised panels */
+  --s4: #21232b;   /* inputs and controls */
+  --s5: #272a33;   /* hover, subtle borders */
+  --s6: #2e323c;   /* borders */
+  --s7: #353945;   /* strong borders, active controls */
+  --s8: #3b404d;   /* hovered borders */
+  --s9: #444959;   /* dividers on light surfaces */
+
+  /* Same ramp as channels, for the translucent surfaces (popovers, sticky headers) where an
+     opacity modifier is needed — Tailwind cannot fade a colour it only sees as a var(). */
+  --s0-rgb: 6 7 8;
+  --s1-rgb: 13 14 17;
+  --s2-rgb: 19 21 25;
+  --s3-rgb: 26 28 34;
+  --s4-rgb: 33 35 43;
+  --s5-rgb: 39 42 51;
+  --s6-rgb: 46 50 60;
+  --s7-rgb: 53 57 69;
+  --s8-rgb: 59 64 77;
+  --s9-rgb: 68 73 89;
   --bg-base: #0f1117;
   --bg-panel: #18181b;
   --bg-hover: #27272a;
@@ -24,6 +51,28 @@
 }
 
 [data-theme="light"] {
+  /* Same ten roles, inverted: the step number still means "further forward", so every component
+     keeps its depth order without knowing which theme is on. */
+  --s0: #e6e9ef;
+  --s1: #eef0f4;
+  --s2: #ffffff;
+  --s3: #f7f8fa;
+  --s4: #f1f3f6;
+  --s5: #e7eaef;
+  --s6: #dce0e8;
+  --s7: #ced4de;
+  --s8: #bcc4d1;
+  --s9: #a7b0c0;
+  --s0-rgb: 230 233 239;
+  --s1-rgb: 238 240 244;
+  --s2-rgb: 255 255 255;
+  --s3-rgb: 247 248 250;
+  --s4-rgb: 241 243 246;
+  --s5-rgb: 231 234 239;
+  --s6-rgb: 220 224 232;
+  --s7-rgb: 206 212 222;
+  --s8-rgb: 188 196 209;
+  --s9-rgb: 167 176 192;
   --bg-base: #f5f6f8;
   --bg-panel: #ffffff;
   --bg-hover: #eef0f3;
@@ -61,20 +110,47 @@ video, canvas, [data-gpu="true"] {
   will-change: transform;
 }
 
-/* Global ultra-smooth scrollbars */
+/* Scrollbars. One definition only — a second copy further down used to override this and put
+   a hard track back, which is why some panels had a visible gutter and others did not. */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(113, 113, 122, 0.35);
-  border-radius: 4px;
+  background: var(--s7);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 6px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(113, 113, 122, 0.6);
+  background: var(--s9);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--s7) transparent;
+}
+
+/* Keyboard focus was invisible: most controls here clear the default outline for looks, which
+   leaves anyone tabbing through the editor with no idea where they are. */
+:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+::selection {
+  background: rgb(26 109 255 / 0.35);
+  color: var(--text-bright);
 }
 
 /* Color picker styling */
@@ -115,22 +191,6 @@ input[type="color"]::-webkit-color-swatch {
 .font-khmer-santepheap {
   font-family: 'Koh Santepheap', 'Kantumruy Pro', sans-serif;
   line-height: 1.6;
-}
-
-/* Scrollbar styling */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-::-webkit-scrollbar-track {
-  background: #1a1b23;
-}
-::-webkit-scrollbar-thumb {
-  background: #3f3f46;
-  border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #52525b;
 }
 
 /* Timeline track styling */
@@ -295,9 +355,8 @@ input[type="checkbox"] {
 [data-theme="light"] input[type="range"]::-webkit-slider-runnable-track { background: #d1d5db; }
 
 /* --- Scrollbar --- */
-[data-theme="light"] ::-webkit-scrollbar-track { background: #f3f4f6; }
-[data-theme="light"] ::-webkit-scrollbar-thumb { background: #d1d5db; }
-[data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+/* The ramp already flips for light, so the scrollbar needs no separate colours — only the
+   transparent track that the shared rule sets. */
 
 /* --- Segment rows --- */
 [data-theme="light"] .segment-row:hover { background-color: rgba(59, 130, 246, 0.05); }
@@ -404,9 +463,9 @@ input[type="checkbox"] {
    TIMELINE EDITOR — LIGHT MODE FIXES
    ============================================ */
 
-/* Playhead vertical line */
-.timeline-playhead { background-color: #ffffff; }
-[data-theme="light"] .timeline-playhead { background-color: #1f2937; }
+/* Playhead vertical line — primary accent */
+.timeline-playhead { background-color: #3d8eff; }
+[data-theme="light"] .timeline-playhead { background-color: #1d6fe0; }
 
 /* Segment text on colored backgrounds — keep readable in light mode */
 [data-theme="light"] .text-white\/90 { color: rgba(0,0,0,0.8); }
@@ -569,3 +628,23 @@ input[type="checkbox"] {
   display: inline-block;
 }
 
+
+/* Toasts slide in from the right edge and leave the same way. No fill mode on the way in:
+   a filled animation would override the transform a swipe sets while dragging. */
+@keyframes toastIn {
+  from { transform: translateX(110%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes toastOut {
+  from { transform: translateX(0); opacity: 1; }
+  to { transform: translateX(110%); opacity: 0; }
+}
+.toast-in {
+  animation: toastIn 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.toast-out {
+  animation: toastOut 0.25s ease-in forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast-in, .toast-out { animation-duration: 0.01ms; }
+}

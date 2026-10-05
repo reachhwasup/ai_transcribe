@@ -1,57 +1,47 @@
+import { useShallow } from 'zustand/react/shallow';
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useProjectStore } from '../stores/projectStore';
 import {
-  fetchPlatforms,
   exportVideoForPlatform,
+  fetchProjectParts,
+  joinParts,
   getExportUrl,
-  translateSegments,
   getDefaultFolders,
   openFolderInSystem,
   selectFolderInSystem,
-  generateMovieTitles,
-  generateViralMetadata,
-  generateSocialMediaScript,
+  fetchProjectLogo,
+  fetchRenderQueue,
+  removeRenderJob,
+  clearFinishedRenderJobs,
+  type RenderJob,
   uploadProjectLogo,
-  type PlatformPreset,
+  type ExportBlurArea,
 } from '../api/client';
+import { blurAreasForExport, blurStorageKey } from './player/BlurTools';
+import { loadLogoSettings, saveLogoSettings } from './player/LogoTools';
 import {
   X,
   Download,
   Loader2,
-  Monitor,
   FileText,
   Check,
   Play,
   Pause,
   Scissors,
   SplitSquareHorizontal,
-  Volume2,
-  Captions,
-  Crop,
-  ChevronDown,
   Sparkles,
   Music,
   Film,
-  Zap,
-  Sliders,
-  Settings2,
   CheckCircle2,
   Folder,
   FolderOpen,
   FolderPlus,
-  Copy,
-  Hash,
-  MessageSquare,
-  Tag,
-  Flame,
-  CheckCheck,
-  Clock,
-  RotateCcw,
-  Layers,
-  Image as ImageIcon,
-  Upload,
 } from 'lucide-react';
 import { buildClipLayout, totalTimelineDuration, timelineToSource } from '../utils/clipTimemap';
+import { FILTER_PRESETS, cssFilter, resolveSteps, useVideoFilter } from '../utils/videoFilters';
+import TitlesTagsPanel from './TitlesTagsPanel';
+import { toast } from '../utils/toast';
+import { nameParts } from '../utils/names';
 import SubtitleOverlay from './SubtitleOverlay';
 
 interface Props {
@@ -128,16 +118,35 @@ const PLATFORM_PRESETS: {
   },
 ];
 
-const RESOLUTION_OPTIONS = [
-  { id: '720p', label: '720p HD', desc: 'Fast render, smaller size' },
-  { id: '1080p', label: '1080p Full HD', desc: 'Crystal clear (Recommended)' },
-  { id: '4k', label: '4K Ultra HD', desc: 'Maximum crispness' },
-];
+/** Short names for the formats, so none is cut off in its button */
+const PLATFORM_LABELS: Record<string, string> = {
+  tiktok: 'TikTok · Reels', youtube: 'YouTube', instagram_portrait: 'Instagram 4:5',
+  instagram_square: 'Square', cinematic: 'Cinematic', custom: 'Original',
+};
+const QUALITY_LABELS: Record<string, string> = { compact: 'small file', standard: 'standard', high: 'best quality' };
+/** What is heard, in the order a dub is usually exported */
+const AUDIO_LABELS = {
+  music: 'Dub + the film’s music',
+  original: 'Dub + original sound',
+  none: 'Dub only',
+  original_clean: 'Original, no dub',
+} as const;
+const AUDIO_HINTS: Record<keyof typeof AUDIO_LABELS, string> = {
+  music: 'New voices over the music; the original voices taken out',
+  original: 'New voices over everything, original voices included',
+  none: 'Only the new voices, no background',
+  original_clean: 'The video’s own sound, untouched',
+};
 
-const FPS_OPTIONS = ['30 FPS', '60 FPS'];
+/** The file name an export starts with: the project's name, made safe for a file */
+const defaultExportName = (project: { name?: string; video_filename?: string }) =>
+  (project.name || (project.video_filename || '').split('/').pop() || 'export')
+    .replace(/\.[^.]+$/, '')
+    .replace(/[\\/:*?"<>|]/g, '')
+    .trim() || 'export';
 
 export default function ExportModal({ open, onClose, inline = false }: Props) {
-  const { currentProject, videoClips, videoMuted, subtitleStyle, currentTime, aspectRatio, audioSeparated, bgmUrl } = useProjectStore();
+  const { currentProject, videoClips, subtitleStyle, currentTime, aspectRatio, audioSeparated, bgmUrl, vocalsUrl } = useProjectStore(useShallow(state => ({ currentProject: state.currentProject, videoClips: state.videoClips, subtitleStyle: state.subtitleStyle, currentTime: state.currentTime, aspectRatio: state.aspectRatio, audioSeparated: state.audioSeparated, bgmUrl: state.bgmUrl, vocalsUrl: state.vocalsUrl })));
   const previewRef = useRef<HTMLVideoElement>(null);
   const previewBgRef = useRef<HTMLVideoElement>(null);
   const previewBoxRef = useRef<HTMLDivElement>(null);
@@ -147,9 +156,8 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
   const clipLayout = useMemo(() => buildClipLayout(videoClips), [videoClips]);
 
   const [tab, setTab] = useState<'video' | 'subtitles' | 'audio' | 'metadata'>('video');
+  const [showMore, setShowMore] = useState(false);
   const [selectedPlatform, setSelectedPlatform] = useState('tiktok');
-  const [resolution, setResolution] = useState('1080p');
-  const [fps, setFps] = useState('30 FPS');
   const [quality, setQuality] = useState<'compact' | 'standard' | 'high'>('standard');
   const [scaleMode, setScaleMode] = useState<'blur' | 'fit' | 'fill'>('blur');
   const hasTtsVoice = (currentProject?.segments || []).some((s) => Boolean(s.audio_url));
@@ -191,41 +199,8 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const [previewTime, setPreviewTime] = useState(0);
   const [currentSourceTime, setCurrentSourceTime] = useState(0);
-  const [subtitleLanguage, setSubtitleLanguage] = useState('');
-  const [translatedSegments, setTranslatedSegments] = useState<
-    Array<{ start_time: number; end_time: number; text: string }>
-  >([]);
-  const [translating, setTranslating] = useState(false);
 
-  // Viral Metadata & Publishing Tab State
-  const [titlesList, setTitlesList] = useState<
-    Array<{ category: string; category_label: string; title: string; description: string }>
-  >([]);
-  const [socialScriptData, setSocialScriptData] = useState<{
-    platform?: string;
-    hook?: string;
-    viral_titles?: string[];
-    captions?: {
-      tiktok?: string;
-      youtube_shorts?: string;
-      facebook_reels?: string;
-      full_description?: string;
-    };
-    hashtags?: string[];
-    pinned_comment?: string;
-    call_to_action?: string;
-    suggested_sound?: string;
-    cover_text_hook?: string;
-    seo_keywords?: string[];
-    thumbnail_text_ideas?: string[];
-  } | null>(null);
-  const [generatingMetadata, setGeneratingMetadata] = useState(false);
-  const [metadataTone, setMetadataTone] = useState<'viral' | 'suspense' | 'comedy' | 'action' | 'emotional'>('viral');
-  const [metadataPlatform, setMetadataPlatform] = useState<'all' | 'tiktok' | 'youtube' | 'facebook'>('all');
-  const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  const [videoFormat, setVideoFormat] = useState<'mp4' | 'mov' | 'webm'>('mp4');
-  const [videoQuality, setVideoQuality] = useState<'1080p' | '4k' | '720p'>('1080p');
   const [exportFolder, setExportFolder] = useState<string>(
     () => localStorage.getItem('meatika_export_folder') || ''
   );
@@ -240,28 +215,41 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
 
   // Logo / Watermark Export State
   const [exportLogoEnabled, setExportLogoEnabled] = useState(false);
+  // Blur boxes are drawn in the video player and stored per project
+  const [duckMusic, setDuckMusic] = useState(true);
+  // The colour filter chosen in the player: shown on the preview here and rendered into the file
+  const [videoFilter] = useVideoFilter(currentProject?.id);
+  const filterSteps = useMemo(() => resolveSteps(videoFilter), [videoFilter]);
+  const [normalizeLoudness, setNormalizeLoudness] = useState(true);
+  const [renderJobs, setRenderJobs] = useState<RenderJob[]>([]);
+
+  const refreshQueue = useCallback(async () => {
+    try {
+      setRenderJobs(await fetchRenderQueue());
+    } catch {
+      /* server may be restarting */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    refreshQueue();
+    const timer = setInterval(refreshQueue, 2000);
+    return () => clearInterval(timer);
+  }, [open, refreshQueue]);
+
+  const [blurAreas, setBlurAreas] = useState<ExportBlurArea[]>([]);
+  const [applyBlur, setApplyBlur] = useState(true);
+  const exportLogoInputRef = useRef<HTMLInputElement>(null);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
   const [exportLogoUrl, setExportLogoUrl] = useState('');
   const [exportLogoPosition, setExportLogoPosition] = useState('top_right');
   const [exportLogoScalePct, setExportLogoScalePct] = useState(15);
   const [exportLogoOpacity, setExportLogoOpacity] = useState(1.0);
   const [exportLogoXPct, setExportLogoXPct] = useState(85);
+  // when the logo shows, as set on the timeline's logo track (null = the whole video)
+  const [exportLogoRange, setExportLogoRange] = useState<{ start: number | null; end: number | null }>({ start: null, end: null });
   const [exportLogoYPct, setExportLogoYPct] = useState(5);
-  const [uploadingLogo, setUploadingLogo] = useState(false);
-  const exportLogoInputRef = useRef<HTMLInputElement>(null);
-
-  const handleExportLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !currentProject) return;
-    setUploadingLogo(true);
-    try {
-      const res = await uploadProjectLogo(currentProject.id, file);
-      setExportLogoUrl(res.url);
-      setExportLogoEnabled(true);
-    } catch (err: any) {
-      console.error('Failed to upload logo:', err);
-    }
-    setUploadingLogo(false);
-  };
 
   // Fetch OS default user directories
   useEffect(() => {
@@ -337,32 +325,6 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
     return () => ro.disconnect();
   }, [open, inline, selectedPlatform]);
 
-  useEffect(() => {
-    if (
-      !subtitleLanguage ||
-      !currentProject ||
-      subtitleLanguage === (currentProject.language || 'km')
-    ) {
-      setTranslatedSegments([]);
-      return;
-    }
-    let cancelled = false;
-    setTranslating(true);
-    translateSegments(currentProject.id, subtitleLanguage)
-      .then((segs) => {
-        if (!cancelled) setTranslatedSegments(segs);
-      })
-      .catch(() => {
-        if (!cancelled) setTranslatedSegments([]);
-      })
-      .finally(() => {
-        if (!cancelled) setTranslating(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [subtitleLanguage, currentProject?.id, currentProject?.language]);
-
   const previewTlDuration = useMemo(() => {
     if (videoClips.length > 0) return totalTimelineDuration(videoClips);
     return currentProject?.duration || 0;
@@ -397,17 +359,48 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         if (savedCustomName && savedCustomName.trim()) {
           setExportName(savedCustomName.trim());
         } else {
-          const base = (currentProject.video_filename || currentProject.name || 'meatika_export').replace(
-            /\.[^.]+$/,
-            ''
-          );
-          setExportName(base);
+          setExportName(defaultExportName(currentProject));
         }
       }
     } else if (!open) {
       initializedOpenRef.current = false;
     }
   }, [open, currentProject]);
+
+  useEffect(() => {
+    if (!open || !currentProject?.id) return;
+    try {
+      const stored = localStorage.getItem(blurStorageKey(currentProject.id));
+      const shapes = stored ? JSON.parse(stored) : [];
+      // style, strength, tint and timing travel too, so the export matches the player
+      setBlurAreas(blurAreasForExport(Array.isArray(shapes) ? shapes : []));
+    } catch {
+      setBlurAreas([]);
+    }
+  }, [open, currentProject?.id]);
+
+  useEffect(() => {
+    if (!open || !currentProject?.id) return;
+    let cancelled = false;
+    // The logo set up on the player comes along: on/off, where, how big, how solid
+    const logo = loadLogoSettings(currentProject.id);
+    setExportLogoEnabled(!!(logo.enabled && logo.url));
+    setExportLogoPosition(logo.position);
+    setExportLogoScalePct(logo.scale_pct);
+    setExportLogoOpacity(logo.opacity);
+    setExportLogoXPct(logo.x_pct);
+    setExportLogoYPct(logo.y_pct);
+    setExportLogoRange({ start: logo.start ?? null, end: logo.end ?? null });
+    if (logo.url) setExportLogoUrl(logo.url);
+    fetchProjectLogo(currentProject.id)
+      .then((url) => {
+        if (!cancelled && url && !logo.url) setExportLogoUrl(url);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [open, currentProject?.id]);
 
   useEffect(() => {
     const video = previewRef.current;
@@ -421,7 +414,30 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
     }
   }, [open, clipLayout, currentTime]);
 
+  // The preview is heard the way the export will sound, following the choice under "Captions &
+  // sound": the film's own track is silenced when the dub goes over the isolated music (or over
+  // nothing), and the music stem is played in its place. It used to play the film's track
+  // whatever was chosen, so the original voices were heard under the dub.
+  const previewBgmRef = useRef<HTMLAudioElement>(null);
+  const previewUsesStem = bgAudio === 'music' && !!bgmUrl;
+  const previewFilmSilent = bgAudio === 'none' || previewUsesStem;
+  const previewHasDub = bgAudio !== 'original_clean';
+  useEffect(() => {
+    const video = previewRef.current;
+    if (video) {
+      video.muted = previewFilmSilent;
+      // under a dub the original sound is turned down to the chosen level, as in the export
+      video.volume = bgAudio === 'original' ? Math.max(0, Math.min(1, bgmVolume)) : 1;
+    }
+    const stem = previewBgmRef.current;
+    if (stem) {
+      stem.volume = Math.max(0, Math.min(1, bgmVolume));
+      if (!previewUsesStem && !stem.paused) stem.pause();
+    }
+  }, [open, previewFilmSilent, previewUsesStem, bgAudio, bgmVolume]);
+
   const pauseAllAiAudio = useCallback(() => {
+    if (previewBgmRef.current && !previewBgmRef.current.paused) previewBgmRef.current.pause();
     aiAudioRefs.current.forEach((audio) => {
       if (!audio.paused) {
         audio.pause();
@@ -429,6 +445,34 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
       }
     });
   }, []);
+
+  // Guarantee all preview video and AI audio are paused when modal closes
+  useEffect(() => {
+    if (!open) {
+      if (previewRef.current && !previewRef.current.paused) {
+        previewRef.current.pause();
+      }
+      if (previewBgRef.current && !previewBgRef.current.paused) {
+        previewBgRef.current.pause();
+      }
+      pauseAllAiAudio();
+      setPreviewPlaying(false);
+    }
+  }, [open, pauseAllAiAudio]);
+
+  // Clean up on component unmount
+  useEffect(() => {
+    return () => {
+      if (previewRef.current && !previewRef.current.paused) {
+        previewRef.current.pause();
+      }
+      if (previewBgRef.current && !previewBgRef.current.paused) {
+        previewBgRef.current.pause();
+      }
+      pauseAllAiAudio();
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, [pauseAllAiAudio]);
 
   useEffect(() => {
     const video = previewRef.current;
@@ -505,7 +549,14 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
           return;
         }
       }
-      syncAiAudio(srcTime);
+      if (previewHasDub) syncAiAudio(srcTime);
+      const stem = previewBgmRef.current;
+      if (stem && previewUsesStem) {
+        if (stem.paused) {
+          stem.currentTime = srcTime;
+          stem.play().catch(() => {});
+        } else if (Math.abs(stem.currentTime - srcTime) > 0.3) stem.currentTime = srcTime;
+      }
       rafRef.current = requestAnimationFrame(tick);
     };
 
@@ -513,14 +564,14 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
     video.play().catch(() => setPreviewPlaying(false));
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [previewPlaying, clipLayout, previewTlDuration, pauseAllAiAudio, scaleMode]);
+  }, [previewPlaying, clipLayout, previewTlDuration, pauseAllAiAudio, scaleMode, previewHasDub, previewUsesStem]);
 
   useEffect(() => {
-    if (!previewPlaying) {
-      if (previewRef.current && !previewRef.current.paused) previewRef.current.pause();
+    if (!previewPlaying || !previewHasDub) {
+      if (!previewPlaying && previewRef.current && !previewRef.current.paused) previewRef.current.pause();
       pauseAllAiAudio();
     }
-  }, [previewPlaying, pauseAllAiAudio]);
+  }, [previewPlaying, previewHasDub, pauseAllAiAudio]);
 
   useEffect(() => {
     if (!open) {
@@ -543,28 +594,130 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         const r = timelineToSource(clipLayout, newTlTime);
         if (r) video.currentTime = r.sourceTime;
       } else video.currentTime = newTlTime;
+      // the subtitle preview and the dubbed voices follow this, not the scrubber position
+      setCurrentSourceTime(video.currentTime);
     },
     [clipLayout, previewTlDuration]
   );
 
   const handleSubtitleExport = (format: string) => {
     if (!currentProject) return;
-    window.open(getExportUrl(currentProject.id, format, subtitleLanguage || undefined), '_blank');
+    window.open(getExportUrl(currentProject.id, format), '_blank');
   };
 
-  const handleVideoExport = async () => {
+  // When this project is one part of a split video, offer to render every part and
+  // stitch them back into one file instead of exporting this part alone.
+  const [siblingParts, setSiblingParts] = useState<{ id: string; name: string }[]>([]);
+  const [joinAllParts, setJoinAllParts] = useState(false);
+  const isPart = !!currentProject?.part_index;
+
+  useEffect(() => {
+    if (!open || !currentProject?.id || !isPart) {
+      setSiblingParts([]);
+      return;
+    }
+    let cancelled = false;
+    fetchProjectParts(currentProject.id)
+      .then((parts) => {
+        if (!cancelled) setSiblingParts(parts.map((p) => ({ id: p.id, name: p.name })));
+      })
+      .catch(() => {
+        if (!cancelled) setSiblingParts([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, currentProject?.id, isPart]);
+
+  /** The same settings the single-project export sends, as the backend's snake_case request. */
+  const buildExportRequest = () => ({
+    platform: selectedPlatform,
+    include_subtitles: burnSubtitles,
+    include_voice: bgAudio !== 'original_clean',
+    mute_original_audio: bgAudio === 'none',
+    background_audio: bgAudio === 'original_clean' ? 'original' : bgAudio,
+    scale_mode: scaleMode,
+    subtitle_style: subtitleStyle,
+    export_folder: exportFolder?.trim() || undefined,
+    quality,
+    bgm_volume: bgmVolume,
+    voice_offset_ms: voiceOffsetMs,
+    logo_url: exportLogoUrl || undefined,
+    logo_enabled: exportLogoEnabled,
+    logo_position: exportLogoPosition,
+    logo_scale_pct: exportLogoScalePct,
+    logo_opacity: exportLogoOpacity,
+    logo_x_pct: exportLogoPosition === 'custom' ? exportLogoXPct : undefined,
+    logo_y_pct: exportLogoPosition === 'custom' ? exportLogoYPct : undefined,
+    logo_start: exportLogoRange.start,
+    logo_end: exportLogoRange.end,
+    blur_areas: applyBlur ? blurAreas : [],
+    duck_music: duckMusic,
+    normalize_loudness: normalizeLoudness,
+    video_filter: filterSteps.length ? filterSteps : null,
+  });
+
+  const handleJoinExport = async () => {
+    if (!currentProject) return;
+    setExporting(true);
+    setError('');
+    setProgress(0);
+    setDone(false);
+    setSavedLocalPath(null);
+    setStatusMessage(`Rendering ${siblingParts.length} parts…`);
+    const label = nameParts(currentProject.name).head || currentProject.name;
+    toast({ tone: 'working', title: `Exporting ${siblingParts.length} parts as one video`, detail: label });
+    try {
+      const safeName = (exportName.trim() || currentProject.name || 'meatika_video')
+        .replace(/[\\/:*?"<>|]/g, '')
+        .replace(/\s+/g, '_');
+      const res = await joinParts(
+        currentProject.id,
+        buildExportRequest(),
+        `${safeName}.mp4`,
+        (pct, msg) => {
+          setProgress(pct);
+          if (msg) setStatusMessage(msg);
+        },
+      );
+      setDone(true);
+      setStatusMessage(`Joined ${siblingParts.length} parts into one video`);
+      toast({ tone: 'success', title: 'Export finished', detail: `${label} — ${siblingParts.length} parts joined` });
+      if (res.savedPath) {
+        setSavedLocalPath(res.savedPath);
+        openFolderInSystem(res.savedPath).catch(() => {});
+      } else {
+        const a = document.createElement('a');
+        a.href = res.downloadUrl;
+        a.download = res.filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Joining the parts failed');
+      toast({ tone: 'error', title: 'Export failed', detail: `${label} — ${e instanceof Error ? e.message : 'joining the parts failed'}` });
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleVideoExport = async (queueIt = false) => {
     if (!currentProject) return;
     setExporting(true);
     setError('');
     setProgress(0);
     setStatusMessage('Preparing render...');
     setDone(false);
+    // a queued export is announced by the queue itself, when it starts and when it ends
+    const label = nameParts(currentProject.name).tail || currentProject.name;
+    if (!queueIt) toast({ tone: 'working', title: 'Export started', detail: label });
     try {
       setSavedLocalPath(null);
       const safeName = (exportName.trim() || currentProject.name || 'meatika_video')
         .replace(/[\\/:*?"<>|]/g, '')
         .replace(/\s+/g, '_');
-      const targetFilename = `${safeName}.${videoFormat || 'mp4'}`;
+      const targetFilename = `${safeName}.mp4`;
 
       const includeVoice = bgAudio !== 'original_clean';
       const actualBgAudio = bgAudio === 'original_clean' ? 'original' : bgAudio;
@@ -581,7 +734,7 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         },
         includeVoice,
         splitEnabled ? parseFloat(splitDuration) : undefined,
-        subtitleLanguage || undefined,
+        undefined, // subtitle language: captions are exported as they are
         bgAudio === 'none',
         scaleMode,
         subtitleStyle,
@@ -599,8 +752,20 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
           logo_opacity: exportLogoOpacity,
           logo_x_pct: exportLogoPosition === 'custom' ? exportLogoXPct : undefined,
           logo_y_pct: exportLogoPosition === 'custom' ? exportLogoYPct : undefined,
+          logo_start: exportLogoRange.start,
+          logo_end: exportLogoRange.end,
         },
+        applyBlur ? blurAreas : [],
+        queueIt ? (exportName.trim() || currentProject.name || 'Export') : undefined,
+        { duck_music: duckMusic, normalize_loudness: normalizeLoudness, video_filter: filterSteps },
       );
+      if (result.queuedJob) {
+        setExporting(false);
+        setStatusMessage('');
+        setProgress(0);
+        await refreshQueue();
+        return;
+      }
       const blob = result.blob;
       if (result.savedPath) {
         setSavedLocalPath(result.savedPath);
@@ -610,7 +775,7 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         // Fallback: trigger browser web download only if not saved directly to local disk
         const isZip =
           blob.type === 'application/zip' || (splitEnabled && parseFloat(splitDuration) > 0);
-        const ext = isZip ? 'zip' : videoFormat || 'mp4';
+        const ext = isZip ? 'zip' : 'mp4';
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -621,15 +786,58 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         URL.revokeObjectURL(url);
       }
       setDone(true);
+      toast({ tone: 'success', title: 'Export finished', detail: result.savedPath ? `${label} — saved to ${result.savedPath}` : label });
       setTimeout(() => setDone(false), 10000);
     } catch (e: any) {
       const msg = e?.response?.data
         ? (await e.response.data.text?.()) || 'Export failed'
         : e.message || 'Export failed';
       setError(typeof msg === 'string' ? msg : 'Export failed');
+      if (!queueIt) toast({ tone: 'error', title: 'Export failed', detail: `${label} — ${typeof msg === 'string' ? msg : 'Export failed'}` });
     }
     setExporting(false);
   };
+
+  // the volume slider also sets what the timeline plays, so the two stay the same
+  const setVolume = (v: number) => {
+    setBgmVolume(v);
+    if (currentProject?.id) {
+      const key = audioSeparated ? `timeline-bgm-volume-${currentProject.id}` : `timeline-video-volume-${currentProject.id}`;
+      localStorage.setItem(key, String(v));
+    }
+  };
+  const setOffset = (v: number) => {
+    setVoiceOffsetMs(v);
+    if (currentProject?.id) localStorage.setItem(`export-voice-offset-${currentProject.id}`, String(v));
+  };
+  // A logo set here is the project's logo: saving it puts it on the video in the editor and
+  // gives it its track on the timeline, the same as setting it from the player's Logo panel.
+  const keepLogo = (patch: Partial<ReturnType<typeof loadLogoSettings>>) => {
+    if (!currentProject?.id) return;
+    saveLogoSettings(currentProject.id, { ...loadLogoSettings(currentProject.id), ...patch });
+  };
+  const chooseFolder = (path: string) => {
+    setExportFolder(path);
+    localStorage.setItem('meatika_export_folder', path);
+  };
+  const pendingRenders = renderJobs.filter((j) => j.status === 'queued' || j.status === 'rendering').length;
+  // what is switched on under "More options", so it is never forgotten while folded away
+  const moreInUse = [
+    trimEnabled && 'trimmed',
+    splitEnabled && 'split',
+    exportLogoEnabled && exportLogoUrl && 'logo',
+    voiceOffsetMs !== 0 && `voice ${voiceOffsetMs > 0 ? '+' : ''}${voiceOffsetMs} ms`,
+  ].filter(Boolean) as string[];
+  const sectionClass = 'p-4 rounded-2xl bg-[var(--s2)] border border-white/5 space-y-3';
+  const sectionTitle = (n: number, text: string, aside?: string) => (
+    <div className="flex items-center justify-between gap-2">
+      <span className="flex items-center gap-2">
+        <span className="w-5 h-5 rounded-full bg-blue-600/20 text-blue-300 text-[10px] font-bold flex items-center justify-center">{n}</span>
+        <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-300">{text}</span>
+      </span>
+      {aside && <span className="text-[10px] font-mono text-emerald-400">{aside}</span>}
+    </div>
+  );
 
   if (!open) return null;
 
@@ -656,189 +864,85 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
     1.5,
     Math.round(
       (activeExportDuration *
-        (quality === 'compact' ? 0.28 : quality === 'high' ? 0.82 : 0.48) *
-        (videoQuality === '4k' ? 1.6 : videoQuality === '720p' ? 0.7 : 1.0)) *
+        (quality === 'compact' ? 0.28 : quality === 'high' ? 0.82 : 0.48)) *
         10
     ) / 10
   );
-
-  const copyToClipboard = (text: string, key: string) => {
-    if (!text) return;
-    navigator.clipboard.writeText(text);
-    setCopiedKey(key);
-    setTimeout(() => setCopiedKey(null), 2500);
-  };
-
-  const handleGenerateMetadata = async () => {
-    if (!currentProject) return;
-    setGeneratingMetadata(true);
-    try {
-      const [titlesRes, data] = await Promise.all([
-        generateMovieTitles(currentProject.id, currentProject.name, currentProject.language || 'km').catch(() => []),
-        generateViralMetadata(currentProject.id, {
-          originalTitle: currentProject.name,
-          language: currentProject.language || 'km',
-          tone: metadataTone,
-          platform: metadataPlatform,
-        }).catch(() => null),
-      ]);
-
-      if (titlesRes && Array.isArray(titlesRes) && titlesRes.length > 0) {
-        setTitlesList(titlesRes);
-      } else if (data && data.titles && Array.isArray(data.titles)) {
-        const categories = [
-          { cat: 'viral_hook', label: 'ចំណងជើងទាក់ទាញ (Viral Hook)' },
-          { cat: 'suspense', label: 'រន្ធត់ & ភ្ញាក់ផ្អើល (Suspense)' },
-          { cat: 'comedy', label: 'កំប្លុកកំប្លែង (Humor)' },
-          { cat: 'action', label: 'វាយប្រហារ (Action)' },
-          { cat: 'short', label: 'ខ្លីខ្លឹមបែប TikTok (Short)' },
-        ];
-        const normalized = data.titles.map((t: any, idx: number) => {
-          if (typeof t === 'string') {
-            const c = categories[idx % categories.length];
-            return {
-              category: c.cat,
-              category_label: c.label,
-              title: t,
-              description: 'ចំណងជើងទាក់ទាញបង្កើតការចង់ដឹងចង់ឃើញខ្ពស់',
-            };
-          }
-          return {
-            category: t.category || 'viral_hook',
-            category_label: t.category_label || t.category || 'ចំណងជើងទាក់ទាញ',
-            title: t.title || t.text || String(t || ''),
-            description: t.description || '',
-          };
-        });
-        setTitlesList(normalized);
-      }
-
-      if (data) {
-        setSocialScriptData({
-          hook: data.hook || '',
-          captions: {
-            full_description: (data as any).description || (data as any)?.captions?.full_description || (data as any)?.captions?.youtube_shorts || '',
-            youtube_shorts: (data as any).description || (data as any)?.captions?.youtube_shorts || (data as any)?.captions?.full_description || '',
-            tiktok: (data as any).short_caption || (data as any)?.captions?.tiktok || '',
-            facebook_reels: (data as any).facebook_caption || (data as any)?.captions?.facebook_reels || '',
-          },
-          hashtags: data.hashtags || [],
-          seo_keywords: (data as any).seo_keywords || (data as any)?.seo_tags || [
-            'សម្រាយរឿង',
-            'សម្រាយរឿងពេញ',
-            currentProject.name || 'សម្រាយរឿងថ្មី',
-            'movie recap khmer',
-            'រឿងចិននិយាយខ្មែរ',
-            'ភាពយន្តភាគចិន',
-            'ក្បាច់គុនបុរាណ',
-            'cinema khmer',
-            'film recap khmer',
-            'រឿងពេញ 2024',
-          ],
-          pinned_comment: data.pinned_comment || '',
-          call_to_action: data.call_to_action || '',
-          thumbnail_text_ideas: (data as any).thumbnail_text_ideas || [
-            'នឹកស្មានមិនដល់! 😱',
-            'ការពិតត្រូវបានទម្លាយ! 💥',
-            'កុំមើលរំលងឱ្យសោះ! 🔥',
-            'ស្ដេចសង្គ្រាមត្រឡប់មកវិញ! ⚔️',
-          ],
-        } as any);
-      }
-    } catch (err) {
-      console.error('Generate metadata failed:', err);
-    } finally {
-      setGeneratingMetadata(false);
-    }
-  };
 
   return (
     <div
       className={
         inline
-          ? 'w-full h-full flex flex-col bg-[#0e1015] text-white select-none font-sans overflow-hidden'
+          ? 'w-full h-full flex flex-col bg-[var(--s1)] text-white select-none font-sans overflow-hidden'
           : 'fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/85 backdrop-blur-md animate-in fade-in duration-200'
       }
       onClick={!inline ? onClose : undefined}
     >
       <div
-        className={`bg-[#111318] text-[#e1e3e6] flex flex-col relative ${
+        className={`bg-[var(--s2)] text-[#e1e3e6] flex flex-col relative ${
           inline
             ? 'w-full h-full'
-            : 'border border-white/10 rounded-3xl w-full max-w-5xl shadow-2xl shadow-purple-950/20 overflow-hidden max-h-[94vh]'
+            : 'border border-white/10 rounded-3xl w-full max-w-5xl shadow-2xl overflow-hidden max-h-[94vh]'
         }`}
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Top Gradient Accent Line */}
-        <div className="h-[2px] w-full bg-gradient-to-r from-pink-500 via-purple-500 to-indigo-500 shrink-0" />
-
-        {/* Header Bar */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between px-6 py-4 border-b border-white/5 bg-[#141720]/80 backdrop-blur-md gap-3 shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-2xl bg-gradient-to-tr from-pink-600 via-purple-600 to-indigo-600 flex items-center justify-center text-white shadow-lg shadow-pink-500/25 shrink-0">
+        {/* Header: what is being exported, and what kind of export */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between px-5 py-3.5 border-b border-white/5 gap-3 shrink-0">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-9 h-9 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow-lg shrink-0">
               <Download className="w-4 h-4" />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h2 className="text-sm font-bold text-white tracking-wide">
-                  Export Studio
-                </h2>
-                <span className="text-[9px] font-mono font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-pink-500/15 text-pink-300 border border-pink-500/25">
-                  Meatika Engine
-                </span>
-              </div>
-              <p className="text-[11px] text-zinc-400 mt-0.5">
-                {currentProject?.name ? `Project: ${currentProject.name} · ` : ''}Render MP4, subtitles, or create viral titles & tags
-              </p>
+            <div className="min-w-0">
+              <h2 className="text-sm font-bold text-white">Export</h2>
+              {currentProject?.name && (
+                <p className="text-[11px] text-zinc-400 truncate" title={currentProject.name}>
+                  <span className="text-zinc-200 font-semibold">{nameParts(currentProject.name).tail}</span>
+                  {nameParts(currentProject.name).head && <span> · {nameParts(currentProject.name).head}</span>}
+                </p>
+              )}
             </div>
           </div>
 
-          {/* Top Tabs Bar */}
-          <div className="flex items-center gap-1.5 bg-[#0a0b0e]/80 p-1 rounded-2xl border border-white/5 shadow-inner">
-            {[
-              { id: 'video', label: '🎬 Render Video', icon: Film },
-              { id: 'metadata', label: '🔥 Viral Titles & Tags', icon: Sparkles, badge: 'AI' },
-              { id: 'subtitles', label: '💬 Subtitles', icon: FileText },
-              { id: 'audio', label: '🎵 Audio Stems', icon: Music },
-            ].map((t) => {
-              const Icon = t.icon;
-              const isActive = tab === t.id;
-              return (
-                <button
-                  key={t.id}
-                  onClick={() => setTab(t.id as any)}
-                  className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                    isActive
-                      ? t.id === 'metadata'
-                        ? 'bg-gradient-to-r from-pink-500 to-purple-600 text-white shadow-md shadow-pink-500/25'
-                        : 'bg-white text-black shadow-md'
-                      : 'text-zinc-400 hover:text-white hover:bg-white/5'
-                  }`}
-                >
-                  <Icon className={`w-3.5 h-3.5 ${t.id === 'metadata' && !isActive ? 'text-pink-400' : ''}`} />
-                  <span>{t.label}</span>
-                  {t.badge && !isActive && (
-                    <span className="text-[9px] font-mono px-1 py-0.2 rounded bg-pink-500/20 text-pink-300 border border-pink-500/30">
-                      {t.badge}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="flex items-center gap-1 bg-[var(--s1)] p-1 rounded-xl border border-white/5" role="tablist">
+              {[
+                { id: 'video', label: 'Video', icon: Film },
+                { id: 'metadata', label: 'Titles & tags', icon: Sparkles },
+                { id: 'subtitles', label: 'Subtitles', icon: FileText },
+                { id: 'audio', label: 'Audio', icon: Music },
+              ].map((t) => {
+                const Icon = t.icon;
+                const isActive = tab === t.id;
+                return (
+                  <button
+                    key={t.id}
+                    role="tab"
+                    aria-selected={isActive}
+                    onClick={() => setTab(t.id as any)}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors cursor-pointer ${
+                      isActive ? 'bg-blue-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-white/5'
+                    }`}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                    <span>{t.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+            {!inline && (
+              <button
+                onClick={onClose}
+                aria-label="Close"
+                className="p-2 rounded-xl text-zinc-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
           </div>
-
-          {!inline && (
-            <button
-              onClick={onClose}
-              className="hidden sm:flex p-2 rounded-xl text-zinc-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          )}
         </div>
 
         {/* Modal Body */}
-        <div className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-6">
+        <div className="flex-1 overflow-y-auto p-5 space-y-6">
           {/* SUBTITLE EXPORT TAB */}
           {tab === 'subtitles' && (
             <div className="space-y-4 max-w-xl mx-auto py-4">
@@ -884,18 +988,18 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                     key={item.fmt}
                     onClick={() => handleSubtitleExport(item.fmt)}
                     disabled={!hasSegments}
-                    className="p-4 rounded-2xl bg-[#181a1f] border border-[#26282e] hover:border-pink-500/60 hover:bg-[#1e2128] text-left transition-all group disabled:opacity-30 disabled:cursor-not-allowed shadow-sm"
+                    className="p-4 rounded-2xl bg-[var(--s3)] border border-[var(--s4)] hover:border-white/10 hover:bg-[var(--s4)] text-left transition-all group disabled:opacity-30 disabled:cursor-not-allowed shadow-sm"
                   >
                     <div className="flex items-center justify-between mb-2">
-                      <span className="text-xs font-bold text-white group-hover:text-pink-300 transition-colors">
+                      <span className="text-xs font-bold text-white group-hover:text-zinc-200 transition-colors">
                         {item.label}
                       </span>
-                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-pink-500/20 text-pink-300 font-semibold">
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-white/10 text-zinc-200 font-semibold">
                         {item.ext}
                       </span>
                     </div>
                     <p className="text-[11px] text-zinc-400 leading-relaxed mb-3">{item.desc}</p>
-                    <div className="flex items-center text-[11px] font-bold text-pink-400 group-hover:translate-x-1 transition-transform gap-1">
+                    <div className="flex items-center text-[11px] font-bold text-zinc-400 group-hover:translate-x-1 transition-transform gap-1">
                       <Download className="w-3.5 h-3.5" /> Download {item.ext}
                     </div>
                   </button>
@@ -904,531 +1008,73 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
             </div>
           )}
 
-          {/* AUDIO ONLY TAB */}
+          {/* AUDIO TAB — the separated tracks, as files */}
           {tab === 'audio' && (
             <div className="space-y-4 max-w-xl mx-auto py-4">
               <div className="text-center space-y-1 mb-6">
-                <h3 className="text-sm font-bold text-white">Export Audio Tracks</h3>
-                <p className="text-xs text-zinc-400">
-                  Download separate audio, isolated vocals, or background music
-                </p>
+                <h3 className="text-sm font-bold text-white">Audio tracks</h3>
+                <p className="text-xs text-zinc-400">The film’s own voices and its background music, as separate files</p>
               </div>
+
+              {!audioSeparated && (
+                <p className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
+                  The music has not been isolated for this project yet. Isolate it from the timeline (the music track) and both files appear here.
+                </p>
+              )}
 
               <div className="space-y-3">
                 {[
-                  {
-                    id: 'mix',
-                    title: 'Full Master Mix Audio',
-                    ext: '.MP3 / .WAV',
-                    desc: 'Combined original audio, AI voiceover dubbing, and music',
-                  },
-                  {
-                    id: 'vocals',
-                    title: 'Isolated Vocals / Speech Only',
-                    ext: '.MP3',
-                    desc: 'Cleaned human dialogue with background music removed',
-                  },
-                  {
-                    id: 'bgm',
-                    title: 'Isolated BGM / Instrumental Track',
-                    ext: '.MP3',
-                    desc: 'Instrumental background music with vocals removed',
-                  },
+                  { id: 'vocals', title: 'Original voices', desc: 'The film’s dialogue with the music taken out', url: vocalsUrl },
+                  { id: 'bgm', title: 'Background music', desc: 'The film’s music and sound with the voices taken out — what the dub plays over', url: bgmUrl },
                 ].map((a) => (
-                  <div
-                    key={a.id}
-                    className="p-4 rounded-2xl bg-[#181a1f] border border-[#26282e] flex items-center justify-between gap-4"
-                  >
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-bold text-white">{a.title}</span>
-                        <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-blue-500/20 text-blue-300">
-                          {a.ext}
-                        </span>
-                      </div>
+                  <div key={a.id} className="p-4 rounded-2xl bg-[var(--s3)] border border-[var(--s4)] flex items-center justify-between gap-4">
+                    <div className="min-w-0">
+                      <span className="text-xs font-bold text-white">{a.title}</span>
                       <p className="text-[11px] text-zinc-400 mt-0.5">{a.desc}</p>
                     </div>
-                    <button
-                      onClick={() => handleSubtitleExport('txt')}
-                      className="px-4 py-2 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white text-xs font-bold flex items-center gap-1.5 shrink-0 transition-all shadow-md shadow-blue-950/40 active:scale-95 cursor-pointer"
+                    <a
+                      href={a.url || undefined}
+                      download={`${(exportName || currentProject?.name || 'audio').replace(/[\\/:*?"<>|]/g, '')} - ${a.id === 'vocals' ? 'voices' : 'music'}.${(a.url || '').split('?')[0].split('.').pop() || 'flac'}`}
+                      aria-disabled={!a.url}
+                      onClick={(e) => { if (!a.url) e.preventDefault(); }}
+                      className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors ${
+                        a.url ? 'bg-blue-600 hover:bg-blue-500 text-white cursor-pointer' : 'bg-white/5 text-zinc-500 cursor-not-allowed'
+                      }`}
                     >
-                      <Download className="w-3.5 h-3.5" /> Export Audio
-                    </button>
+                      <Download className="w-3.5 h-3.5" /> Download
+                    </a>
                   </div>
                 ))}
               </div>
+              <p className="text-[11px] text-zinc-500 text-center">
+                For the finished dub as sound only, export the video and take its audio — a separate audio export is not built yet.
+              </p>
             </div>
           )}
 
-          {/* VIRAL TITLES & SOCIAL METADATA TAB */}
-          {tab === 'metadata' && (
-            <div className="space-y-6 max-w-3xl mx-auto py-2">
-              {/* Generator Control Card */}
-              <div className="p-5 rounded-2xl bg-gradient-to-br from-[#1c1a29] via-[#161822] to-[#12131a] border border-purple-500/20 shadow-xl space-y-4">
-                {/* Top Action Bar */}
-                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-                  <div className="flex items-center gap-2.5">
-                    <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-pink-500 to-purple-600 flex items-center justify-center text-white shadow-md shadow-pink-950/40 shrink-0">
-                      <Sparkles className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <h4 className="text-xs font-bold text-white tracking-wide flex items-center gap-1.5">
-                        <span>AI Viral Title & Tags Engine</span>
-                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-pink-500/20 text-pink-300 border border-pink-500/30 font-bold font-mono">
-                          Auto-SEO
-                        </span>
-                      </h4>
-                      <p className="text-[11px] text-zinc-400">
-                        Analyzes your video transcript to generate viral titles, first 3s hook, descriptions & tags
-                      </p>
-                    </div>
-                  </div>
-
-                  <button
-                    onClick={handleGenerateMetadata}
-                    disabled={generatingMetadata}
-                    className="w-full sm:w-auto justify-center px-4 py-2 rounded-xl bg-gradient-to-r from-pink-600 via-purple-600 to-indigo-600 hover:from-pink-500 hover:to-indigo-500 text-white text-xs font-bold shadow-lg shadow-purple-950/50 flex items-center gap-2 transition-all active:scale-95 disabled:opacity-50 cursor-pointer shrink-0"
-                  >
-                    {generatingMetadata ? (
-                      <>
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        <span>AI Generating Package...</span>
-                      </>
-                    ) : (
-                      <>
-                        <Zap className="w-3.5 h-3.5 text-yellow-300" />
-                        <span>{titlesList.length > 0 ? 'Regenerate Titles & Tags' : 'Generate Viral Package'}</span>
-                      </>
-                    )}
-                  </button>
-                </div>
-
-                {/* Tone & Target Filter Bar */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-white/5">
-                  <div className="space-y-1">
-                    <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1">
-                      <Flame className="w-3 h-3 text-pink-400" />
-                      Content Vibe / Tone
-                    </label>
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      {[
-                        { id: 'viral', label: '🔥 Viral Hook' },
-                        { id: 'suspense', label: '🎭 Suspense & Drama' },
-                        { id: 'comedy', label: '😂 Comedy' },
-                        { id: 'action', label: '⚡ Action Battle' },
-                        { id: 'emotional', label: '❤️ Emotional' },
-                      ].map((t) => (
-                        <button
-                          key={t.id}
-                          onClick={() => setMetadataTone(t.id as any)}
-                          className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-all cursor-pointer ${
-                            metadataTone === t.id
-                              ? 'bg-purple-600 text-white shadow-xs'
-                              : 'bg-[#1e2029] text-zinc-400 hover:text-zinc-200 border border-white/5'
-                          }`}
-                        >
-                          {t.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="space-y-1">
-                    <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1">
-                      <Monitor className="w-3 h-3 text-blue-400" />
-                      Target Social Platform
-                    </label>
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      {[
-                        { id: 'all', label: 'All Platforms' },
-                        { id: 'tiktok', label: 'TikTok / Shorts' },
-                        { id: 'youtube', label: 'YouTube' },
-                        { id: 'facebook', label: 'Facebook Reels' },
-                      ].map((p) => (
-                        <button
-                          key={p.id}
-                          onClick={() => setMetadataPlatform(p.id as any)}
-                          className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-all cursor-pointer ${
-                            metadataPlatform === p.id
-                              ? 'bg-pink-600 text-white shadow-xs'
-                              : 'bg-[#1e2029] text-zinc-400 hover:text-zinc-200 border border-white/5'
-                          }`}
-                        >
-                          {p.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* 1. Catchy Titles Section */}
-              <div className="space-y-3">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
-                  <h4 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
-                    <Flame className="w-4 h-4 text-pink-400" />
-                    Catchy Video Titles (ចំណងជើងទាក់ទាញ)
-                  </h4>
-                  <span className="text-[10px] text-zinc-400 font-mono">
-                    {titlesList.length} Variations Generated
-                  </span>
-                </div>
-
-                {titlesList.length === 0 && !generatingMetadata ? (
-                  <div className="p-8 rounded-2xl bg-[#181a1f] border border-[#26282e] text-center space-y-2">
-                    <Sparkles className="w-6 h-6 text-pink-400 mx-auto animate-bounce" />
-                    <p className="text-xs text-zinc-300 font-medium">No titles generated yet</p>
-                    <p className="text-[11px] text-zinc-500">
-                      Click "Generate Viral Package" to create 5+ high-CTR titles from this video's dialogue
-                    </p>
-                  </div>
-                ) : generatingMetadata && titlesList.length === 0 ? (
-                  <div className="p-8 rounded-2xl bg-[#181a1f] border border-[#26282e] text-center space-y-2">
-                    <Loader2 className="w-6 h-6 text-purple-400 animate-spin mx-auto" />
-                    <p className="text-xs text-zinc-300">Crafting high-CTR viral titles from your transcript...</p>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 gap-2.5">
-                    {titlesList.map((rawItem, idx) => {
-                      const item = typeof rawItem === 'string'
-                        ? { category: 'viral_hook', category_label: 'ចំណងជើងទាក់ទាញ (Viral Hook)', title: rawItem, description: '' }
-                        : {
-                            category: (rawItem as any).category || 'viral_hook',
-                            category_label: (rawItem as any).category_label || (rawItem as any).category || 'ចំណងជើងទាក់ទាញ',
-                            title: (rawItem as any).title || (rawItem as any).text || String(rawItem || ''),
-                            description: (rawItem as any).description || '',
-                          };
-                      const isCopied = copiedKey === `title-${idx}`;
-                      return (
-                        <div
-                          key={idx}
-                          className="p-3.5 rounded-xl bg-[#181a1f] hover:bg-[#1f2229] border border-[#26282e] hover:border-purple-500/40 transition-all flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 group"
-                        >
-                          <div className="space-y-1 flex-1 min-w-0">
-                            <div className="flex items-center gap-2">
-                              <span className="text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/25">
-                                {item.category_label || item.category}
-                              </span>
-                            </div>
-                            <p className="text-xs sm:text-sm font-bold text-white font-khmer leading-relaxed select-text break-words">
-                              {item.title}
-                            </p>
-                            {item.description && (
-                              <p className="text-[11px] text-zinc-400 font-khmer leading-normal break-words">
-                                {item.description}
-                              </p>
-                            )}
-                          </div>
-
-                          <button
-                            onClick={() => copyToClipboard(item.title, `title-${idx}`)}
-                            className={`w-full sm:w-auto justify-center px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 shrink-0 transition-all cursor-pointer ${
-                              isCopied
-                                ? 'bg-emerald-600 text-white shadow-sm'
-                                : 'bg-[#252833] hover:bg-[#323645] text-zinc-200 hover:text-white border border-white/10'
-                            }`}
-                          >
-                            {isCopied ? (
-                              <>
-                                <CheckCheck className="w-3.5 h-3.5 text-white" />
-                                <span>Copied!</span>
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="w-3.5 h-3.5" />
-                                <span>Copy Title</span>
-                              </>
-                            )}
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              {/* 2. First 3-Seconds Hook / On-Screen Text */}
-              {socialScriptData?.hook && (
-                <div className="p-4 rounded-2xl bg-[#181a1f] border border-pink-500/20 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-pink-400 uppercase tracking-wider flex items-center gap-1.5">
-                      <Zap className="w-3.5 h-3.5 text-yellow-300" />
-                      First 3-Seconds Video Hook (ឃ្លាទាក់ទាញ 3 វិនាទីដំបូង)
-                    </span>
-                    <button
-                      onClick={() => copyToClipboard(socialScriptData.hook || '', 'hook')}
-                      className="text-[11px] text-zinc-400 hover:text-pink-300 font-semibold flex items-center gap-1 cursor-pointer"
-                    >
-                      {copiedKey === 'hook' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                      <span>{copiedKey === 'hook' ? 'Copied' : 'Copy Hook'}</span>
-                    </button>
-                  </div>
-                  <p className="text-sm text-zinc-100 font-khmer font-semibold bg-black/40 p-3 rounded-xl border border-white/5 select-text leading-relaxed">
-                    "{socialScriptData.hook}"
-                  </p>
-                </div>
-              )}
-
-              {/* 3. Social Media Descriptions & Captions */}
-              {socialScriptData?.captions && (
-                <div className="space-y-3">
-                  <h4 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
-                    <FileText className="w-4 h-4 text-blue-400" />
-                    Video Description & Caption (ការពិពណ៌នាវីដេអូ)
-                  </h4>
-
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                    {socialScriptData.captions.tiktok && (
-                      <div className="p-3.5 rounded-xl bg-[#181a1f] border border-[#26282e] space-y-2 flex flex-col justify-between">
-                        <div>
-                          <div className="flex items-center justify-between mb-1.5">
-                            <span className="text-[10px] font-bold text-pink-300 uppercase tracking-wider">
-                              📱 TikTok / Shorts
-                            </span>
-                            <button
-                              onClick={() => copyToClipboard(socialScriptData?.captions?.tiktok || '', 'desc-tiktok')}
-                              className="text-[10px] text-zinc-400 hover:text-white font-semibold flex items-center gap-1 cursor-pointer"
-                            >
-                              {copiedKey === 'desc-tiktok' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                              <span>{copiedKey === 'desc-tiktok' ? 'Copied' : 'Copy'}</span>
-                            </button>
-                          </div>
-                          <p className="text-[11px] text-zinc-300 whitespace-pre-line select-text line-clamp-6">
-                            {socialScriptData.captions.tiktok}
-                          </p>
-                        </div>
-                      </div>
-                    )}
-
-                    {(socialScriptData.captions.facebook_reels || (socialScriptData as any).facebook_caption) && (
-                      <div className="p-3.5 rounded-xl bg-[#181a1f] border border-[#26282e] space-y-2 flex flex-col justify-between">
-                        <div>
-                          <div className="flex items-center justify-between mb-1.5">
-                            <span className="text-[10px] font-bold text-blue-400 uppercase tracking-wider">
-                              📘 Facebook Post & Reels
-                            </span>
-                            <button
-                              onClick={() => copyToClipboard(socialScriptData?.captions?.facebook_reels || (socialScriptData as any)?.facebook_caption || '', 'desc-fb')}
-                              className="text-[10px] text-zinc-400 hover:text-white font-semibold flex items-center gap-1 cursor-pointer"
-                            >
-                              {copiedKey === 'desc-fb' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                              <span>{copiedKey === 'desc-fb' ? 'Copied' : 'Copy'}</span>
-                            </button>
-                          </div>
-                          <p className="text-[11px] text-zinc-300 whitespace-pre-line select-text line-clamp-6">
-                            {socialScriptData.captions.facebook_reels || (socialScriptData as any).facebook_caption}
-                          </p>
-                        </div>
-                      </div>
-                    )}
-
-                    {(socialScriptData.captions.youtube_shorts || socialScriptData.captions.full_description) && (
-                      <div className="p-3.5 rounded-xl bg-[#181a1f] border border-[#26282e] space-y-2 flex flex-col justify-between">
-                        <div>
-                          <div className="flex items-center justify-between mb-1.5">
-                            <span className="text-[10px] font-bold text-red-300 uppercase tracking-wider">
-                              ▶️ YouTube Description
-                            </span>
-                            <button
-                              onClick={() => copyToClipboard(socialScriptData?.captions?.youtube_shorts || socialScriptData?.captions?.full_description || '', 'desc-yt')}
-                              className="text-[10px] text-zinc-400 hover:text-white font-semibold flex items-center gap-1 cursor-pointer"
-                            >
-                              {copiedKey === 'desc-yt' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                              <span>{copiedKey === 'desc-yt' ? 'Copied' : 'Copy'}</span>
-                            </button>
-                          </div>
-                          <p className="text-[11px] text-zinc-300 whitespace-pre-line select-text line-clamp-6">
-                            {socialScriptData.captions.youtube_shorts || socialScriptData.captions.full_description}
-                          </p>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* 4. Trending Hashtags Cloud */}
-              {socialScriptData?.hashtags && socialScriptData.hashtags.length > 0 && (
-                <div className="p-4 rounded-2xl bg-[#181a1f] border border-[#26282e] space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
-                      <Hash className="w-3.5 h-3.5 text-indigo-400" />
-                      Trending Hashtags ({socialScriptData.hashtags.length} Tags)
-                    </span>
-                    <button
-                      onClick={() => {
-                        const allFormatted = (socialScriptData.hashtags || []).map((t) => {
-                          const clean = String(t || '').trim().replace(/^#+/, '').replace(/\s+/g, '');
-                          return clean ? `#${clean}` : '';
-                        }).filter(Boolean);
-                        copyToClipboard(allFormatted.join(' '), 'tags-all');
-                      }}
-                      className="px-2.5 py-1 rounded-lg bg-indigo-600/30 hover:bg-indigo-600 text-indigo-200 hover:text-white text-[11px] font-bold border border-indigo-500/30 flex items-center gap-1 transition-all cursor-pointer"
-                    >
-                      {copiedKey === 'tags-all' ? <Check className="w-3 h-3 text-emerald-300" /> : <Copy className="w-3 h-3" />}
-                      <span>{copiedKey === 'tags-all' ? 'All Copied!' : 'Copy All Hashtags'}</span>
-                    </button>
-                  </div>
-
-                  <div className="flex flex-wrap gap-1.5">
-                    {socialScriptData.hashtags.map((tag, idx) => {
-                      const cleanTag = String(tag || '').trim().replace(/^#+/, '').replace(/\s+/g, '');
-                      const formattedTag = cleanTag ? `#${cleanTag}` : tag;
-                      const isTagCopied = copiedKey === `tag-${idx}`;
-                      return (
-                        <button
-                          key={idx}
-                          onClick={() => copyToClipboard(formattedTag, `tag-${idx}`)}
-                          className="px-2 py-0.5 rounded-lg bg-[#222633] hover:bg-purple-900/40 text-zinc-300 hover:text-purple-200 text-[11px] font-mono border border-white/5 hover:border-purple-500/30 transition-colors flex items-center gap-1 cursor-pointer"
-                          title="Click to copy single hashtag"
-                        >
-                          <span>{formattedTag}</span>
-                          {isTagCopied && <Check className="w-2.5 h-2.5 text-emerald-400" />}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {/* 4.5. YouTube Studio SEO Tags (Comma-separated) */}
-              {socialScriptData?.seo_keywords && socialScriptData.seo_keywords.length > 0 && (
-                <div className="p-4 rounded-2xl bg-[#181a1f] border border-[#26282e] space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-emerald-300 uppercase tracking-wider flex items-center gap-1.5 font-khmer">
-                      <span>🏷️</span> YouTube Studio SEO Tags ({socialScriptData.seo_keywords.length} Keywords)
-                    </span>
-                    <button
-                      onClick={() => copyToClipboard((socialScriptData.seo_keywords || []).join(', '), 'seo-tags-all')}
-                      className="px-2.5 py-1 rounded-lg bg-emerald-600/30 hover:bg-emerald-600 text-emerald-200 hover:text-white text-[11px] font-bold border border-emerald-500/30 flex items-center gap-1 transition-all cursor-pointer"
-                    >
-                      {copiedKey === 'seo-tags-all' ? <Check className="w-3 h-3 text-white" /> : <Copy className="w-3 h-3" />}
-                      <span>{copiedKey === 'seo-tags-all' ? 'All Copied!' : 'Copy for YouTube Studio (Comma Separated)'}</span>
-                    </button>
-                  </div>
-                  <p className="text-[11px] text-zinc-400 font-khmer leading-relaxed">
-                    ពាក្យគន្លឹះទាំងនេះបំបែកដោយសញ្ញាក្បៀស (,) អាច Copy យកទៅ Paste ផ្ទាល់ក្នុងប្រអប់ Tags នៃ YouTube Studio ដើម្បីបង្កើនលំដាប់ Ranking ស្វែងរក៖
-                  </p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {socialScriptData.seo_keywords.map((kw, idx) => {
-                      const isKwCopied = copiedKey === `kw-${idx}`;
-                      return (
-                        <button
-                          key={idx}
-                          onClick={() => copyToClipboard(kw, `kw-${idx}`)}
-                          className="px-2 py-0.5 rounded-lg bg-[#1a2920] hover:bg-emerald-900/40 text-emerald-300 hover:text-emerald-100 text-[11px] font-khmer border border-emerald-500/20 hover:border-emerald-400/40 transition-colors flex items-center gap-1 cursor-pointer"
-                          title="Click to copy single tag"
-                        >
-                          <span>{kw}</span>
-                          {isKwCopied && <Check className="w-2.5 h-2.5 text-emerald-400" />}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {/* 5. Pinned Comment & Engagement CTA */}
-              {socialScriptData?.pinned_comment && (
-                <div className="p-3.5 rounded-xl bg-[#181a1f] border border-[#26282e] space-y-1.5">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-yellow-400 uppercase tracking-wider flex items-center gap-1">
-                      <MessageSquare className="w-3 h-3 text-yellow-400" />
-                      Pinned Comment Hook (ខមមិនទាក់ទាញអ្នកទស្សនា)
-                    </span>
-                    <button
-                      onClick={() => copyToClipboard(socialScriptData.pinned_comment || '', 'comment')}
-                      className="text-[10px] text-zinc-400 hover:text-white font-semibold flex items-center gap-1 cursor-pointer"
-                    >
-                      {copiedKey === 'comment' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                      <span>{copiedKey === 'comment' ? 'Copied' : 'Copy'}</span>
-                    </button>
-                  </div>
-                  <p className="text-xs text-zinc-300 select-text bg-black/30 p-2 rounded-lg border border-white/5">
-                    {socialScriptData.pinned_comment}
-                  </p>
-                </div>
-              )}
-
-              {/* 6. High-CTR Thumbnail Text Overlays */}
-              {socialScriptData?.thumbnail_text_ideas && socialScriptData.thumbnail_text_ideas.length > 0 && (
-                <div className="p-4 rounded-2xl bg-gradient-to-br from-[#1b1926] via-[#161822] to-[#12131a] border border-amber-500/25 space-y-3 shadow-lg">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-amber-300 uppercase tracking-wider flex items-center gap-1.5 font-khmer">
-                      <span>🖼️</span> Thumbnail Cover Text Ideas (ពាក្យគន្លឹះដាក់លើផ្ទាំងរូបភាព Thumbnail)
-                    </span>
-                    <span className="text-[10px] text-amber-400/80 font-mono">
-                      High-CTR Overlays
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-zinc-400 font-khmer leading-relaxed">
-                    ប្រើពាក្យខ្លីៗទាំងនេះ (3-4 ពាក្យ) ដាក់ជាអក្សរធំៗ ពណ៌លឿង ឬសកាត់ខ្មៅ លើផ្ទាំងរូបភាព Thumbnail ដើម្បីទាក់ទាញភ្នែកអ្នកទស្សនា៖
-                  </p>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    {socialScriptData.thumbnail_text_ideas.map((idea, idx) => {
-                      const isThumbCopied = copiedKey === `thumb-${idx}`;
-                      return (
-                        <div
-                          key={idx}
-                          className="p-3 rounded-xl bg-black/40 hover:bg-black/60 border border-amber-500/20 hover:border-amber-400/50 transition-all flex items-center justify-between gap-2 group"
-                        >
-                          <span className="text-xs font-bold text-amber-200 font-khmer select-text">
-                            {idea}
-                          </span>
-                          <button
-                            onClick={() => copyToClipboard(idea, `thumb-${idx}`)}
-                            className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold flex items-center gap-1 shrink-0 transition-all cursor-pointer ${
-                              isThumbCopied
-                                ? 'bg-emerald-600 text-white'
-                                : 'bg-amber-500/20 hover:bg-amber-500/40 text-amber-300 border border-amber-500/30'
-                            }`}
-                          >
-                            {isThumbCopied ? (
-                              <>
-                                <Check className="w-3 h-3 text-white" />
-                                <span>Copied</span>
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="w-3 h-3" />
-                                <span>Copy Text</span>
-                              </>
-                            )}
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </div>
+          {/* TITLES & TAGS TAB */}
+          {tab === 'metadata' && currentProject && (
+            <TitlesTagsPanel
+              projectId={currentProject.id}
+              hasCaptions={(currentProject.segments || []).some((seg) => (seg.text || '').trim())}
+              videoSrc={videoSrc || undefined}
+              onUseAsFileName={(title: string) => setExportName(title)}
+            />
           )}
 
-          {/* VIDEO EXPORT TAB */}
+          {/* VIDEO TAB */}
           {tab === 'video' && (
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-              {/* Left Column: Live Video & Subtitle Preview Player */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+              {/* Left: the preview, what will be made, and how the render is going — kept in view */}
               <div className="lg:col-span-5 space-y-3 lg:sticky lg:top-0">
-                <div className="w-full rounded-2xl overflow-hidden border border-white/10 bg-[#090a0d] shadow-2xl flex flex-col relative group">
-                  {/* Monitor Top Status Bar */}
-                  <div className="px-3 py-2 bg-[#12141a]/90 border-b border-white/5 flex items-center justify-between text-[10px] text-zinc-400">
-                    <div className="flex items-center gap-1.5 font-mono">
-                      <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                      <span className="font-bold text-zinc-300">STUDIO MONITOR</span>
-                    </div>
-                    <span className="font-mono text-zinc-400">
-                      {selectedPreset.ratio} ({selectedPreset.width}×{selectedPreset.height})
-                    </span>
-                  </div>
-
-                  {/* Centered Preview Canvas Stage */}
-                  <div className="w-full bg-[#07080a] py-3 px-3 flex items-center justify-center min-h-[340px]">
+                <div className="w-full rounded-2xl overflow-hidden border border-white/10 bg-[var(--s0)] flex flex-col relative group">
+                  <div className="w-full bg-[var(--s0)] p-3 flex items-center justify-center min-h-[300px]">
                     <div
                       ref={previewBoxRef}
-                      className="relative cursor-pointer bg-black rounded-xl flex items-center justify-center overflow-hidden mx-auto shadow-2xl border border-white/10"
+                      className="relative cursor-pointer bg-black rounded-xl flex items-center justify-center overflow-hidden mx-auto border border-white/10"
                       style={{
                         aspectRatio: `${selectedPreset.width} / ${selectedPreset.height}`,
-                        height: '330px',
+                        height: '300px',
                         maxWidth: '100%',
                       }}
                       onClick={togglePreview}
@@ -1438,6 +1084,8 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                           ref={previewBgRef}
                           src={videoSrc}
                           className="absolute inset-0 w-full h-full object-cover blur-2xl scale-125 opacity-60 pointer-events-none"
+                          // the blurred backdrop is the same film, so it carries the colour filter too
+                          style={filterSteps.length ? { filter: `blur(40px) ${cssFilter(filterSteps)}` } : undefined}
                           preload="metadata"
                           muted
                         />
@@ -1450,102 +1098,133 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                             ? 'w-full h-full object-cover object-center'
                             : 'max-w-full max-h-full object-contain object-center'
                         }`}
+                        style={{ filter: cssFilter(filterSteps) }}
                         preload="metadata"
-                        muted={videoMuted}
+                        muted={previewFilmSilent}
                       />
 
-                    {/* Live Burned-in Subtitles Preview */}
-                    {burnSubtitles &&
-                      (() => {
-                        const segs =
-                          translatedSegments.length > 0
-                            ? translatedSegments
-                            : currentProject?.segments || [];
-                        const seg = segs.find(
-                          (s) =>
-                            currentSourceTime >= s.start_time && currentSourceTime < s.end_time
-                        );
-                        return seg ? (
-                          <div className="absolute inset-0 pointer-events-none z-20 overflow-hidden">
-                            <SubtitleOverlay
-                              text={seg.text}
-                              style={subtitleStyle}
-                              frameHeight={previewBoxH}
-                            />
+                      {/* the captions as they will be burned in */}
+                      {burnSubtitles &&
+                        (() => {
+                          const segs = currentProject?.segments || [];
+                          const seg = segs.find((s) => currentSourceTime >= s.start_time && currentSourceTime < s.end_time);
+                          return seg ? (
+                            <div className="absolute inset-0 pointer-events-none z-20 overflow-hidden">
+                              <SubtitleOverlay text={seg.text} style={subtitleStyle} frameHeight={previewBoxH} />
+                            </div>
+                          ) : null;
+                        })()}
+
+                      {!previewPlaying && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-black/30 pointer-events-none">
+                          <div className="w-11 h-11 rounded-2xl bg-white/20 backdrop-blur-md border border-white/30 flex items-center justify-center text-white transition-transform group-hover:scale-110">
+                            <Play className="w-5 h-5 ml-0.5" />
                           </div>
-                        ) : null;
-                      })()}
-
-                    {/* Play Overlay */}
-                    {!previewPlaying && (
-                      <div className="absolute inset-0 flex items-center justify-center bg-black/30 pointer-events-none backdrop-blur-[2px]">
-                        <div className="w-12 h-12 rounded-2xl bg-white/20 backdrop-blur-md border border-white/30 flex items-center justify-center text-white shadow-2xl transition-transform group-hover:scale-110">
-                          <Play className="w-5 h-5 ml-0.5" />
                         </div>
-                      </div>
-                    )}
+                      )}
+                    </div>
                   </div>
-                </div>
 
-                  {/* Scrubber & Player Controls */}
-                  <div className="p-3 bg-[#13151b] border-t border-white/5 flex items-center gap-3">
+                  <div className="px-3 py-2.5 bg-[var(--s2)] border-t border-white/5 flex items-center gap-3">
                     <button
                       onClick={togglePreview}
+                      aria-label={previewPlaying ? 'Pause preview' : 'Play preview'}
                       className="w-7 h-7 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center text-zinc-200 hover:text-white transition-colors shrink-0 cursor-pointer"
                     >
                       {previewPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 ml-0.5" />}
                     </button>
-
-                    <div
-                      className="flex-1 h-2 bg-[#20232b] rounded-full cursor-pointer relative group"
-                      onClick={seekPreview}
-                    >
+                    <div className="flex-1 h-1.5 bg-[var(--s4)] rounded-full cursor-pointer relative" onClick={seekPreview}>
                       <div
-                        className="h-full bg-gradient-to-r from-pink-500 to-purple-600 rounded-full"
-                        style={{
-                          width: `${
-                            previewTlDuration > 0
-                              ? (previewTime / previewTlDuration) * 100
-                              : 0
-                          }%`,
-                        }}
+                        className="h-full bg-blue-500 rounded-full"
+                        style={{ width: `${previewTlDuration > 0 ? (previewTime / previewTlDuration) * 100 : 0}%` }}
                       />
                     </div>
-
-                    <span className="text-[10px] text-zinc-400 font-mono shrink-0 font-semibold">
+                    <span className="text-[10px] text-zinc-400 font-mono shrink-0">
                       {fmt(previewTime)} / {fmt(previewTlDuration)}
                     </span>
                   </div>
                 </div>
 
-                {/* Estimate Summary Box */}
-                <div className="p-3.5 rounded-2xl bg-[#14161d] border border-white/5 grid grid-cols-3 gap-2 text-center text-xs shadow-sm">
-                  <div className="bg-black/20 p-2 rounded-xl border border-white/5">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block font-semibold">Est. Size</span>
-                    <span className="font-mono font-bold text-emerald-400">~{estimatedSizeMb} MB</span>
-                  </div>
-                  <div className="bg-black/20 p-2 rounded-xl border border-white/5">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block font-semibold">Duration</span>
-                    <span className="font-mono font-bold text-white">{fmt(previewTlDuration)}</span>
-                  </div>
-                  <div className="bg-black/20 p-2 rounded-xl border border-white/5">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block font-semibold">Aspect</span>
-                    <span className="font-mono font-bold text-pink-400">{selectedPreset.ratio}</span>
-                  </div>
+                {/* What you will get, in one place */}
+                <div className="rounded-2xl bg-[var(--s2)] border border-white/5 p-3.5">
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 mb-2">You will get</p>
+                  <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-[11px]">
+                    <dt className="text-zinc-500">Format</dt>
+                    <dd className="text-zinc-200 truncate">
+                      {PLATFORM_LABELS[selectedPreset.id] || selectedPreset.name} · {selectedPreset.ratio}
+                      {selectedPreset.id !== 'custom' && <span className="text-zinc-500"> · {selectedPreset.res}</span>}
+                    </dd>
+                    <dt className="text-zinc-500">Length</dt>
+                    <dd className="text-zinc-200">
+                      {fmt(activeExportDuration)}
+                      {trimEnabled && <span className="text-zinc-500"> · {fmt(parsedStart)}–{fmt(parsedEnd)}</span>}
+                      {splitEnabled && <span className="text-zinc-500"> · in {splitDuration}s parts (.zip)</span>}
+                    </dd>
+                    <dt className="text-zinc-500">Size</dt>
+                    <dd className="text-zinc-200" title="The most this export can come to. A source that is already small exports smaller.">
+                      up to ~{estimatedSizeMb} MB <span className="text-zinc-500">· {QUALITY_LABELS[quality]}</span>
+                    </dd>
+                    <dt className="text-zinc-500">Captions</dt>
+                    <dd className="text-zinc-200">{burnSubtitles ? 'Burned in' : 'None'}</dd>
+                    <dt className="text-zinc-500">Sound</dt>
+                    <dd className="text-zinc-200 truncate">{AUDIO_LABELS[bgAudio]}</dd>
+                    <dt className="text-zinc-500">Saved as</dt>
+                    <dd className="text-zinc-200 truncate" title={`${exportFolder ? `${exportFolder}/` : ''}${exportName || 'export'}.mp4`}>
+                      {exportName || 'export'}.mp4
+                      {exportFolder && <span className="text-zinc-500"> in {exportFolder.split('/').filter(Boolean).pop()}</span>}
+                    </dd>
+                  </dl>
                 </div>
+
+                {/* How the render is going */}
+                {exporting && (
+                  <div role="status" className="p-3.5 rounded-2xl bg-blue-600/10 border border-blue-500/30 space-y-2">
+                    <div className="flex items-center justify-between text-xs gap-2">
+                      <span className="font-semibold text-zinc-100 flex items-center gap-2 min-w-0">
+                        <Loader2 className="w-4 h-4 animate-spin text-blue-300 shrink-0" />
+                        <span className="truncate">{statusMessage || 'Rendering…'}</span>
+                      </span>
+                      <span className="font-mono font-bold text-white shrink-0">{progress}%</span>
+                    </div>
+                    <div className="w-full h-1.5 bg-black/40 rounded-full overflow-hidden">
+                      <div className="h-full bg-blue-500 rounded-full transition-all duration-300" style={{ width: `${Math.max(2, progress)}%` }} />
+                    </div>
+                  </div>
+                )}
+                {error && (
+                  <div role="alert" className="p-3 rounded-2xl bg-red-950/60 border border-red-800 text-red-200 text-xs leading-relaxed">{error}</div>
+                )}
+                {done && (
+                  <div role="status" className="p-3.5 rounded-2xl bg-emerald-950/50 border border-emerald-700/60 text-emerald-100 text-xs space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="flex items-center gap-2 font-bold"><CheckCircle2 className="w-4 h-4 text-emerald-400" /> Video saved</span>
+                      {savedLocalPath && (
+                        <button
+                          type="button"
+                          onClick={() => openFolderInSystem(savedLocalPath)}
+                          className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                        >
+                          <FolderOpen className="w-3.5 h-3.5" /> Show in Finder
+                        </button>
+                      )}
+                    </div>
+                    {savedLocalPath && <p className="text-[11px] text-emerald-300/90 font-mono truncate" title={savedLocalPath}>{savedLocalPath}</p>}
+                    <button
+                      type="button"
+                      onClick={() => setTab('metadata')}
+                      className="w-full px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-[11px] font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" /> Next: titles & tags to post it with
+                    </button>
+                  </div>
+                )}
               </div>
 
-              {/* Right Column: Export Settings */}
-              <div className="lg:col-span-7 space-y-4">
-                {/* Platform Presets */}
-                <div className="p-4 rounded-2xl bg-[#14161d] border border-white/5 space-y-2.5 shadow-sm">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[11px] font-bold text-zinc-300 uppercase tracking-wider block flex items-center gap-1.5">
-                      <Monitor className="w-3.5 h-3.5 text-pink-400" />
-                      Platform & Aspect Ratio
-                    </span>
-                    <span className="text-[10px] text-zinc-500 font-mono">Select target format</span>
-                  </div>
+              {/* Right: the choices, most-used first */}
+              <div className="lg:col-span-7 space-y-3.5">
+                {/* 1. Format and framing */}
+                <section className={sectionClass}>
+                  {sectionTitle(1, 'Format')}
                   <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                     {PLATFORM_PRESETS.map((p) => {
                       const isActive = selectedPlatform === p.id;
@@ -1554,820 +1233,491 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
                           key={p.id}
                           type="button"
                           onClick={() => setSelectedPlatform(p.id)}
-                          className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
-                            isActive
-                              ? 'bg-pink-500/15 border-pink-500 text-white shadow-md shadow-pink-500/10 ring-1 ring-pink-500/40'
-                              : 'bg-[#181a22] border-white/5 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                          aria-pressed={isActive}
+                          className={`flex items-center gap-2.5 p-2.5 rounded-xl border text-left transition-colors cursor-pointer ${
+                            isActive ? 'bg-blue-600/15 border-blue-500/70 ring-1 ring-blue-500/30' : 'bg-[var(--s3)] border-white/5 hover:border-zinc-600'
                           }`}
                         >
-                          <div className="flex items-center justify-between mb-1">
-                            <span className="text-base">{p.icon}</span>
-                            {p.badge && (
-                              <span className="text-[9px] px-1.5 py-0.2 rounded bg-pink-500/20 text-pink-300 font-semibold">
-                                {p.badge}
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-xs font-bold text-white truncate">{p.name}</p>
-                          <p className="text-[10px] text-zinc-400 font-mono mt-0.5">
-                            {p.ratio} · {p.res}
-                          </p>
+                          {/* the frame's shape, drawn */}
+                          <span className="w-7 h-7 flex items-center justify-center shrink-0">
+                            <span
+                              className={`block rounded-[3px] border-2 ${isActive ? 'border-blue-300' : 'border-zinc-500'}`}
+                              style={p.id === 'custom'
+                                ? { width: 18, height: 18, borderStyle: 'dashed' }
+                                : p.width >= p.height
+                                  ? { width: 26, height: Math.max(8, Math.round((26 * p.height) / p.width)) }
+                                  : { height: 26, width: Math.max(8, Math.round((26 * p.width) / p.height)) }}
+                            />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="block text-xs font-semibold text-white truncate">{PLATFORM_LABELS[p.id] || p.name}</span>
+                            <span className="block text-[10px] text-zinc-400">{p.id === 'custom' ? 'Same as the video' : p.ratio}</span>
+                          </span>
                         </button>
                       );
                     })}
                   </div>
-                </div>
-
-                {/* Video Format & Resolution */}
-                <div className="p-4 rounded-2xl bg-[#14161d] border border-white/5 space-y-3 shadow-sm">
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="space-y-1.5">
-                      <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
-                        Video Container
-                      </span>
-                      <div className="grid grid-cols-3 gap-1 bg-[#181a22] border border-white/5 rounded-xl p-1">
-                        {[
-                          { id: 'mp4', label: 'MP4', badge: 'H.264' },
-                          { id: 'mov', label: 'MOV', badge: 'Apple' },
-                          { id: 'webm', label: 'WebM', badge: 'Web' },
-                        ].map((f) => (
-                          <button
-                            key={f.id}
-                            type="button"
-                            onClick={() => setVideoFormat(f.id as any)}
-                            className={`py-1.5 px-1 rounded-lg text-center transition-all cursor-pointer ${
-                              videoFormat === f.id
-                                ? 'bg-pink-600 text-white font-bold shadow-sm'
-                                : 'text-zinc-400 hover:text-white hover:bg-white/5'
-                            }`}
-                          >
-                            <p className="text-xs font-bold leading-none">{f.label}</p>
-                            <p className="text-[9px] opacity-70 mt-0.5">{f.badge}</p>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
-                        Resolution
-                      </span>
-                      <div className="grid grid-cols-3 gap-1 bg-[#181a22] border border-white/5 rounded-xl p-1">
-                        {[
-                          { id: '1080p', label: '1080p', badge: 'FHD' },
-                          { id: '4k', label: '4K', badge: 'UHD' },
-                          { id: '720p', label: '720p', badge: 'HD' },
-                        ].map((q) => (
-                          <button
-                            key={q.id}
-                            type="button"
-                            onClick={() => setVideoQuality(q.id as any)}
-                            className={`py-1.5 px-1 rounded-lg text-center transition-all cursor-pointer ${
-                              videoQuality === q.id
-                                ? 'bg-purple-600 text-white font-bold shadow-sm'
-                                : 'text-zinc-400 hover:text-white hover:bg-white/5'
-                            }`}
-                          >
-                            <p className="text-xs font-bold leading-none">{q.label}</p>
-                            <p className="text-[9px] opacity-70 mt-0.5">{q.badge}</p>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Quality Profiles */}
-                  <div className="space-y-1.5 pt-1">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
-                        File Size & Bitrate Profile
-                      </span>
-                      <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full font-bold">
-                        Est. Output: ~{estimatedSizeMb} MB
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-2">
+                  <div className="flex flex-wrap items-center gap-3 pt-1">
+                    <span className="text-[11px] text-zinc-400">When the video is a different shape</span>
+                    <div className="flex gap-1 bg-[var(--s3)] border border-white/5 rounded-xl p-1">
                       {[
-                        {
-                          id: 'compact',
-                          icon: '⚡',
-                          label: 'Compact / Web',
-                          badge: '~70% Smaller',
-                          desc: '~2.2 Mbps · Fast Share',
-                        },
-                        {
-                          id: 'standard',
-                          icon: '✨',
-                          label: 'Standard HD',
-                          badge: 'Balanced',
-                          desc: '~3.8 Mbps · Crisp 1080p',
-                        },
-                        {
-                          id: 'high',
-                          icon: '💎',
-                          label: 'High Bitrate',
-                          badge: 'Master',
-                          desc: '~6.5 Mbps · Pristine Detail',
-                        },
-                      ].map((opt) => (
+                        { id: 'blur', label: 'Blur the edges' },
+                        { id: 'fit', label: 'Black bars' },
+                        { id: 'fill', label: 'Crop to fill' },
+                      ].map((mode) => (
                         <button
-                          key={opt.id}
+                          key={mode.id}
                           type="button"
-                          onClick={() => setQuality(opt.id as any)}
-                          className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
-                            quality === opt.id
-                              ? 'bg-emerald-500/15 border-emerald-500/70 text-white shadow-sm ring-1 ring-emerald-500/30'
-                              : 'bg-[#181a22] border-white/5 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                          onClick={() => setScaleMode(mode.id as any)}
+                          aria-pressed={scaleMode === mode.id}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer ${
+                            scaleMode === mode.id ? 'bg-blue-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-white/5'
                           }`}
                         >
-                          <div className="flex items-center justify-between gap-1 mb-1">
-                            <span className="text-xs">{opt.icon}</span>
-                            <span
-                              className={`text-[9px] font-bold px-1.5 py-0.2 rounded-md ${
-                                quality === opt.id
-                                  ? 'bg-emerald-500/30 text-emerald-300'
-                                  : 'bg-white/5 text-zinc-400'
-                              }`}
-                            >
-                              {opt.badge}
-                            </span>
-                          </div>
-                          <p className="text-xs font-bold text-white leading-tight">{opt.label}</p>
-                          <p className="text-[9.5px] text-zinc-400 mt-0.5">{opt.desc}</p>
+                          {mode.label}
                         </button>
                       ))}
                     </div>
                   </div>
-                </div>
+                  {filterSteps.length > 0 && (
+                    <p className="text-[11px] text-blue-200/90 bg-blue-600/10 border border-blue-500/30 rounded-xl px-2.5 py-1.5">
+                      Colour filter: <span className="font-semibold">{FILTER_PRESETS.find((f) => f.id === videoFilter.preset && f.id !== 'none')?.name || 'Adjusted'}</span>
+                      {' '}— rendered in, as in the preview. Change it with Filter above the player.
+                    </p>
+                  )}
+                </section>
 
-                {/* Video Trimming & Clip Cutting */}
-                <div className="p-4 rounded-2xl bg-[#14161d] border border-white/5 space-y-3 shadow-sm">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <div className="w-7 h-7 rounded-xl bg-pink-500/15 text-pink-400 flex items-center justify-center border border-pink-500/20">
-                        <Scissors className="w-3.5 h-3.5" />
-                      </div>
-                      <div>
-                        <span className="text-xs font-bold text-white block leading-tight">
-                          Trim Video (Clip Cutting)
-                        </span>
-                        <p className="text-[10px] text-zinc-400">
-                          {trimEnabled
-                            ? `Range: ${fmt(parsedStart)} → ${fmt(parsedEnd)} (${fmt(activeExportDuration)})`
-                            : `Full Video (${fmt(previewTlDuration)})`}
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const next = !trimEnabled;
-                        setTrimEnabled(next);
-                        if (next && (!endTime || endTime === '' || endTime === '0')) {
-                          setEndTime(previewTlDuration.toFixed(1));
-                        }
-                      }}
-                      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors cursor-pointer ${
-                        trimEnabled ? 'bg-pink-600' : 'bg-zinc-700'
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-                          trimEnabled ? 'translate-x-4' : 'translate-x-1'
+                {/* 2. Quality */}
+                <section className={sectionClass}>
+                  {sectionTitle(2, 'Quality', `up to ~${estimatedSizeMb} MB`)}
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      { id: 'compact', label: 'Small file', desc: 'Quick to upload · ~2 Mbps' },
+                      { id: 'standard', label: 'Standard', desc: 'Sharp on phones · ~4 Mbps' },
+                      { id: 'high', label: 'Best', desc: 'Most detail · ~6.5 Mbps' },
+                    ].map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setQuality(opt.id as any)}
+                        aria-pressed={quality === opt.id}
+                        className={`p-2.5 rounded-xl border text-left transition-colors cursor-pointer ${
+                          quality === opt.id ? 'bg-blue-600/15 border-blue-500/70 ring-1 ring-blue-500/30' : 'bg-[var(--s3)] border-white/5 hover:border-zinc-600'
                         }`}
-                      />
-                    </button>
+                      >
+                        <span className="block text-xs font-semibold text-white">{opt.label}</span>
+                        <span className="block text-[10px] text-zinc-400 mt-0.5">{opt.desc}</span>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+
+                {/* 3. Captions and sound */}
+                <section className={sectionClass}>
+                  {sectionTitle(3, 'Captions & sound')}
+                  <div className="flex flex-wrap gap-2">
+                    <label className="flex items-center gap-2 px-3 py-2 rounded-xl bg-[var(--s3)] border border-white/5 cursor-pointer hover:border-white/10">
+                      <input type="checkbox" checked={burnSubtitles} onChange={(e) => setBurnSubtitles(e.target.checked)} className="accent-blue-500 cursor-pointer" />
+                      <span className="text-xs text-zinc-200">Burn the captions in</span>
+                    </label>
+                    {blurAreas.length > 0 && (
+                      <label className="flex items-center gap-2 px-3 py-2 rounded-xl bg-[var(--s3)] border border-white/5 cursor-pointer hover:border-white/10">
+                        <input type="checkbox" checked={applyBlur} onChange={(e) => setApplyBlur(e.target.checked)} className="accent-blue-500 cursor-pointer" />
+                        <span className="text-xs text-zinc-200">Blur {blurAreas.length} area{blurAreas.length > 1 ? 's' : ''}</span>
+                      </label>
+                    )}
                   </div>
 
-                  {trimEnabled && (
-                    <div className="space-y-3 pt-2 border-t border-white/5 animate-in fade-in">
-                      {/* Quick Presets */}
-                      <div className="space-y-1.5">
-                        <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
-                          Quick Range Presets
-                        </span>
-                        <div className="grid grid-cols-4 gap-1.5">
-                          {[
-                            { label: '⚡ First 60s', s: 0, e: Math.min(60, previewTlDuration || 60) },
-                            { label: '⏱️ First 3m', s: 0, e: Math.min(180, previewTlDuration || 180) },
-                            { label: '🎬 First 5m', s: 0, e: Math.min(300, previewTlDuration || 300) },
-                            { label: '🔄 Full Video', s: 0, e: previewTlDuration || 0 },
-                          ].map((pre, idx) => (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {(Object.keys(AUDIO_LABELS) as (keyof typeof AUDIO_LABELS)[]).map((id) => (
+                      <button
+                        key={id}
+                        type="button"
+                        onClick={() => setBgAudio(id as any)}
+                        aria-pressed={bgAudio === id}
+                        className={`p-2.5 rounded-xl border text-left transition-colors cursor-pointer ${
+                          bgAudio === id ? 'bg-blue-600/15 border-blue-500/70 ring-1 ring-blue-500/30' : 'bg-[var(--s3)] border-white/5 hover:border-zinc-600'
+                        }`}
+                      >
+                        <span className="block text-xs font-semibold text-white">{AUDIO_LABELS[id]}</span>
+                        <span className="block text-[10px] text-zinc-400 mt-0.5">{AUDIO_HINTS[id]}</span>
+                      </button>
+                    ))}
+                  </div>
+
+                  {bgAudio !== 'none' && (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-zinc-300">{bgAudio === 'original_clean' ? 'Video volume' : 'Music volume'}</span>
+                        <span className="font-mono text-zinc-300">{Math.round(bgmVolume * 100)}%</span>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="range" min="0" max="1" step="0.05" value={bgmVolume}
+                          onChange={(e) => setVolume(Number(e.target.value))}
+                          aria-label="Background volume"
+                          className="flex-1 h-1.5 bg-zinc-800 accent-blue-500 rounded-lg cursor-pointer"
+                        />
+                        <div className="flex gap-1">
+                          {[0.2, 0.35, 0.6, 1].map((v) => (
                             <button
-                              key={idx}
+                              key={v}
                               type="button"
-                              onClick={() => {
-                                setStartTime(pre.s.toString());
-                                setEndTime(pre.e.toFixed(1));
-                              }}
-                              className="py-1 px-1.5 rounded-lg bg-[#181a22] hover:bg-[#222530] border border-white/5 text-[10px] font-medium text-zinc-300 text-center transition-colors truncate cursor-pointer"
+                              onClick={() => setVolume(v)}
+                              className={`px-1.5 py-0.5 rounded-md text-[10px] font-semibold cursor-pointer ${
+                                Math.abs(bgmVolume - v) < 0.04 ? 'bg-blue-600 text-white' : 'bg-[var(--s3)] text-zinc-400 hover:text-white'
+                              }`}
                             >
-                              {pre.label}
+                              {Math.round(v * 100)}
                             </button>
                           ))}
                         </div>
                       </div>
-
-                      {/* Visual Range Bar */}
-                      {previewTlDuration > 0 && (
-                        <div className="space-y-1 bg-black/20 p-2.5 rounded-xl border border-white/5">
-                          <div className="flex justify-between text-[10px] text-zinc-400 font-mono">
-                            <span>Start: {fmt(parsedStart)}</span>
-                            <span className="text-pink-400 font-bold">Selected: {fmt(activeExportDuration)}</span>
-                            <span>End: {fmt(parsedEnd)}</span>
-                          </div>
-                          <div className="relative h-2.5 bg-zinc-800/80 rounded-full overflow-hidden">
-                            <div
-                              className="absolute top-0 bottom-0 bg-gradient-to-r from-pink-500 to-purple-600 rounded-full shadow-sm"
-                              style={{
-                                left: `${Math.max(0, Math.min(100, (parsedStart / previewTlDuration) * 100))}%`,
-                                width: `${Math.max(
-                                  1,
-                                  Math.min(100, (activeExportDuration / previewTlDuration) * 100)
-                                )}%`,
-                              }}
-                            />
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Precise Start & End Time Inputs */}
-                      <div className="grid grid-cols-2 gap-2.5">
-                        <div className="space-y-1.5 bg-black/20 p-2.5 rounded-xl border border-white/5">
-                          <div className="flex items-center justify-between">
-                            <label className="text-[10px] font-bold text-zinc-400 uppercase">
-                              Start Time (sec)
-                            </label>
-                            <span className="text-[10px] font-mono text-pink-400 font-bold">
-                              {fmt(parsedStart)}
-                            </span>
-                          </div>
-                          <input
-                            type="number"
-                            step="0.5"
-                            min="0"
-                            max={parsedEnd}
-                            value={startTime}
-                            onChange={(e) => setStartTime(e.target.value)}
-                            className="w-full bg-[#181a22] border border-white/10 focus:border-pink-500 rounded-lg px-2.5 py-1 text-xs text-white font-mono focus:outline-none transition-colors"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => setStartTime(previewTime.toFixed(1))}
-                            className="w-full text-[9px] text-zinc-400 hover:text-white bg-white/5 hover:bg-white/10 py-1 rounded-lg text-center transition-colors cursor-pointer"
-                          >
-                            📍 Set at Playhead ({fmt(previewTime)})
-                          </button>
-                        </div>
-
-                        <div className="space-y-1.5 bg-black/20 p-2.5 rounded-xl border border-white/5">
-                          <div className="flex items-center justify-between">
-                            <label className="text-[10px] font-bold text-zinc-400 uppercase">
-                              End Time (sec)
-                            </label>
-                            <span className="text-[10px] font-mono text-pink-400 font-bold">
-                              {fmt(parsedEnd)}
-                            </span>
-                          </div>
-                          <input
-                            type="number"
-                            step="0.5"
-                            min={parsedStart}
-                            max={previewTlDuration || 999999}
-                            value={endTime}
-                            onChange={(e) => setEndTime(e.target.value)}
-                            className="w-full bg-[#181a22] border border-white/10 focus:border-pink-500 rounded-lg px-2.5 py-1 text-xs text-white font-mono focus:outline-none transition-colors"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => setEndTime(previewTime.toFixed(1))}
-                            className="w-full text-[9px] text-zinc-400 hover:text-white bg-white/5 hover:bg-white/10 py-1 rounded-lg text-center transition-colors cursor-pointer"
-                          >
-                            📍 Set at Playhead ({fmt(previewTime)})
-                          </button>
-                        </div>
+                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+                        {bgAudio !== 'original_clean' && (
+                          <label className="flex items-center gap-2 cursor-pointer" title="Music dips while the dubbed voice speaks and returns in the gaps">
+                            <input type="checkbox" checked={duckMusic} onChange={(e) => setDuckMusic(e.target.checked)} className="accent-blue-500 cursor-pointer" />
+                            <span className="text-[11px] text-zinc-300">Lower the music under voices</span>
+                          </label>
+                        )}
+                        <label className="flex items-center gap-2 cursor-pointer" title="Match the loudness streaming platforms expect (-16 LUFS)">
+                          <input type="checkbox" checked={normalizeLoudness} onChange={(e) => setNormalizeLoudness(e.target.checked)} className="accent-blue-500 cursor-pointer" />
+                          <span className="text-[11px] text-zinc-300">Even out loudness for social media</span>
+                        </label>
                       </div>
                     </div>
                   )}
+                </section>
 
-                  {/* Auto Split Option */}
-                  <div className="pt-2 border-t border-white/5">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-1.5">
-                        <SplitSquareHorizontal className="w-3.5 h-3.5 text-purple-400" />
-                        <span className="text-xs font-medium text-zinc-300">
-                          Split into Multi-Part Episodes (.ZIP)
-                        </span>
-                      </div>
+                {/* 4. Where it goes */}
+                <section className={sectionClass}>
+                  {sectionTitle(4, 'Save as')}
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={exportName}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setExportName(val);
+                        if (currentProject?.id) {
+                          if (val.trim()) localStorage.setItem(`meatika_export_name_${currentProject.id}`, val.trim());
+                          else localStorage.removeItem(`meatika_export_name_${currentProject.id}`);
+                        }
+                      }}
+                      aria-label="File name"
+                      className="flex-1 min-w-0 bg-[var(--s3)] border border-white/10 focus:border-blue-500 rounded-xl px-3 py-2 text-xs text-white focus:outline-none"
+                      placeholder="File name"
+                    />
+                    <span className="text-xs text-zinc-400 font-mono shrink-0">.mp4</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!currentProject) return;
+                        setExportName(defaultExportName(currentProject));
+                        localStorage.removeItem(`meatika_export_name_${currentProject.id}`);
+                      }}
+                      className="text-[11px] text-zinc-500 hover:text-zinc-200 shrink-0 cursor-pointer"
+                      title="Use the project's name"
+                    >
+                      Reset
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="relative flex-1 min-w-[200px]">
+                      <Folder className="w-3.5 h-3.5 text-zinc-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                       <input
-                        type="checkbox"
-                        checked={splitEnabled}
-                        onChange={(e) => setSplitEnabled(e.target.checked)}
-                        className="rounded accent-purple-500 cursor-pointer"
+                        type="text"
+                        value={exportFolder}
+                        onChange={(e) => chooseFolder(e.target.value)}
+                        aria-label="Folder"
+                        className="w-full bg-[var(--s3)] border border-white/10 focus:border-blue-500 rounded-xl pl-8 pr-3 py-2 text-[11px] text-zinc-200 font-mono focus:outline-none"
+                        placeholder="/Users/you/Downloads"
                       />
                     </div>
-
-                    {splitEnabled && (
-                      <div className="mt-2 grid grid-cols-4 gap-1 bg-[#181a22] p-1 rounded-xl border border-white/5 animate-in fade-in">
-                        {[
-                          { id: '60', label: '60s (1m)' },
-                          { id: '90', label: '90s (1.5m)' },
-                          { id: '180', label: '180s (3m)' },
-                          { id: '300', label: '300s (5m)' },
-                        ].map((part) => (
-                          <button
-                            key={part.id}
-                            type="button"
-                            onClick={() => setSplitDuration(part.id)}
-                            className={`py-1 px-1 rounded-lg text-center text-[10px] font-bold transition-colors cursor-pointer ${
-                              splitDuration === part.id
-                                ? 'bg-purple-600 text-white shadow-sm'
-                                : 'text-zinc-400 hover:text-white hover:bg-white/5'
-                            }`}
-                          >
-                            {part.label}
-                          </button>
-                        ))}
-                      </div>
+                    <button
+                      type="button"
+                      onClick={async () => { const selected = await selectFolderInSystem(); if (selected) chooseFolder(selected); }}
+                      className="px-3 py-2 bg-[var(--s3)] border border-white/10 hover:bg-white/5 text-zinc-200 rounded-xl text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <FolderPlus className="w-3.5 h-3.5" /> Choose…
+                    </button>
+                    {exportFolder && (
+                      <button
+                        type="button"
+                        onClick={() => openFolderInSystem(exportFolder)}
+                        title="Open this folder in Finder"
+                        aria-label="Open the folder in Finder"
+                        className="p-2 bg-[var(--s3)] border border-white/10 hover:bg-white/5 text-zinc-300 rounded-xl cursor-pointer"
+                      >
+                        <FolderOpen className="w-3.5 h-3.5" />
+                      </button>
                     )}
                   </div>
-                </div>
-
-                {/* Subtitle & Audio Options */}
-                <div className="p-4 rounded-2xl bg-[#14161d] border border-white/5 space-y-3.5 shadow-sm">
-                  {/* Framing & Captions Burn-in */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div className="space-y-1.5">
-                      <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
-                        Captions Burn-in
-                      </span>
-                      <label className="flex items-center gap-2 p-2 rounded-xl bg-[#181a22] border border-white/5 cursor-pointer hover:border-pink-500/50 transition-colors">
-                        <input
-                          type="checkbox"
-                          checked={burnSubtitles}
-                          onChange={(e) => setBurnSubtitles(e.target.checked)}
-                          className="rounded accent-pink-500 cursor-pointer"
-                        />
-                        <span className="text-xs text-zinc-200 font-medium">Burn Subtitles on Video</span>
-                      </label>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
-                        Framing Mode
-                      </span>
-                      <div className="grid grid-cols-3 gap-1 bg-[#181a22] border border-white/5 rounded-xl p-1">
-                        {[
-                          { id: 'blur', label: 'Blur' },
-                          { id: 'fit', label: 'Fit' },
-                          { id: 'fill', label: 'Crop' },
-                        ].map((mode) => (
-                          <button
-                            key={mode.id}
-                            type="button"
-                            onClick={() => setScaleMode(mode.id as any)}
-                            className={`py-1 px-1 rounded-lg text-center text-xs font-bold transition-all cursor-pointer ${
-                              scaleMode === mode.id
-                                ? 'bg-blue-600 text-white shadow-sm'
-                                : 'text-zinc-400 hover:text-white hover:bg-white/5'
-                            }`}
-                          >
-                            {mode.label}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
+                  <div className="flex flex-wrap gap-1">
+                    {([['Downloads', defaultFolders.downloads], ['Desktop', defaultFolders.desktop], ['Movies', defaultFolders.movies]] as [string, string | undefined][])
+                      .filter(([, path]) => !!path)
+                      .map(([label, path]) => (
+                        <button
+                          key={label}
+                          type="button"
+                          onClick={() => chooseFolder(path!)}
+                          className={`text-[10px] px-2 py-0.5 rounded-md cursor-pointer ${
+                            exportFolder === path ? 'bg-blue-600 text-white font-semibold' : 'bg-white/5 text-zinc-400 hover:text-zinc-200'
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      ))}
                   </div>
+                </section>
 
-                  {/* Audio Mix & Volume */}
-                  <div className="space-y-2 pt-1 border-t border-white/5">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block flex items-center gap-1.5">
-                        <Music className="w-3 h-3 text-pink-400" />
-                        Audio Mix & Background Music
-                      </span>
-                      {bgAudio !== 'none' && (
-                        <span className="text-[10px] font-mono text-pink-400 font-bold bg-pink-500/10 border border-pink-500/20 px-2 py-0.5 rounded-full">
-                          Vol: {Math.round(bgmVolume * 100)}%
-                        </span>
-                      )}
-                    </div>
+                {/* More: the options most exports never touch */}
+                <section className="rounded-2xl bg-[var(--s2)] border border-white/5">
+                  <button
+                    type="button"
+                    onClick={() => setShowMore((v) => !v)}
+                    aria-expanded={showMore}
+                    className="w-full flex items-center justify-between px-4 py-3 text-left cursor-pointer"
+                  >
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-300">More options</span>
+                    <span className="flex items-center gap-2 text-[11px] text-zinc-500">
+                      {moreInUse.length > 0 ? <span className="text-blue-300">{moreInUse.join(' · ')}</span> : 'Trim, split, logo, voice timing'}
+                      <span className={`transition-transform ${showMore ? 'rotate-180' : ''}`}>▾</span>
+                    </span>
+                  </button>
+                  {showMore && (
+                    <div className="px-4 pb-4 space-y-4 border-t border-white/5 pt-3">
+                      {/* Trim */}
+                      <div className="space-y-2">
+                        <label className="flex items-center justify-between gap-2 cursor-pointer">
+                          <span className="flex items-center gap-2 text-xs font-semibold text-white"><Scissors className="w-3.5 h-3.5 text-zinc-400" /> Export only part of the video</span>
+                          <input
+                            type="checkbox"
+                            checked={trimEnabled}
+                            onChange={(e) => {
+                              setTrimEnabled(e.target.checked);
+                              if (e.target.checked && (!endTime || endTime === '0')) setEndTime(previewTlDuration.toFixed(1));
+                            }}
+                            className="accent-blue-500 cursor-pointer"
+                          />
+                        </label>
+                        {trimEnabled && (
+                          <div className="space-y-2 pl-5">
+                            <div className="flex flex-wrap gap-1">
+                              {[
+                                { label: 'First minute', s: 0, e: Math.min(60, previewTlDuration || 60) },
+                                { label: 'First 3 min', s: 0, e: Math.min(180, previewTlDuration || 180) },
+                                { label: 'Whole video', s: 0, e: previewTlDuration || 0 },
+                              ].map((pre) => (
+                                <button key={pre.label} type="button" onClick={() => { setStartTime(String(pre.s)); setEndTime(pre.e.toFixed(1)); }}
+                                  className="px-2 py-1 rounded-lg bg-[var(--s3)] hover:bg-[var(--s4)] text-[10px] text-zinc-300 cursor-pointer">
+                                  {pre.label}
+                                </button>
+                              ))}
+                            </div>
+                            <div className="grid grid-cols-2 gap-2">
+                              {([['From', startTime, setStartTime], ['To', endTime, setEndTime]] as [string, string, (v: string) => void][]).map(([label, value, setter]) => (
+                                <div key={label} className="space-y-1">
+                                  <div className="flex items-center justify-between text-[10px] text-zinc-400">
+                                    <span>{label} (seconds)</span>
+                                    <button type="button" onClick={() => setter(previewTime.toFixed(1))} className="text-blue-400 hover:text-blue-300 cursor-pointer">
+                                      use {fmt(previewTime)}
+                                    </button>
+                                  </div>
+                                  <input type="number" step="0.5" min="0" value={value} onChange={(e) => setter(e.target.value)}
+                                    className="w-full bg-[var(--s3)] border border-white/10 focus:border-blue-500 rounded-lg px-2.5 py-1 text-xs text-white font-mono focus:outline-none" />
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
 
-                    <select
-                      value={bgAudio}
-                      onChange={(e) => setBgAudio(e.target.value as any)}
-                      className="w-full bg-[#181a22] border border-white/10 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-pink-500 transition-colors"
-                    >
-                      <option value="original_clean">🎬 Original Video Audio (Original Track & Voice, No AI Dubbing)</option>
-                      <option value="music">🎵 AI Voice + BGM Only (Original Vocals Removed)</option>
-                      <option value="original">🗣️ AI Voice + Original Audio (With Original Voices)</option>
-                      <option value="none">🔇 AI Voice Only (Muted Background)</option>
-                    </select>
+                      {/* Split */}
+                      <div className="space-y-2">
+                        <label className="flex items-center justify-between gap-2 cursor-pointer">
+                          <span className="flex items-center gap-2 text-xs font-semibold text-white"><SplitSquareHorizontal className="w-3.5 h-3.5 text-zinc-400" /> Cut into short videos (.zip)</span>
+                          <input type="checkbox" checked={splitEnabled} onChange={(e) => setSplitEnabled(e.target.checked)} className="accent-blue-500 cursor-pointer" />
+                        </label>
+                        {splitEnabled && (
+                          <div className="flex gap-1 pl-5">
+                            {['60', '90', '180', '300'].map((sec) => (
+                              <button key={sec} type="button" onClick={() => setSplitDuration(sec)}
+                                className={`px-2.5 py-1 rounded-lg text-[10px] font-semibold cursor-pointer ${splitDuration === sec ? 'bg-blue-600 text-white' : 'bg-[var(--s3)] text-zinc-400 hover:text-white'}`}>
+                                {Number(sec) >= 60 && Number(sec) % 60 === 0 ? `${Number(sec) / 60} min` : `${sec} s`}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
 
-                    {bgAudio !== 'none' && (
-                      <div className="p-3 rounded-xl bg-black/20 border border-white/5 space-y-2.5 animate-in fade-in">
-                        <div className="flex items-center justify-between">
-                          <span className="text-[11px] text-zinc-300 font-medium">
-                            Background Music Track Volume
-                          </span>
-                          <span className="text-xs font-mono font-bold text-pink-400 bg-pink-950/50 px-2 py-0.5 rounded-md border border-pink-500/20">
-                            {Math.round(bgmVolume * 100)}%
-                          </span>
-                        </div>
-                        <input
-                          type="range"
-                          min="0"
-                          max="1"
-                          step="0.05"
-                          value={bgmVolume}
-                          onChange={(e) => {
-                            const v = Number(e.target.value);
-                            setBgmVolume(v);
-                            if (currentProject?.id) {
-                              const key = audioSeparated ? `timeline-bgm-volume-${currentProject.id}` : `timeline-video-volume-${currentProject.id}`;
-                              localStorage.setItem(key, String(v));
-                            }
-                          }}
-                          className="w-full h-1.5 bg-zinc-800 accent-pink-500 rounded-lg cursor-pointer"
-                        />
-                        <div className="flex items-center gap-1.5 pt-0.5">
-                          {[
-                            { label: '🔇 0%', val: 0 },
-                            { label: '🔉 20%', val: 0.2 },
-                            { label: '🎵 35%', val: 0.35 },
-                            { label: '60%', val: 0.6 },
-                            { label: '🔊 100%', val: 1.0 },
-                          ].map((p) => (
-                            <button
-                              key={p.val}
-                              type="button"
-                              onClick={() => {
-                                setBgmVolume(p.val);
-                                if (currentProject?.id) {
-                                  const key = audioSeparated ? `timeline-bgm-volume-${currentProject.id}` : `timeline-video-volume-${currentProject.id}`;
-                                  localStorage.setItem(key, String(p.val));
+                      {/* Logo */}
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input type="checkbox" checked={exportLogoEnabled} onChange={(e) => { setExportLogoEnabled(e.target.checked); keepLogo({ enabled: e.target.checked, url: exportLogoUrl }); }} disabled={!exportLogoUrl} className="accent-blue-500 cursor-pointer" />
+                            <span className="text-xs font-semibold text-white">Logo on the video</span>
+                          </label>
+                          <div className="flex items-center gap-2">
+                            {exportLogoUrl && <img src={exportLogoUrl} alt="" className="h-6 w-auto max-w-[80px] object-contain rounded bg-black/40" />}
+                            <input
+                              ref={exportLogoInputRef}
+                              type="file"
+                              accept="image/png,image/jpeg,image/webp"
+                              className="hidden"
+                              onChange={async (e) => {
+                                const file = e.target.files?.[0];
+                                if (!file || !currentProject?.id) return;
+                                setUploadingLogo(true);
+                                try {
+                                  const res = await uploadProjectLogo(currentProject.id, file);
+                                  setExportLogoUrl(res.url);
+                                  setExportLogoEnabled(true);
+                                  keepLogo({ url: res.url, enabled: true });
+                                } catch {
+                                  /* upload failed; keep the previous logo */
+                                } finally {
+                                  setUploadingLogo(false);
+                                  if (exportLogoInputRef.current) exportLogoInputRef.current.value = '';
                                 }
                               }}
-                              className={`text-[9px] px-1.5 py-0.5 rounded-lg transition-colors flex-1 cursor-pointer ${
-                                Math.abs(bgmVolume - p.val) < 0.04
-                                  ? 'bg-pink-600 text-white font-bold'
-                                  : 'bg-[#181a22] text-zinc-400 hover:text-zinc-200 border border-white/5'
-                              }`}
-                            >
-                              {p.label}
+                            />
+                            <button type="button" onClick={() => exportLogoInputRef.current?.click()} disabled={uploadingLogo}
+                              className="px-2 py-1 rounded-md bg-white/5 hover:bg-white/10 text-[11px] text-zinc-300 hover:text-white cursor-pointer disabled:opacity-50">
+                              {uploadingLogo ? 'Uploading…' : exportLogoUrl ? 'Replace' : 'Upload'}
+                            </button>
+                          </div>
+                        </div>
+                        {exportLogoEnabled && exportLogoUrl && (
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pl-5">
+                            <select value={exportLogoPosition} onChange={(e) => { setExportLogoPosition(e.target.value); keepLogo({ position: e.target.value as any }); }}
+                              className="bg-[var(--s3)] border border-white/5 rounded-lg px-2 py-1.5 text-[11px] text-zinc-200 focus:outline-none focus:border-blue-500">
+                              <option value="top_left">Top left</option>
+                              <option value="top_right">Top right</option>
+                              <option value="bottom_left">Bottom left</option>
+                              <option value="bottom_right">Bottom right</option>
+                              <option value="center">Centre</option>
+                            </select>
+                            <label className="flex items-center gap-2 text-[11px] text-zinc-400">
+                              Size
+                              <input type="range" min={5} max={40} value={exportLogoScalePct} onChange={(e) => { setExportLogoScalePct(Number(e.target.value)); keepLogo({ scale_pct: Number(e.target.value) }); }} className="flex-1 h-1 accent-blue-500 cursor-pointer" />
+                              <span className="font-mono text-zinc-300 w-9 text-right">{exportLogoScalePct}%</span>
+                            </label>
+                            <label className="flex items-center gap-2 text-[11px] text-zinc-400">
+                              Opacity
+                              <input type="range" min={10} max={100} value={Math.round(exportLogoOpacity * 100)} onChange={(e) => { setExportLogoOpacity(Number(e.target.value) / 100); keepLogo({ opacity: Number(e.target.value) / 100 }); }} className="flex-1 h-1 accent-blue-500 cursor-pointer" />
+                              <span className="font-mono text-zinc-300 w-9 text-right">{Math.round(exportLogoOpacity * 100)}%</span>
+                            </label>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Voice timing */}
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-semibold text-white">Voice timing</span>
+                          <span className="font-mono text-[11px] text-zinc-300">
+                            {voiceOffsetMs === 0 ? 'On time' : voiceOffsetMs > 0 ? `${voiceOffsetMs} ms later` : `${-voiceOffsetMs} ms earlier`}
+                          </span>
+                        </div>
+                        <input type="range" min="-500" max="800" step="50" value={voiceOffsetMs} onChange={(e) => setOffset(Number(e.target.value))}
+                          aria-label="Voice timing" className="w-full h-1.5 bg-zinc-800 accent-blue-500 rounded-lg cursor-pointer" />
+                        <div className="flex gap-1">
+                          {[-200, 0, 150, 250, 400].map((v) => (
+                            <button key={v} type="button" onClick={() => setOffset(v)}
+                              className={`flex-1 py-1 text-[10px] font-mono rounded-lg cursor-pointer ${voiceOffsetMs === v ? 'bg-blue-600 text-white font-bold' : 'bg-[var(--s3)] text-zinc-400 hover:text-white'}`}>
+                              {v === 0 ? '0' : v > 0 ? `+${v}` : v}
                             </button>
                           ))}
                         </div>
-                        <p className="text-[9.5px] text-emerald-400/90 flex items-center gap-1">
-                          <span>✓</span>
-                          <span>Auto-synced with timeline volume ({Math.round(bgmVolume * 100)}%)</span>
-                        </p>
+                        <p className="text-[10px] text-zinc-500">If the voices start before the captions appear, move them a little later (+150 or +250 ms).</p>
                       </div>
-                    )}
+                    </div>
+                  )}
+                </section>
 
-                    {/* Voice Timing & Subtitle Sync Offset */}
-                    <div className="p-3 rounded-xl bg-black/20 border border-white/5 space-y-2.5">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-[11px] text-zinc-300 font-medium">
-                            🎙️ Voice Sync Timing (Nudge)
+                {/* Exports already queued or done */}
+                {renderJobs.length > 0 && (
+                  <section className="rounded-2xl bg-[var(--s2)] border border-white/5 p-4 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-300">
+                        Export queue{pendingRenders ? ` · ${pendingRenders} waiting` : ''}
+                      </span>
+                      {renderJobs.some((j) => ['done', 'error', 'cancelled'].includes(j.status)) && (
+                        <button onClick={async () => { await clearFinishedRenderJobs(); refreshQueue(); }} className="text-[11px] text-zinc-400 hover:text-white cursor-pointer">
+                          Clear finished
+                        </button>
+                      )}
+                    </div>
+                    <div className="space-y-1 max-h-40 overflow-y-auto">
+                      {renderJobs.map((job) => (
+                        <div key={job.id} className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-[var(--s3)]">
+                          <span className="text-[11px] text-zinc-200 truncate flex-1" title={job.error || job.label}>
+                            {nameParts(job.label || '').tail || job.label}
                           </span>
-                          <span className="text-[9px] text-zinc-500 font-normal">
-                            ({voiceOffsetMs >= 0 ? `+${voiceOffsetMs}ms` : `${voiceOffsetMs}ms`})
+                          <span className={`text-[10px] shrink-0 ${job.status === 'done' ? 'text-emerald-400' : job.status === 'error' ? 'text-red-400' : job.status === 'rendering' ? 'text-blue-300' : 'text-zinc-500'}`}>
+                            {job.status === 'rendering' ? `${job.percent}%` : job.status === 'queued' ? 'waiting' : job.status === 'done' ? 'done' : job.status}
                           </span>
+                          {job.status === 'done' && job.download_url && (
+                            <a href={job.download_url} className="text-[11px] text-blue-400 hover:text-blue-300" title={job.saved_path || 'Download'}>Download</a>
+                          )}
+                          <button
+                            onClick={async () => { await removeRenderJob(job.id); refreshQueue(); }}
+                            className="text-zinc-500 hover:text-red-400 cursor-pointer"
+                            aria-label={job.status === 'rendering' ? 'Stop this render' : 'Remove from list'}
+                            title={job.status === 'rendering' ? 'Stop this render' : 'Remove from list'}
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
                         </div>
-                        <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded-md border ${
-                          voiceOffsetMs === 0
-                            ? 'text-zinc-400 bg-zinc-800/60 border-zinc-700/40'
-                            : voiceOffsetMs > 0
-                            ? 'text-amber-400 bg-amber-950/50 border-amber-500/20'
-                            : 'text-cyan-400 bg-cyan-950/50 border-cyan-500/20'
-                        }`}>
-                          {voiceOffsetMs === 0 ? '0ms (Exact)' : voiceOffsetMs > 0 ? `+${voiceOffsetMs}ms (Delay Voice)` : `${voiceOffsetMs}ms (Advance Voice)`}
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        min="-500"
-                        max="800"
-                        step="50"
-                        value={voiceOffsetMs}
-                        onChange={(e) => {
-                          const v = Number(e.target.value);
-                          setVoiceOffsetMs(v);
-                          if (currentProject?.id) {
-                            localStorage.setItem(`export-voice-offset-${currentProject.id}`, String(v));
-                          }
-                        }}
-                        className="w-full h-1.5 bg-zinc-800 accent-pink-500 rounded-lg cursor-pointer"
-                      />
-                      <div className="flex items-center gap-1.5 pt-0.5">
-                        {[
-                          { label: '⚡ -200ms', val: -200 },
-                          { label: 'Exact (0ms)', val: 0 },
-                          { label: '⏱️ +150ms', val: 150 },
-                          { label: '⏱️ +250ms', val: 250 },
-                          { label: '⏱️ +400ms', val: 400 },
-                        ].map((p) => (
-                          <button
-                            key={p.label}
-                            type="button"
-                            onClick={() => {
-                              setVoiceOffsetMs(p.val);
-                              if (currentProject?.id) {
-                                localStorage.setItem(`export-voice-offset-${currentProject.id}`, String(p.val));
-                              }
-                            }}
-                            className={`flex-1 py-1 text-[10px] font-mono rounded-lg transition-all border ${
-                              voiceOffsetMs === p.val
-                                ? 'bg-pink-500/20 border-pink-500/50 text-pink-300 font-bold shadow-sm'
-                                : 'bg-zinc-800/50 hover:bg-zinc-800 border-white/5 text-zinc-400'
-                            }`}
-                          >
-                            {p.label}
-                          </button>
-                        ))}
-                      </div>
-                      <p className="text-[9.5px] text-zinc-400/90 leading-relaxed">
-                        💡 If the voice finishes faster than the captions, choose <strong className="text-amber-300">+150ms</strong> or <strong className="text-amber-300">+250ms</strong> to delay audio start and match visual subtitle pace.
-                      </p>
+                      ))}
                     </div>
-                  </div>
-                </div>
-
-                {/* Output Filename & Destination */}
-                <div className="p-4 rounded-2xl bg-[#14161d] border border-white/5 space-y-3 shadow-sm">
-                  {/* File Name */}
-                  <div className="space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5 font-khmer">
-                        <FileText className="w-3.5 h-3.5 text-pink-400" />
-                        <span>Output File Name (ឈ្មោះឯកសារទាញយក)</span>
-                      </label>
-                      <div className="flex items-center gap-2">
-                        {currentProject?.id && localStorage.getItem(`meatika_export_name_${currentProject.id}`) && (
-                          <span className="text-[9.5px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-1.5 py-0.5 rounded flex items-center gap-1">
-                            <span>✓ Auto-saved</span>
-                          </span>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (!currentProject) return;
-                            const base = (currentProject.video_filename || currentProject.name || 'meatika_export').replace(
-                              /\.[^.]+$/,
-                              ''
-                            );
-                            setExportName(base);
-                            localStorage.removeItem(`meatika_export_name_${currentProject.id}`);
-                          }}
-                          className="text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer hover:underline"
-                          title="Reset to default project filename"
-                        >
-                          ↺ Reset default
-                        </button>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="text"
-                        value={exportName}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          setExportName(val);
-                          if (currentProject?.id) {
-                            if (val.trim()) {
-                              localStorage.setItem(`meatika_export_name_${currentProject.id}`, val.trim());
-                            } else {
-                              localStorage.removeItem(`meatika_export_name_${currentProject.id}`);
-                            }
-                          }
-                        }}
-                        className="flex-1 bg-[#181a22] border border-white/10 focus:border-pink-500 rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-none transition-colors"
-                        placeholder="export_video_name"
-                      />
-                      <span className="text-xs text-pink-400 font-mono shrink-0 font-bold bg-pink-500/10 border border-pink-500/20 px-2.5 py-1.5 rounded-xl">
-                        .{videoFormat}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Destination Folder Path */}
-                  <div className="space-y-1.5 pt-1">
-                    <div className="flex items-center justify-between">
-                      <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
-                        <Folder className="w-3.5 h-3.5 text-pink-400" />
-                        <span>Destination Folder</span>
-                      </label>
-                      <div className="flex items-center gap-1">
-                        {defaultFolders.downloads && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setExportFolder(defaultFolders.downloads!);
-                              localStorage.setItem('meatika_export_folder', defaultFolders.downloads!);
-                            }}
-                            className={`text-[10px] px-2 py-0.5 rounded-md transition-colors cursor-pointer ${
-                              exportFolder === defaultFolders.downloads
-                                ? 'bg-pink-500/25 text-pink-300 font-bold border border-pink-500/30'
-                                : 'bg-white/5 text-zinc-400 hover:text-zinc-200'
-                            }`}
-                          >
-                            Downloads
-                          </button>
-                        )}
-                        {defaultFolders.desktop && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setExportFolder(defaultFolders.desktop!);
-                              localStorage.setItem('meatika_export_folder', defaultFolders.desktop!);
-                            }}
-                            className={`text-[10px] px-2 py-0.5 rounded-md transition-colors cursor-pointer ${
-                              exportFolder === defaultFolders.desktop
-                                ? 'bg-pink-500/25 text-pink-300 font-bold border border-pink-500/30'
-                                : 'bg-white/5 text-zinc-400 hover:text-zinc-200'
-                            }`}
-                          >
-                            Desktop
-                          </button>
-                        )}
-                        {defaultFolders.movies && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setExportFolder(defaultFolders.movies!);
-                              localStorage.setItem('meatika_export_folder', defaultFolders.movies!);
-                            }}
-                            className={`text-[10px] px-2 py-0.5 rounded-md transition-colors cursor-pointer ${
-                              exportFolder === defaultFolders.movies
-                                ? 'bg-pink-500/25 text-pink-300 font-bold border border-pink-500/30'
-                                : 'bg-white/5 text-zinc-400 hover:text-zinc-200'
-                            }`}
-                          >
-                            Movies
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="relative flex-1">
-                        <Folder className="w-3.5 h-3.5 text-zinc-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-                        <input
-                          type="text"
-                          value={exportFolder}
-                          onChange={(e) => {
-                            setExportFolder(e.target.value);
-                            localStorage.setItem('meatika_export_folder', e.target.value);
-                          }}
-                          className="w-full bg-[#181a22] border border-white/10 focus:border-pink-500 rounded-xl pl-8 pr-3 py-2 text-xs text-zinc-200 font-mono focus:outline-none transition-colors"
-                          placeholder="/Users/username/Downloads"
-                        />
-                      </div>
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          const selected = await selectFolderInSystem();
-                          if (selected) {
-                            setExportFolder(selected);
-                            localStorage.setItem('meatika_export_folder', selected);
-                          }
-                        }}
-                        title="Choose custom folder on your computer"
-                        className="px-3 py-2 bg-[#181a22] border border-white/10 hover:border-pink-500 hover:bg-pink-950/20 text-zinc-300 hover:text-pink-300 rounded-xl text-xs font-semibold flex items-center gap-1.5 shrink-0 transition-colors shadow-sm cursor-pointer"
-                      >
-                        <FolderPlus className="w-3.5 h-3.5 text-pink-400" />
-                        <span>Browse...</span>
-                      </button>
-                      {exportFolder && (
-                        <button
-                          type="button"
-                          onClick={() => openFolderInSystem(exportFolder)}
-                          title="Open folder in Finder"
-                          className="px-3 py-2 bg-[#181a22] border border-white/10 hover:border-pink-500 hover:bg-pink-950/20 text-zinc-300 hover:text-pink-300 rounded-xl text-xs font-semibold flex items-center gap-1.5 shrink-0 transition-colors shadow-sm cursor-pointer"
-                        >
-                          <FolderOpen className="w-3.5 h-3.5 text-pink-400" />
-                          <span>Finder</span>
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Real-Time Progress Bar & Status */}
-                {exporting && (
-                  <div className="p-4 rounded-2xl bg-gradient-to-r from-pink-950/40 via-purple-950/30 to-indigo-950/40 border border-pink-500/40 space-y-2.5 shadow-xl animate-in fade-in">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-bold text-pink-300 flex items-center gap-2 truncate max-w-[80%]">
-                        <Loader2 className="w-4 h-4 animate-spin text-pink-400 shrink-0" />
-                        <span className="truncate">{statusMessage || 'Rendering Video...'}</span>
-                      </span>
-                      <span className="font-mono font-extrabold text-white text-sm shrink-0 ml-2">{progress}%</span>
-                    </div>
-                    <div className="w-full h-2.5 bg-black/40 rounded-full overflow-hidden p-0.5 border border-white/10 shadow-inner">
-                      <div
-                        className="h-full bg-gradient-to-r from-pink-500 via-purple-500 to-emerald-400 rounded-full transition-all duration-300 shadow-md shadow-pink-500/30"
-                        style={{ width: `${Math.max(2, progress)}%` }}
-                      />
-                    </div>
-                  </div>
-                )}
-
-                {error && (
-                  <div className="p-3.5 rounded-2xl bg-red-950/60 border border-red-800 text-red-200 text-xs leading-relaxed">
-                    {error}
-                  </div>
-                )}
-
-                {done && (
-                  <div className="p-4 rounded-2xl bg-emerald-950/60 border border-emerald-700/60 text-emerald-200 text-xs space-y-3 shadow-xl animate-in fade-in">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2 font-bold">
-                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                        <span>Video successfully rendered and saved!</span>
-                      </div>
-                      {savedLocalPath && (
-                        <button
-                          type="button"
-                          onClick={() => openFolderInSystem(savedLocalPath)}
-                          className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-[11px] font-bold flex items-center gap-1 shadow transition-all active:scale-95 cursor-pointer"
-                        >
-                          <FolderOpen className="w-3.5 h-3.5" />
-                          <span>Show in Finder</span>
-                        </button>
-                      )}
-                    </div>
-                    {savedLocalPath && (
-                      <p className="text-[11px] text-emerald-300/90 font-mono truncate bg-black/30 p-2 rounded-xl border border-emerald-700/40">
-                        {savedLocalPath}
-                      </p>
-                    )}
-
-                    {/* Quick CTA to Generate Viral Titles & Tags */}
-                    <div className="pt-2 border-t border-emerald-800/40 flex items-center justify-between">
-                      <span className="text-[11px] text-emerald-200 font-medium">
-                        Ready to post? Generate viral titles & tags:
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setTab('metadata')}
-                        className="px-3.5 py-1.5 bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-md shadow-pink-950/40 transition-all active:scale-95 cursor-pointer"
-                      >
-                        <Sparkles className="w-3.5 h-3.5 text-yellow-300 animate-pulse" />
-                        <span>Generate Titles & Tags</span>
-                      </button>
-                    </div>
-                  </div>
+                  </section>
                 )}
               </div>
             </div>
           )}
         </div>
 
-        {/* Modal Footer */}
-        <div className="px-6 py-4 border-t border-white/5 bg-[#141720]/80 backdrop-blur-md flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-2 text-xs text-zinc-400 font-medium">
-            <Sparkles className="w-3.5 h-3.5 text-pink-400" />
-            <span>Meatika High-Performance FFmpeg Render Engine</span>
+        {/* Footer */}
+        <div className="px-5 py-3.5 border-t border-white/5 flex flex-wrap items-center justify-between gap-3 shrink-0">
+          <div className="flex items-center gap-2 text-xs text-zinc-400">
+            {tab === 'video' && isPart && siblingParts.length > 1 && (
+              <label className="flex items-center gap-2 cursor-pointer" title="Render every part with these settings, then stitch them into one file">
+                <input type="checkbox" checked={joinAllParts} onChange={(e) => setJoinAllParts(e.target.checked)} disabled={exporting} className="accent-blue-500" />
+                <span>Join all {siblingParts.length} parts into one video</span>
+              </label>
+            )}
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2.5">
             {!inline && (
-              <button
-                onClick={onClose}
-                className="px-4 py-2 rounded-xl text-xs font-semibold text-zinc-400 hover:text-white hover:bg-white/5 transition-colors cursor-pointer"
-              >
-                Cancel
+              <button onClick={onClose} className="px-4 py-2 rounded-xl text-xs font-semibold text-zinc-400 hover:text-white hover:bg-white/5 cursor-pointer">
+                Close
               </button>
             )}
-
             {tab === 'video' && (
               <button
-                onClick={handleVideoExport}
-                disabled={exporting || !hasVideo}
-                className={`relative overflow-hidden group flex items-center gap-2.5 px-6 py-2.5 rounded-xl text-xs font-bold transition-all shadow-xl active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer ${
-                  done
-                    ? 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white shadow-emerald-950/50 border border-emerald-400/40'
-                    : 'bg-gradient-to-r from-pink-600 via-purple-600 to-indigo-600 hover:from-pink-500 hover:via-purple-500 hover:to-indigo-500 text-white shadow-purple-950/60 border border-white/20 hover:border-white/40'
-                }`}
+                onClick={() => handleVideoExport(true)}
+                disabled={exporting || !hasVideo || joinAllParts}
+                className="px-4 py-2.5 rounded-xl text-xs font-semibold bg-white/5 hover:bg-white/10 text-zinc-200 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                title="Render it in the background and keep working; renders run one after another"
               >
-                <span className="absolute inset-0 bg-gradient-to-r from-white/0 via-white/25 to-white/0 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-700 pointer-events-none" />
+                Add to queue
+              </button>
+            )}
+            {tab === 'video' && (
+              <button
+                onClick={() => (joinAllParts ? handleJoinExport() : handleVideoExport())}
+                disabled={exporting || !hasVideo}
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-bold bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-950/50 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+              >
                 {exporting ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin text-pink-200" />
-                    <span className="tracking-wide">Rendering ({progress}%)...</span>
-                  </>
+                  <><Loader2 className="w-4 h-4 animate-spin" /> Rendering {progress}%</>
                 ) : done ? (
-                  <>
-                    <Check className="w-4 h-4 text-emerald-200 group-hover:scale-110 transition-transform" />
-                    <span className="tracking-wide">Render Finished!</span>
-                  </>
+                  <><Check className="w-4 h-4" /> Export again</>
                 ) : (
-                  <>
-                    <Download className="w-4 h-4 text-pink-200 group-hover:translate-y-[-1px] transition-transform" />
-                    <span className="tracking-wide">Export & Download MP4</span>
-                    <Sparkles className="w-3.5 h-3.5 text-yellow-300 animate-pulse" />
-                  </>
+                  <><Download className="w-4 h-4" /> {joinAllParts ? `Export ${siblingParts.length} parts as one` : 'Export video'}</>
                 )}
               </button>
             )}
@@ -2375,9 +1725,18 @@ export default function ExportModal({ open, onClose, inline = false }: Props) {
         </div>
       </div>
 
-      {/* AI Audio Preload Elements */}
+      {/* Dubbed voices for the preview. Only the lines around the preview position are loaded:
+          a player per line for the whole film meant hundreds of them all downloading at once
+          each time this window opened. */}
+      {previewUsesStem && <audio ref={previewBgmRef} src={bgmUrl || undefined} preload="auto" />}
       {(currentProject?.segments || [])
-        .filter((s) => s.audio_url)
+        .filter(
+          (s) =>
+            s.audio_url &&
+            s.end_time >= currentSourceTime - 2 &&
+            s.start_time <= currentSourceTime + 12
+        )
+        .slice(0, 24)
         .map((seg) => (
           <audio
             key={`preview-ai-${seg.id}`}

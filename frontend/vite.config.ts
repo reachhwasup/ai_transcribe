@@ -22,7 +22,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        target: 'http://127.0.0.1:8008',
         configure: (proxy) => {
           // Disable buffering for SSE streaming
           proxy.on('proxyRes', (proxyRes) => {
@@ -33,7 +33,7 @@ export default defineConfig({
           });
         },
       },
-      '/uploads': 'http://127.0.0.1:8000',
+      '/uploads': 'http://127.0.0.1:8008',
     },
   },
 })
